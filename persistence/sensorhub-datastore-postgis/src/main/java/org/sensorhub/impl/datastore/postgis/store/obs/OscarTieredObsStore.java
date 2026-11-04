@@ -1722,27 +1722,33 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         Set<ObsField> fields = Set.of(ObsField.DATASTREAM_ID, ObsField.FOI_ID,
                 ObsField.PHENOMENON_TIME, ObsField.RESULT_TIME);
         // Metadata aggregation is order-independent. Avoid forcing PostgreSQL
-        // to sort the complete hot relation before the streaming aggregate.
+        // to sort the complete hot relation before the streaming aggregate, and
+        // project tableoid/archivegenerationid directly in the single table scan
+        // instead of self-joining the partitioned obs hierarchy back onto itself.
+        String markerColumn = archiveConfig.isParquetPrimary()
+                ? "tableoid"
+                : "archivegenerationid";
         ParameterizedQuery selected = queryBuilder.createParameterizedUnorderedSelectEntriesQuery(
-                unbounded, fields);
-        String table = getDatastoreName();
+                unbounded, fields, markerColumn);
+        String escapedTable = getDatastoreName().replace("'", "''");
         String ownership = archiveConfig.isParquetPrimary()
                 ? "owner.generation_id"
-                : "marker.archivegenerationid";
+                : "matched.archivegenerationid";
         String stageOwnership = archiveConfig.isParquetPrimary()
-                ? " LEFT JOIN oscar_obs_stage_partition stage ON stage.store_key='" + table + "' " +
-                "AND stage.id_scope=" + idScope + " AND marker.tableoid=to_regclass(stage.child_table) " +
-                "LEFT JOIN oscar_obs_stage_owner owner ON owner.store_key='" + table + "' " +
+                ? " LEFT JOIN (SELECT child_table, to_regclass(child_table) AS child_oid " +
+                "FROM oscar_obs_stage_partition WHERE store_key='" + escapedTable + "' " +
+                "AND id_scope=" + idScope + ") stage ON stage.child_oid=matched.tableoid " +
+                "LEFT JOIN oscar_obs_stage_owner owner ON owner.store_key='" + escapedTable + "' " +
                 "AND owner.id_scope=" + idScope + " AND owner.child_table=stage.child_table " +
-                "AND owner.observation_id=marker.id"
+                "AND owner.observation_id=matched.id"
                 : "";
         String sql = "SELECT matched.id, matched.datastreamid, matched.foiid, matched.phenomenontime, " +
                 "matched.resulttime, EXISTS (SELECT 1 FROM oscar_archive_generation generation " +
                 "WHERE generation.id=" + ownership + " " +
-                "AND generation.store_key='" + getDatastoreName() + "' " +
+                "AND generation.store_key='" + escapedTable + "' " +
                 "AND generation.id_scope=" + idScope + " " +
                 "AND generation.state IN ('ACTIVE','SEALED')) AS cold_overlap " +
-                "FROM (" + selected.sql() + ") matched JOIN " + table + " marker ON marker.id=matched.id" +
+                "FROM (" + selected.sql() + ") matched" +
                 stageOwnership;
         try (Connection connection = connectionManager.getConnection()) {
             connection.setReadOnly(true);

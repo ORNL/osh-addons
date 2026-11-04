@@ -612,7 +612,7 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                         assertFalse(definition.contains("using gin"));
                         assertFalse(definition.contains("jsonb_path_ops"));
                     }
-                    assertEquals("The raw stage must retain only its three bounded indexes", 3, count);
+                    assertEquals("The raw stage must retain only its eight bounded indexes", 8, count);
                 }
             }
         }
@@ -4360,5 +4360,117 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertEquals(List.of(newerGen.id()),
                 catalog.candidates(firstWindow, thirdWindow, null, null, null, streamSet, secondWindow)
                         .stream().map(ArchiveGeneration::id).toList());
+    }
+
+    @Test
+    public void parquetPrimaryHotMetadataScanDeduplicatesStageOverlapInSingleTableScan() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.outputNames = List.of("gammaCounts");
+        primaryConfig.immutableStageWindowMinutes = 30;
+        primaryConfig.maximumGenerationsPerCycle = 2;
+        primaryConfig.maximumVerificationsPerCycle = 2;
+        primaryConfig.maximumDeletionsPerCycle = 2;
+        primaryConfig.deleteHotAfterArchive = true;
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        Instant firstWindow = Instant.parse("2026-08-10T00:00:00Z");
+        Instant secondWindow = firstWindow.plus(30, ChronoUnit.MINUTES);
+        Instant thirdWindow = secondWindow.plus(30, ChronoUnit.MINUTES);
+        BigId rawStream = addSimpleDataStream(bigId(92), "gammaCounts");
+        BigId mutableStream = addSimpleDataStream(bigId(93), "occupancy");
+
+        // 3 immutable rows in firstWindow (will be archived into Parquet while still attached in stage),
+        // 2 immutable rows in secondWindow (hot stage only), and 1 mutable row in base table.
+        addSimpleObsWithoutResultTime(rawStream, BigId.NONE, firstWindow.plusSeconds(5), 3, 1_000L);
+        addSimpleObsWithoutResultTime(rawStream, BigId.NONE, secondWindow.plusSeconds(5), 2, 1_000L);
+        addSimpleObsWithoutResultTime(mutableStream, BigId.NONE, firstWindow.plusSeconds(10), 1, 0L);
+        forceReadBackFromStorage();
+
+        ArchiveGeneration archived = tiered.archiveWindow(firstWindow, secondWindow, "RAW_GATED").orElseThrow();
+        assertEquals(3, archived.rowCount());
+        String firstStageChild = tiered.getImmutableStagePartitions().get(0).childTable();
+
+        // Unfiltered count, stream-filtered count, and time-range scan all hit scanMetadata -> scanHotMetadata
+        // because an ACTIVE Parquet generation overlaps firstWindow while stage partition remains attached.
+        ObsFilter overlapFilter = new ObsFilter.Builder()
+                .withDataStreams(rawStream)
+                .withPhenomenonTimeDuring(firstWindow, thirdWindow)
+                .build();
+        assertEquals(6, tiered.getNumRecords());
+        assertEquals(5, tiered.countMatchingEntries(overlapFilter));
+        var rawRange = tiered.getDataStreamPhenomenonTimeRanges(List.of(rawStream.getIdAsLong()))
+                .get(rawStream.getIdAsLong());
+        assertNotNull(rawRange);
+        assertEquals(firstWindow.plusSeconds(5), rawRange.begin());
+        assertEquals(secondWindow.plusSeconds(6), rawRange.end());
+
+        // Differential scan check: compare 1 vs 4 countMatchingEntries calls across identical store lifecycles
+        // so fixed startup catalog checks cancel out and per-query stage scans must equal 1 (not 2 from self-join).
+        tiered.close();
+        long baselineScans;
+        try (Connection connection = open(); Statement stmt = connection.createStatement()) {
+            stmt.execute("SELECT pg_stat_clear_snapshot()");
+            baselineScans = queryLong(connection,
+                    "SELECT COALESCE(seq_scan,0) + COALESCE(idx_scan,0) FROM pg_stat_user_tables WHERE relname='" +
+                            firstStageChild + "'");
+        }
+
+        tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        assertEquals(5, tiered.countMatchingEntries(overlapFilter));
+        tiered.close();
+
+        long afterOneCallScans;
+        try (Connection connection = open(); Statement stmt = connection.createStatement()) {
+            stmt.execute("SELECT pg_stat_clear_snapshot()");
+            afterOneCallScans = queryLong(connection,
+                    "SELECT COALESCE(seq_scan,0) + COALESCE(idx_scan,0) FROM pg_stat_user_tables WHERE relname='" +
+                            firstStageChild + "'");
+        }
+        long oneLifecycleDelta = afterOneCallScans - baselineScans;
+
+        tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        for (int i = 0; i < 4; i++) {
+            assertEquals(5, tiered.countMatchingEntries(overlapFilter));
+        }
+        tiered.close();
+
+        long afterFourCallsScans;
+        try (Connection connection = open(); Statement stmt = connection.createStatement()) {
+            stmt.execute("SELECT pg_stat_clear_snapshot()");
+            afterFourCallsScans = queryLong(connection,
+                    "SELECT COALESCE(seq_scan,0) + COALESCE(idx_scan,0) FROM pg_stat_user_tables WHERE relname='" +
+                            firstStageChild + "'");
+        }
+        long fourCallsLifecycleDelta = afterFourCallsScans - afterOneCallScans;
+
+        // Reopen for @After cleanup expectations.
+        tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        assertEquals("Three extra countMatchingEntries calls must add exactly 3 stage-child scans (1 per query, zero self-join)",
+                3L, fourCallsLifecycleDelta - oneLifecycleDelta);
     }
 }
