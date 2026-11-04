@@ -3537,6 +3537,17 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                 if (!"42P01".equals(absentOnLegacySchema.getSQLState()))
                     throw absentOnLegacySchema;
             }
+            for (String mutableCountTable : List.of("oscar_mutable_stream_counts",
+                    "oscar_mutable_stream_counts_state")) {
+                try (PreparedStatement counts = connection.prepareStatement(
+                        "DELETE FROM " + mutableCountTable + " WHERE store_key=?")) {
+                    counts.setString(1, observationTable);
+                    counts.executeUpdate();
+                } catch (SQLException absentOnLegacySchema) {
+                    if (!"42P01".equals(absentOnLegacySchema.getSQLState()))
+                        throw absentOnLegacySchema;
+                }
+            }
             try (Statement statement = connection.createStatement()) {
             statement.execute("DROP TABLE IF EXISTS " + observationTable);
             statement.execute("DROP TABLE IF EXISTS " + observationTable + "_datastreams");
@@ -4472,5 +4483,291 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
 
         assertEquals("Three extra countMatchingEntries calls must add exactly 3 stage-child scans (1 per query, zero self-join)",
                 3L, fourCallsLifecycleDelta - oneLifecycleDelta);
+    }
+
+    @Test
+    public void tombstonedOverlayIsExcludedFromSelectGetAndCount() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant windowStart = Instant.parse("2026-09-01T00:00:00Z");
+        Instant windowEnd = windowStart.plus(1, ChronoUnit.HOURS);
+        BigId stream = addAlarmDataStream(bigId(940), "gammaCounts");
+
+        BigId obsId = tiered.add(alarmObs(stream, windowStart.plusSeconds(10),
+                windowStart.plusSeconds(11), false, false, 15.0));
+        forceReadBackFromStorage();
+
+        ArchiveGeneration gen = tiered.archiveWindow(windowStart, windowEnd, "RAW_GATED").orElseThrow();
+        assertEquals(1L, gen.rowCount());
+
+        // Overlay while hot grace base still exists, then delete hot base so overlay is the sole cold representation.
+        tiered.put(obsId, alarmObs(stream, windowStart.plusSeconds(10),
+                windowStart.plusSeconds(11), true, false, 120.0));
+        try (Connection connection = open();
+             PreparedStatement deleteHot = connection.prepareStatement(
+                     "DELETE FROM " + TABLE + " WHERE datastreamid=?")) {
+            deleteHot.setLong(1, stream.getIdAsLong());
+            assertEquals(1, deleteHot.executeUpdate());
+        }
+
+        ObsFilter alarmFilter = new ObsFilter.Builder()
+                .withDataStreams(stream)
+                .withCQLFilter("gammaAlarm = true AND neutronAlarm = false")
+                .build();
+        assertNotNull(tiered.get(obsId));
+        assertEquals(1L, tiered.countMatchingEntries(alarmFilter));
+        assertEquals(1L, selectCount(tiered, alarmFilter));
+
+        // Tombstone the overlaid observation and verify complete suppression across get, selectEntries, and countMatchingEntries.
+        assertNotNull(tiered.remove(obsId));
+        assertNull(tiered.get(obsId));
+        assertEquals(0L, selectCount(tiered, new ObsFilter.Builder().withDataStreams(stream).build()));
+        assertEquals(0L, tiered.countMatchingEntries(new ObsFilter.Builder().withDataStreams(stream).build()));
+        assertEquals(0L, selectCount(tiered, alarmFilter));
+        assertEquals(0L, tiered.countMatchingEntries(alarmFilter));
+    }
+
+    @Test
+    public void directTieredCountMatchesSelectEntriesAcrossOverlapOverlaysTombstonesAndCql() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant coldStart = Instant.parse("2026-09-02T00:00:00Z");
+        Instant coldEnd = coldStart.plus(1, ChronoUnit.HOURS);
+        Instant overlapStart = coldEnd;
+        Instant overlapEnd = overlapStart.plus(1, ChronoUnit.HOURS);
+        Instant hotStart = overlapEnd;
+        BigId stream = addAlarmDataStream(bigId(941), "gammaCounts");
+
+        // Cold window (hot rows will be removed after archive): 4 observations
+        BigId coldNoneKeep = tiered.add(alarmObs(stream, coldStart.plusSeconds(5),
+                coldStart.plusSeconds(5), false, false, 10.0));
+        BigId coldNoneToAlarmOverlay = tiered.add(alarmObs(stream, coldStart.plusSeconds(10),
+                coldStart.plusSeconds(10), false, false, 12.0));
+        BigId coldAlarmToNoneOverlay = tiered.add(alarmObs(stream, coldStart.plusSeconds(15),
+                coldStart.plusSeconds(15), true, false, 85.0));
+        BigId coldTombstoned = tiered.add(alarmObs(stream, coldStart.plusSeconds(20),
+                coldStart.plusSeconds(20), false, false, 14.0));
+
+        // Grace-overlap window (archived into Parquet AND left in hot PostgreSQL): 2 observations
+        BigId overlapNone = tiered.add(alarmObs(stream, overlapStart.plusSeconds(5),
+                overlapStart.plusSeconds(5), false, false, 20.0));
+        BigId overlapOverlaid = tiered.add(alarmObs(stream, overlapStart.plusSeconds(10),
+                overlapStart.plusSeconds(10), false, false, 22.0));
+
+        // Pure hot unarchived window: 2 observations (one after cutoff)
+        Instant cutoff = hotStart.plusSeconds(8);
+        tiered.add(alarmObs(stream, hotStart.plusSeconds(5),
+                hotStart.plusSeconds(5), false, false, 30.0));
+        tiered.add(alarmObs(stream, hotStart.plusSeconds(15),
+                hotStart.plusSeconds(15), true, true, 150.0));
+        forceReadBackFromStorage();
+
+        tiered.archiveWindow(coldStart, coldEnd, "RAW_GATED").orElseThrow();
+        tiered.archiveWindow(overlapStart, overlapEnd, "RAW_GATED").orElseThrow();
+        try (Connection connection = open();
+             PreparedStatement deleteColdWindowHot = connection.prepareStatement(
+                     "DELETE FROM " + TABLE + " WHERE datastreamid=? AND phenomenontime < ?")) {
+            deleteColdWindowHot.setLong(1, stream.getIdAsLong());
+            UtcJdbcTime.setInstant(deleteColdWindowHot, 2, coldEnd);
+            assertEquals(4, deleteColdWindowHot.executeUpdate());
+        }
+
+        // Apply mutations across cold and grace-overlap rows.
+        tiered.put(coldNoneToAlarmOverlay, alarmObs(stream, coldStart.plusSeconds(10),
+                coldStart.plusSeconds(10), true, false, 95.0));
+        tiered.put(coldAlarmToNoneOverlay, alarmObs(stream, coldStart.plusSeconds(15),
+                coldStart.plusSeconds(15), false, false, 9.0));
+        tiered.put(overlapOverlaid, alarmObs(stream, overlapStart.plusSeconds(10),
+                overlapStart.plusSeconds(10), true, false, 77.0));
+        tiered.remove(coldTombstoned);
+        assertNotNull(tiered.get(coldNoneKeep));
+        assertNotNull(tiered.get(overlapNone));
+
+        List<ObsFilter> filters = List.of(
+                new ObsFilter.Builder().withDataStreams(stream).build(),
+                new ObsFilter.Builder().withDataStreams(stream)
+                        .withCQLFilter("gammaAlarm = false AND neutronAlarm = false").build(),
+                new ObsFilter.Builder().withDataStreams(stream)
+                        .withCQLFilter("gammaAlarm = true").build(),
+                new ObsFilter.Builder().withDataStreams(stream)
+                        .withCQLFilter("maxGamma >= 25").build(),
+                new ObsFilter.Builder().withDataStreams(stream)
+                        .withResultTime(new TemporalFilter.Builder()
+                                .withRange(Range.closed(Instant.MIN, cutoff)).build()).build(),
+                new ObsFilter.Builder().withDataStreams(stream)
+                        .withResultTime(new TemporalFilter.Builder()
+                                .withRange(Range.closedOpen(Instant.MIN, cutoff)).build())
+                        .withCQLFilter("gammaAlarm = false AND neutronAlarm = false").build(),
+                new ObsFilter.Builder().withDataStreams(stream)
+                        .withCQLFilter("gammaAlarm = false AND neutronAlarm = false")
+                        .withLimit(2).build()
+        );
+        for (int i = 0; i < filters.size(); i++) {
+            ObsFilter candidateFilter = filters.get(i);
+            assertEquals("Count mismatch at filter index " + i,
+                    selectCount(tiered, candidateFilter),
+                    tiered.countMatchingEntries(candidateFilter));
+        }
+    }
+
+    @Test
+    public void parquetPrimaryMutableStreamCountsStayExactAndAccelerateBoundedQueries() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.outputNames = List.of("gammaCounts");
+        primaryConfig.immutableStageWindowMinutes = 30;
+        primaryConfig.maximumGenerationsPerCycle = 2;
+        primaryConfig.maximumVerificationsPerCycle = 2;
+        primaryConfig.maximumDeletionsPerCycle = 2;
+        primaryConfig.deleteHotAfterArchive = true;
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        Instant base = Instant.parse("2026-09-03T00:00:00Z");
+        Instant cutoff = base.plusSeconds(25);
+        BigId rawStream = addAlarmDataStream(bigId(942), "gammaCounts");
+        BigId occStreamA = addAlarmDataStream(bigId(943), "occupancy");
+        BigId occStreamB = addAlarmDataStream(bigId(944), "occupancy");
+
+        // Immutable telemetry (must be routed to osg_* children and excluded from oscar_mutable_stream_counts)
+        tiered.add(alarmObs(rawStream, base.plusSeconds(5), base.plusSeconds(5), false, false, 11.0));
+        tiered.add(alarmObs(rawStream, base.plusSeconds(10), base.plusSeconds(10), true, false, 88.0));
+        tiered.add(alarmObs(rawStream, base.plus(35, ChronoUnit.MINUTES),
+                base.plus(35, ChronoUnit.MINUTES), false, false, 13.0));
+
+        // Mutable occupancy rows: mix of <= cutoff, == cutoff, > cutoff, and NULL resultTime
+        BigId occNullResult = tiered.add(alarmObs(occStreamA, base.plusSeconds(5), null, false, false, 10.0));
+        tiered.add(alarmObs(occStreamA, base.plusSeconds(15), base.plusSeconds(15), false, false, 20.0));
+        tiered.add(alarmObs(occStreamA, base.plusSeconds(25), cutoff, true, false, 90.0));
+        BigId occAfterCutoff = tiered.add(alarmObs(occStreamA, base.plusSeconds(35),
+                base.plusSeconds(35), false, false, 30.0));
+        tiered.add(alarmObs(occStreamB, base.plusSeconds(20), base.plusSeconds(20), false, true, 75.0));
+
+        // Natural-key upsert on mutable stream (must not double-count total_rows)
+        tiered.add(alarmObs(occStreamA, base.plusSeconds(15), base.plusSeconds(15), false, false, 25.0));
+        forceReadBackFromStorage();
+
+        // Update NULL resultTime -> non-null resultTime via put, then remove one post-cutoff row
+        tiered.put(occNullResult, alarmObs(occStreamA, base.plusSeconds(5),
+                base.plusSeconds(6), false, false, 10.0));
+        tiered.remove(occAfterCutoff);
+
+        // Archive first immutable 30-minute stage window so cold + hot both exist
+        tiered.archiveWindow(base, base.plus(30, ChronoUnit.MINUTES), "RAW_GATED").orElseThrow();
+
+        try (Connection connection = open()) {
+            assertEquals("Immutable streams must never enter oscar_mutable_stream_counts", 0L,
+                    queryLong(connection, "SELECT count(*) FROM oscar_mutable_stream_counts " +
+                            "WHERE store_key='" + TABLE + "' AND datastream_id=" + rawStream.getIdAsLong()));
+            assertEquals(4L, queryLong(connection,
+                    "SELECT COALESCE(sum(total_rows),0) FROM oscar_mutable_stream_counts " +
+                            "WHERE store_key='" + TABLE + "' AND datastream_id IN (" +
+                            occStreamA.getIdAsLong() + "," + occStreamB.getIdAsLong() + ")"));
+            assertEquals(0L, queryLong(connection,
+                    "SELECT COALESCE(sum(null_result_time_rows),0) FROM oscar_mutable_stream_counts " +
+                            "WHERE store_key='" + TABLE + "'"));
+        }
+
+        // Verify fast mutable count + CQL count + bounded descending CQL merge parity
+        List<ObsFilter> checks = List.of(
+                new ObsFilter.Builder().withDataStreams(occStreamA, occStreamB).build(),
+                new ObsFilter.Builder().withDataStreams(occStreamA, occStreamB)
+                        .withResultTime(new TemporalFilter.Builder()
+                                .withRange(Range.closed(Instant.MIN, cutoff)).build()).build(),
+                new ObsFilter.Builder().withDataStreams(occStreamA, occStreamB)
+                        .withResultTime(new TemporalFilter.Builder()
+                                .withRange(Range.closedOpen(Instant.MIN, cutoff)).build()).build(),
+                new ObsFilter.Builder().withDataStreams(occStreamA, occStreamB)
+                        .withResultTime(new TemporalFilter.Builder()
+                                .withRange(Range.closed(Instant.MIN, cutoff)).build())
+                        .withCQLFilter("gammaAlarm = false AND neutronAlarm = false").build(),
+                new ObsFilter.Builder().withDataStreams(rawStream)
+                        .withPhenomenonTime(new TemporalFilter.Builder()
+                                .withAllTimes().descendingOrder(true).build())
+                        .withCQLFilter("gammaAlarm = false AND neutronAlarm = false")
+                        .withLimit(1).build()
+        );
+        for (int i = 0; i < checks.size(); i++) {
+            ObsFilter check = checks.get(i);
+            assertEquals("Count parity failed at check index " + i,
+                    selectCount(tiered, check), tiered.countMatchingEntries(check));
+        }
+
+        // Bounded descending CQL merge on cold+hot rawStream must return the newest matching observation
+        ObsFilter newestNone = checks.get(checks.size() - 1);
+        try (var rows = tiered.selectEntries(newestNone)) {
+            var selected = rows.toList();
+            assertEquals(1, selected.size());
+            assertEquals(base.plus(35, ChronoUnit.MINUTES), selected.get(0).getValue().getPhenomenonTime());
+        }
+
+        // Reopen store (idempotent O(1) table_oid match) and also verify self-healing when table_oid=0
+        tiered.close();
+        try (Connection connection = open(); Statement stmt = connection.createStatement()) {
+            stmt.execute("UPDATE oscar_mutable_stream_counts SET total_rows = 999 WHERE store_key='" + TABLE + "'");
+            stmt.execute("UPDATE oscar_mutable_stream_counts_state SET table_oid = 0::oid WHERE store_key='" + TABLE + "'");
+        }
+        tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+        assertEquals(4L, tiered.countMatchingEntries(
+                new ObsFilter.Builder().withDataStreams(occStreamA, occStreamB).build()));
+    }
+
+    private BigId addAlarmDataStream(BigId systemId, String outputName) throws Exception {
+        SWEHelper swe = new SWEHelper();
+        var record = swe.createRecord().name(outputName)
+                .addField("gammaAlarm", swe.createBoolean().build())
+                .addField("neutronAlarm", swe.createBoolean().build())
+                .addField("maxGamma", swe.createQuantity().build())
+                .build();
+        var info = new DataStreamInfo.Builder()
+                .withName(outputName)
+                .withSystem(new FeatureId(systemId, "urn:oscar:test:alarm-system:" + systemId.getIdAsLong()))
+                .withRecordDescription(record)
+                .withRecordEncoding(new TextEncodingImpl())
+                .build();
+        return postgisObsStore.getDataStreams().add(info).getInternalID();
+    }
+
+    private static IObsData alarmObs(BigId stream, Instant phenomenonTime, Instant resultTime,
+                                     boolean gammaAlarm, boolean neutronAlarm, double maxGamma) {
+        SWEHelper swe = new SWEHelper();
+        var record = swe.createRecord().name("obs")
+                .addField("gammaAlarm", swe.createBoolean().build())
+                .addField("neutronAlarm", swe.createBoolean().build())
+                .addField("maxGamma", swe.createQuantity().build())
+                .build();
+        DataBlock block = record.createDataBlock();
+        block.setBooleanValue(0, gammaAlarm);
+        block.setBooleanValue(1, neutronAlarm);
+        block.setDoubleValue(2, maxGamma);
+        ObsData.Builder builder = new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(phenomenonTime)
+                .withResult(block);
+        if (resultTime != null)
+            builder.withResultTime(resultTime);
+        return builder.build();
+    }
+
+    private static long selectCount(OscarTieredObsStore store, ObsFilter filter) {
+        try (var stream = store.selectEntries(filter)) {
+            return stream.count();
+        }
     }
 }

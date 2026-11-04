@@ -430,6 +430,10 @@ public final class ParquetArchiveReader {
         if (filter.getCQLFilter() != null || filter.getValuePredicate() != null ||
                 filter.getPhenomenonLocation() != null)
             throw new IllegalArgumentException("Payload and spatial predicates require full observation decoding");
+        if (generations.isEmpty() ||
+                (allowedDataStreams != null && allowedDataStreams.isEmpty()) ||
+                (allowedFois != null && allowedFois.isEmpty()))
+            return 0;
         boolean latestSelection = (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
                 (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
         if (!latestSelection && generations.size() > MAX_RESULT_TIME_METADATA_BATCH) {
@@ -442,6 +446,135 @@ public final class ParquetArchiveReader {
             return total;
         }
         return countSingleBatch(generations, filter, allowedDataStreams, allowedFois);
+    }
+
+    /**
+     * Counts how many specific observation IDs in {@code targetIds} also match
+     * the structured {@code filter} inside {@code generations}, used to subtract
+     * sparse overlaid/tombstoned base rows from a metadata-only cold count.
+     */
+    public long countMatchingIds(List<ArchiveGeneration> generations, int idScope,
+                                 Set<Long> targetIds, ObsFilter filter,
+                                 Set<Long> allowedDataStreams, Set<Long> allowedFois) {
+        if (generations.isEmpty() || targetIds == null || targetIds.isEmpty() ||
+                (allowedDataStreams != null && allowedDataStreams.isEmpty()) ||
+                (allowedFois != null && allowedFois.isEmpty()))
+            return 0;
+        List<Long> effectiveIds;
+        if (filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty()) {
+            effectiveIds = filter.getInternalIDs().stream()
+                    .filter(id -> id.getScope() == idScope && targetIds.contains(id.getIdAsLong()))
+                    .map(BigId::getIdAsLong)
+                    .sorted()
+                    .toList();
+            if (effectiveIds.isEmpty())
+                return 0;
+        } else {
+            effectiveIds = targetIds.stream().sorted().toList();
+        }
+
+        long total = 0;
+        final int idBatchSize = 1_000;
+        for (int offset = 0; offset < effectiveIds.size(); offset += idBatchSize) {
+            List<BigId> chunk = effectiveIds.subList(offset, Math.min(effectiveIds.size(), offset + idBatchSize))
+                    .stream()
+                    .map(id -> BigId.fromLong(idScope, id))
+                    .toList();
+            ObsFilter chunkFilter = ObsFilter.Builder.from(filter)
+                    .withInternalIDs(chunk)
+                    .withLimit(Long.MAX_VALUE)
+                    .build();
+            total = Math.addExact(total, count(generations, chunkFilter, allowedDataStreams, allowedFois));
+        }
+        return total;
+    }
+
+    /**
+     * Counts cold archive observations matching structured + CQL predicates
+     * without constructing SWE {@code DataBlock} instances or sorting rows.
+     */
+    public long countCql(List<ArchiveGeneration> generations, ObsFilter filter,
+                         Set<Long> allowedDataStreams, Set<Long> allowedFois,
+                         Set<Long> excludedIds) {
+        if (filter.getValuePredicate() != null || filter.getPhenomenonLocation() != null)
+            throw new IllegalArgumentException("Value and spatial predicates require full observation decoding");
+        if ((filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
+                (filter.getResultTime() != null && filter.getResultTime().isLatestTime()))
+            throw new IllegalArgumentException("Latest selection requires per-stream reduction");
+        if (generations.isEmpty() ||
+                (allowedDataStreams != null && allowedDataStreams.isEmpty()) ||
+                (allowedFois != null && allowedFois.isEmpty()))
+            return 0;
+
+        long total = 0;
+        Set<Long> exclusions = excludedIds == null ? Set.of() : excludedIds;
+        for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_RESULT_TIME_METADATA_BATCH)) {
+            total = Math.addExact(total, countCqlSingleBatch(
+                    batch, filter, allowedDataStreams, allowedFois, exclusions));
+            if (filter.getLimit() != Long.MAX_VALUE && total >= filter.getLimit())
+                return filter.getLimit();
+        }
+        return total;
+    }
+
+    private long countCqlSingleBatch(List<ArchiveGeneration> generations, ObsFilter filter,
+                                     Set<Long> allowedDataStreams, Set<Long> allowedFois,
+                                     Set<Long> excludedIds) {
+        AuthorizedObjects objects = authorize(generations);
+        if (objects.byFilename().isEmpty())
+            return 0;
+        String fileList = objects.byFilename().keySet().stream()
+                .map(path -> "'" + sqlLiteral(path) + "'")
+                .collect(Collectors.joining(","));
+        StringBuilder sql = new StringBuilder("SELECT id_value, result_json FROM read_parquet([")
+                .append(fileList).append("]) WHERE true");
+        List<Object> parameters = new ArrayList<>();
+        if (filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty())
+            appendIn(sql, "id_value", filter.getInternalIDs().stream().map(BigId::getIdAsLong).toList(), parameters);
+        if (allowedDataStreams != null)
+            appendIn(sql, "datastream_id", allowedDataStreams, parameters);
+        if (allowedFois != null) {
+            Set<Long> explicitFois = allowedFois.stream().filter(id -> id != 0L).collect(Collectors.toSet());
+            if (allowedFois.contains(0L)) {
+                sql.append(" AND (foi_id IS NULL");
+                if (!explicitFois.isEmpty()) {
+                    sql.append(" OR foi_id IN (");
+                    appendPlaceholders(sql, explicitFois.size());
+                    sql.append(')');
+                    parameters.addAll(explicitFois);
+                }
+                sql.append(')');
+            } else {
+                appendIn(sql, "foi_id", explicitFois, parameters);
+            }
+        }
+        appendTime(sql, "phenomenon_time", filter.getPhenomenonTime(), parameters);
+        appendTime(sql, "result_time", filter.getResultTime(), parameters);
+        if (filter.getCQLFilter() != null)
+            JsonCqlEvaluator.appendDuckDbPrefilter(filter.getCQLFilter(), "result_json", sql, parameters);
+
+        long matched = 0;
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "cold-cql-count");
+             PreparedStatement statement = ConnectionManager.trackCancellableStatement(
+                     duckSession.connection().prepareStatement(sql.toString()), "DuckDB cold CQL count")) {
+            bind(statement, parameters);
+            try (ResultSet result = statement.executeQuery()) {
+                while (nextCancellable(result)) {
+                    long id = result.getLong(1);
+                    if (excludedIds.contains(id))
+                        continue;
+                    if (matchesCql(filter, result.getString(2))) {
+                        matched = Math.addExact(matched, 1L);
+                        if (filter.getLimit() != Long.MAX_VALUE && matched >= filter.getLimit())
+                            return filter.getLimit();
+                    }
+                }
+            }
+            return matched;
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot count CQL matches from " + generations.size() +
+                    " archive generation(s)", e);
+        }
     }
 
     private long countSingleBatch(List<ArchiveGeneration> generations, ObsFilter filter,

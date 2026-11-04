@@ -154,6 +154,7 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
     private void ensureEventFilterIndexes() {
         try (Connection connection = this.connectionManager.getConnection()) {
             PostgisUtils.executeQueries(connection, queryBuilder.createEventFilterIndexQueries());
+            PostgisUtils.executeQueries(connection, new String[]{queryBuilder.configureAutovacuumQuery()});
         } catch (SQLException e) {
             throw new RuntimeException("Cannot create observation event filter indexes", e);
         }
@@ -161,6 +162,11 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
 
     @Override
     public Stream<Entry<BigId, IObsData>> selectEntries(ObsFilter filter, Set<ObsField> fields) {
+        return selectEntries(filter, fields, false, STREAM_FETCH_SIZE);
+    }
+
+    protected Stream<Entry<BigId, IObsData>> selectEntries(
+            ObsFilter filter, Set<ObsField> fields, boolean parentTableOnly, int initialPageSize) {
         Set<ObsField> requestedFields = fields == null || fields.isEmpty()
                 ? null : Set.copyOf(fields);
         boolean projectAfterPredicate = filter.getValuePredicate() != null && requestedFields != null;
@@ -188,13 +194,16 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
                 (queryFilter.getResultTime() != null && queryFilter.getResultTime().isLatestTime());
         ParameterizedQuery query;
         if (queryBuilder.supportsLatestResultPerDataStreamQuery(queryFilter)) {
-            query = queryBuilder.createParameterizedLatestResultPerDataStreamQuery(queryFilter, queryFields);
+            query = queryBuilder.createParameterizedLatestResultPerDataStreamQuery(
+                    queryFilter, queryFields, parentTableOnly);
         } else if (latestSelection) {
             // DISTINCT ON relies on its inner ORDER BY. The outer keyset still
             // supplies the final stable page order.
-            query = queryBuilder.createParameterizedSelectEntriesQuery(queryFilter, queryFields);
+            query = queryBuilder.createParameterizedSelectEntriesQuery(
+                    queryFilter, queryFields, parentTableOnly);
         } else {
-            query = queryBuilder.createParameterizedUnorderedSelectEntriesQuery(queryFilter, queryFields);
+            query = queryBuilder.createParameterizedUnorderedSelectEntriesQuery(
+                    queryFilter, queryFields, parentTableOnly);
         }
         logger.debug(query.sql());
 
@@ -204,6 +213,7 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
                 new ObservationKeysetIterator<>(
                         query,
                         connectionManager,
+                        initialPageSize,
                         STREAM_FETCH_SIZE,
                         filter.getLimit(),
                         descending,

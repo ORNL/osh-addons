@@ -56,6 +56,22 @@ public class SelectEntriesQuery extends EntriesQuery<SelectFilterQueryGenerator>
             return self();
         }
 
+        public T parentTableOnly(boolean parentTableOnly) {
+            filterQueryGenerator.setParentTableOnly(parentTableOnly);
+            return self();
+        }
+
+        public T withRawCondition(String condition, Object... parameters) {
+            if (condition != null && !condition.isBlank()) {
+                filterQueryGenerator.addCondition("(" + condition + ")");
+                if (parameters != null) {
+                    for (Object parameter : parameters)
+                        filterQueryGenerator.addParameter(parameter);
+                }
+            }
+            return self();
+        }
+
         public SelectEntriesQuery build() {
             return new SelectEntriesQuery(this);
         }

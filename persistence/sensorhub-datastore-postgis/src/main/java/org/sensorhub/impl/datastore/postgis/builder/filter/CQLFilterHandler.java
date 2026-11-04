@@ -51,7 +51,11 @@ public class CQLFilterHandler {
     }
 
     private void processFilter(Filter filter) {
-        if (filter instanceof And) {
+        if (filter == Filter.INCLUDE) {
+            whereClause.append("TRUE");
+        } else if (filter == Filter.EXCLUDE) {
+            whereClause.append("FALSE");
+        } else if (filter instanceof And) {
             handleAnd((And) filter);
         } else if (filter instanceof Or) {
             handleOr((Or) filter);
