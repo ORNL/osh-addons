@@ -26,6 +26,18 @@ public class SelectEntriesQuery extends EntriesQuery<SelectFilterQueryGenerator>
             return self();
         }
 
+        public T withAdditionalSelectFields(String... fieldNames) {
+            if (fieldNames != null) {
+                for (String fieldName : fieldNames) {
+                    if (fieldName == null || !fieldName.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+                        throw new IllegalArgumentException("Invalid SQL select column identifier: " + fieldName);
+                    }
+                    filterQueryGenerator.addSelectField(fieldName);
+                }
+            }
+            return self();
+        }
+
         public T withOnlyId() {
             filterQueryGenerator.addSelectField("id");
             return self();

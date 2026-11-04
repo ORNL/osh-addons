@@ -231,6 +231,14 @@ public class TestParameterizedQueryBuilder {
         ObsFilter latest = new ObsFilter.Builder().withLatestResult().build();
         assertThrows(IllegalArgumentException.class,
                 () -> builder.createParameterizedUnorderedSelectEntriesQuery(latest, null));
+
+        ParameterizedQuery withTableOid = builder.createParameterizedUnorderedSelectEntriesQuery(
+                ascending, Set.of(IObsStore.ObsField.PHENOMENON_TIME), "tableoid");
+        assertTrue(withTableOid.sql().contains("obs.id,obs.tableoid FROM obs"));
+        assertFalse(withTableOid.sql().contains(" ORDER BY "));
+        assertThrows(IllegalArgumentException.class,
+                () -> builder.createParameterizedUnorderedSelectEntriesQuery(
+                        ascending, Set.of(IObsStore.ObsField.PHENOMENON_TIME), "tableoid; DROP TABLE obs"));
     }
 
     @Test

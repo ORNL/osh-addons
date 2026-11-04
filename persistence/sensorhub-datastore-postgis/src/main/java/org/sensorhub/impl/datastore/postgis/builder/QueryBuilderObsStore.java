@@ -381,22 +381,28 @@ public class QueryBuilderObsStore extends QueryBuilder {
      */
     public ParameterizedQuery createParameterizedUnorderedSelectEntriesQuery(
             ObsFilter filter, Set<IObsStore.ObsField> fields) {
+        return createParameterizedUnorderedSelectEntriesQuery(filter, fields, new String[0]);
+    }
+
+    public ParameterizedQuery createParameterizedUnorderedSelectEntriesQuery(
+            ObsFilter filter, Set<IObsStore.ObsField> fields, String... additionalSelectColumns) {
         if ((filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
                 (filter.getResultTime() != null && filter.getResultTime().isLatestTime())) {
             throw new IllegalArgumentException(
                     "Latest observation selection requires its DISTINCT ON ordering");
         }
-        return createParameterizedSelectEntriesQuery(filter, fields, false);
+        return createParameterizedSelectEntriesQuery(filter, fields, false, additionalSelectColumns);
     }
 
     private ParameterizedQuery createParameterizedSelectEntriesQuery(
-            ObsFilter filter, Set<IObsStore.ObsField> fields, boolean ordered) {
+            ObsFilter filter, Set<IObsStore.ObsField> fields, boolean ordered, String... additionalSelectColumns) {
         SelectEntriesObsQuery selectEntriesObsQuery = new SelectEntriesObsQuery.Builder()
                 .tableName(this.getStoreTableName())
                 .linkTo(this.systemStore)
                 .linkTo(this.dataStreamStore)
                 .linkTo(this.foiStore)
                 .withFields(fields)
+                .withAdditionalSelectFields(additionalSelectColumns)
                 .withObsFilter(filter)
                 .withLimit(filter.getLimit())
                 .withoutOrderByIf(!ordered)
