@@ -99,6 +99,21 @@ public class QueryBuilderObsStore extends QueryBuilder {
                 " (archivegenerationid, id) WHERE archivegenerationid IS NOT NULL";
     }
 
+    /**
+     * Covering partial index for unadjudicated alarm counts across tiered
+     * datastreams so {@code count_alarm} executes as an index-only scan without
+     * random heap fetches.
+     */
+    public String createTieredUnadjudicatedAlarmIndexQuery() {
+        return "CREATE INDEX IF NOT EXISTS " + getStoreTableName() +
+                "_unadjudicated_alarm_idx ON " + getStoreTableName() +
+                " (" + DATASTREAM_ID + ", " + RESULT_TIME + ") " +
+                "INCLUDE (archivegenerationid) " +
+                "WHERE ((" + RESULT + " @> '{\"gammaAlarm\": true}'::jsonb OR " +
+                RESULT + " @> '{\"neutronAlarm\": true}'::jsonb) AND " +
+                RESULT + " @> '{\"adjudicatedIdsCount\": 0}'::jsonb)";
+    }
+
     public String createDataIndexQuery() {
         return "CREATE INDEX IF NOT EXISTS "+this.getStoreTableName()+"_data_idx on "+this.getStoreTableName()+" USING GIN("+RESULT+")";
     }
@@ -130,8 +145,25 @@ public class QueryBuilderObsStore extends QueryBuilder {
                 createKeysetPhenomenonTimeDescIndexQuery(),
                 createKeysetDataStreamPhenomenonTimeAscIndexQuery(),
                 createKeysetDataStreamPhenomenonTimeDescIndexQuery(),
-                createKeysetDataStreamResultTimeIndexQuery()
+                createKeysetDataStreamResultTimeIndexQuery(),
+                createNonAlarmKeysetPhenomenonTimeDescIndexQuery()
         };
+    }
+
+    /**
+     * Ordered partial index for non-alarm occupancy paging ({@code gammaAlarm=false
+     * AND neutronAlarm=false ORDER BY phenomenontime DESC NULLS FIRST, id ASC})
+     * so Event Log's lowest-priority bucket walks the newest matching rows
+     * directly instead of scanning and top-N sorting every historical occupancy
+     * heap page via GIN {@code BitmapAnd}.
+     */
+    public String createNonAlarmKeysetPhenomenonTimeDescIndexQuery() {
+        return "CREATE INDEX IF NOT EXISTS " + this.getStoreTableName() +
+                "_non_alarm_ptime_desc_idx on " +
+                this.getStoreTableName() + " (" + PHENOMENON_TIME + " DESC NULLS FIRST, id ASC) " +
+                "INCLUDE (" + DATASTREAM_ID + ", " + RESULT_TIME + ") " +
+                "WHERE (" + RESULT + " @> '{\"gammaAlarm\": false}'::jsonb AND " +
+                RESULT + " @> '{\"neutronAlarm\": false}'::jsonb)";
     }
 
     /**

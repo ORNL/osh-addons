@@ -63,6 +63,27 @@ public class TestArchiveLifecycleInvariants {
     }
 
     @Test
+    public void sha256Uses9pSafeChunkBufferAndMatchesMultiChunkDigest() throws Exception {
+        assertTrue("SHA-256 read buffer must stay below WSL2 9p msize=65536 and order-4 allocations",
+                ArchiveExporter.SHA256_READ_BUFFER_BYTES > 0 &&
+                        ArchiveExporter.SHA256_READ_BUFFER_BYTES <= 16 * 1024);
+        assertTrue(ArchiveExporter.isTransientAllocationIoError(
+                new java.io.IOException("Cannot allocate memory")));
+        assertFalse(ArchiveExporter.isTransientAllocationIoError(
+                new java.io.IOException("Permission denied")));
+        assertFalse(ArchiveExporter.isTransientAllocationIoError(new java.io.IOException()));
+
+        Path sample = temporary.newFile("multi-chunk.bin").toPath();
+        byte[] payload = new byte[ArchiveExporter.SHA256_READ_BUFFER_BYTES * 5 + 317];
+        for (int i = 0; i < payload.length; i++)
+            payload[i] = (byte) ((i * 31 + 17) & 0xff);
+        Files.write(sample, payload);
+        String expected = java.util.HexFormat.of().formatHex(
+                java.security.MessageDigest.getInstance("SHA-256").digest(payload));
+        assertEquals(expected, ArchiveExporter.sha256(sample));
+    }
+
+    @Test
     public void exactObservationHoldsAreExcludedFromDeletionBatch() {
         assertEquals(List.of(10L, 12L), ArchiveLifecycleManager.withoutHeld(
                 List.of(10L, 11L, 12L, 13L), Set.of(11L, 13L)));

@@ -415,15 +415,37 @@ public final class ArchiveExporter {
         }
     }
 
+    /**
+     * Keep each read syscall well below WSL2 9p drvFs {@code msize=65536} and
+     * order-4 contiguous kernel page allocations so cold Parquet checksum
+     * verification never fails with {@code IOException: Cannot allocate memory}
+     * when guest page cache fragments higher-order kernel buddy blocks.
+     */
+    static final int SHA256_READ_BUFFER_BYTES = 16 * 1024;
+    private static final int SHA256_TRANSIENT_ALLOCATION_RETRIES = 3;
+
     public static String sha256(Path path) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        try (var input = Files.newInputStream(path)) {
-            byte[] buffer = new byte[1024 * 1024];
-            int read;
-            while ((read = input.read(buffer)) >= 0)
-                if (read > 0) digest.update(buffer, 0, read);
+        for (int attempt = 1; ; attempt++) {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (var input = Files.newInputStream(path)) {
+                byte[] buffer = new byte[SHA256_READ_BUFFER_BYTES];
+                int read;
+                while ((read = input.read(buffer)) >= 0)
+                    if (read > 0) digest.update(buffer, 0, read);
+                return HexFormat.of().formatHex(digest.digest());
+            } catch (IOException error) {
+                if (attempt >= SHA256_TRANSIENT_ALLOCATION_RETRIES ||
+                        !isTransientAllocationIoError(error)) {
+                    throw error;
+                }
+                Thread.sleep(20L * attempt);
+            }
         }
-        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    static boolean isTransientAllocationIoError(IOException error) {
+        String message = error.getMessage();
+        return message != null && message.contains("Cannot allocate memory");
     }
 
     private static void forceFile(Path path) throws IOException {

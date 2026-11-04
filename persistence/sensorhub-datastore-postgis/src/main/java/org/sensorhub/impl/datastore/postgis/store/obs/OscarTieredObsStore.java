@@ -122,11 +122,13 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 String[] markerQueries = archiveConfig.isParquetPrimary()
                         ? new String[]{
                         queryBuilder.addArchiveGenerationColumnQuery(),
-                        queryBuilder.createUnarchivedTimeIndexQuery()}
+                        queryBuilder.createUnarchivedTimeIndexQuery(),
+                        queryBuilder.createTieredUnadjudicatedAlarmIndexQuery()}
                         : new String[]{
                         queryBuilder.addArchiveGenerationColumnQuery(),
                         queryBuilder.createUnarchivedTimeIndexQuery(),
-                        queryBuilder.createArchiveGenerationIndexQuery()};
+                        queryBuilder.createArchiveGenerationIndexQuery(),
+                        queryBuilder.createTieredUnadjudicatedAlarmIndexQuery()};
                 org.sensorhub.impl.datastore.postgis.utils.PostgisUtils.executeQueries(
                         connection, markerQueries);
             } catch (java.sql.SQLException e) {

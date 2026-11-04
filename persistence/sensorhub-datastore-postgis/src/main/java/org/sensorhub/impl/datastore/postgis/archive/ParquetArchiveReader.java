@@ -40,6 +40,7 @@ import java.util.stream.StreamSupport;
 /** Reads only catalog-authorized Parquet objects and validates each object before first use. */
 public final class ParquetArchiveReader {
     private static final long VERIFICATION_TTL_NANOS = java.time.Duration.ofMinutes(5).toNanos();
+    private static final int VERIFICATION_LOCK_STRIPES = 64;
     private static final String METADATA_COLUMNS =
             "filename, id_scope, id_value, datastream_scope, datastream_id, " +
                     "foi_scope, foi_id, phenomenon_time, result_time, profile";
@@ -50,8 +51,16 @@ public final class ParquetArchiveReader {
     private final Path root;
     private final TieredArchiveConfig config;
     private final Map<Path, VerificationStamp> verifiedObjects = new ConcurrentHashMap<>();
+    private final Object[] verificationLocks = createVerificationLocks();
     private final Map<String, java.util.Optional<Instant>> maxResultTimeBySha256 = new ConcurrentHashMap<>();
     private final AtomicInteger openCursors = new AtomicInteger();
+
+    private static Object[] createVerificationLocks() {
+        Object[] locks = new Object[VERIFICATION_LOCK_STRIPES];
+        for (int i = 0; i < locks.length; i++)
+            locks[i] = new Object();
+        return locks;
+    }
 
     public ParquetArchiveReader(Path root) {
         this(root, defaultConfig(root));
@@ -781,13 +790,21 @@ public final class ParquetArchiveReader {
             VerificationStamp cached = verifiedObjects.get(object);
             if (cached != null && cached.matches(expectedSha256, before, now))
                 return;
-            String actual = ArchiveExporter.sha256(object);
-            if (!expectedSha256.equals(actual))
-                throw new IllegalStateException("Archive checksum mismatch: " + object);
-            BasicFileAttributes after = readAttributes(object);
-            if (!sameObject(before, after))
-                throw new IllegalStateException("Archive object changed while its checksum was being verified: " + object);
-            verifiedObjects.put(object, VerificationStamp.from(expectedSha256, after, now));
+            Object lock = verificationLocks[object.hashCode() & (VERIFICATION_LOCK_STRIPES - 1)];
+            synchronized (lock) {
+                before = readAttributes(object);
+                now = System.nanoTime();
+                cached = verifiedObjects.get(object);
+                if (cached != null && cached.matches(expectedSha256, before, now))
+                    return;
+                String actual = ArchiveExporter.sha256(object);
+                if (!expectedSha256.equals(actual))
+                    throw new IllegalStateException("Archive checksum mismatch: " + object);
+                BasicFileAttributes after = readAttributes(object);
+                if (!sameObject(before, after))
+                    throw new IllegalStateException("Archive object changed while its checksum was being verified: " + object);
+                verifiedObjects.put(object, VerificationStamp.from(expectedSha256, after, now));
+            }
         } catch (Exception e) {
             verifiedObjects.remove(object);
             throw new IllegalStateException("Cannot verify archive object " + object, e);

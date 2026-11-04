@@ -469,10 +469,12 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                 TABLE + "_datastream_id_result_time_idx",
                 TABLE + "_foi_idx",
                 TABLE + "_unarchived_time_idx",
+                TABLE + "_unadjudicated_alarm_idx",
                 TABLE + "_result_path_ops_idx",
                 TABLE + "_result_occupancy_count_idx",
                 TABLE + "_result_max_gamma_idx",
-                TABLE + "_result_max_neutron_idx")) {
+                TABLE + "_result_max_neutron_idx",
+                TABLE + "_non_alarm_ptime_desc_idx")) {
             assertTrue("Missing required PARQUET_PRIMARY index " + required,
                     indexes.contains(required));
         }
@@ -3538,6 +3540,7 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                     throw absentOnLegacySchema;
             }
             for (String mutableCountTable : List.of("oscar_mutable_stream_counts",
+                    "oscar_mutable_stream_counts_delta",
                     "oscar_mutable_stream_counts_state")) {
                 try (PreparedStatement counts = connection.prepareStatement(
                         "DELETE FROM " + mutableCountTable + " WHERE store_key=?")) {
@@ -4671,16 +4674,24 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             assertEquals("Immutable streams must never enter oscar_mutable_stream_counts", 0L,
                     queryLong(connection, "SELECT count(*) FROM oscar_mutable_stream_counts " +
                             "WHERE store_key='" + TABLE + "' AND datastream_id=" + rawStream.getIdAsLong()));
+            assertEquals("Immutable streams must never enter oscar_mutable_stream_counts_delta", 0L,
+                    queryLong(connection, "SELECT count(*) FROM oscar_mutable_stream_counts_delta " +
+                            "WHERE store_key='" + TABLE + "' AND datastream_id=" + rawStream.getIdAsLong()));
             assertEquals(4L, queryLong(connection,
-                    "SELECT COALESCE(sum(total_rows),0) FROM oscar_mutable_stream_counts " +
+                    "SELECT COALESCE((SELECT sum(total_rows) FROM oscar_mutable_stream_counts " +
                             "WHERE store_key='" + TABLE + "' AND datastream_id IN (" +
-                            occStreamA.getIdAsLong() + "," + occStreamB.getIdAsLong() + ")"));
+                            occStreamA.getIdAsLong() + "," + occStreamB.getIdAsLong() + ")),0) + " +
+                            "COALESCE((SELECT sum(total_rows) FROM oscar_mutable_stream_counts_delta " +
+                            "WHERE store_key='" + TABLE + "' AND datastream_id IN (" +
+                            occStreamA.getIdAsLong() + "," + occStreamB.getIdAsLong() + ")),0)"));
             assertEquals(0L, queryLong(connection,
-                    "SELECT COALESCE(sum(null_result_time_rows),0) FROM oscar_mutable_stream_counts " +
-                            "WHERE store_key='" + TABLE + "'"));
+                    "SELECT COALESCE((SELECT sum(null_result_time_rows) FROM oscar_mutable_stream_counts " +
+                            "WHERE store_key='" + TABLE + "'),0) + " +
+                            "COALESCE((SELECT sum(null_result_time_rows) FROM oscar_mutable_stream_counts_delta " +
+                            "WHERE store_key='" + TABLE + "'),0)"));
         }
 
-        // Verify fast mutable count + CQL count + bounded descending CQL merge parity
+        // Verify fast mutable count + CQL count + bounded descending CQL merge parity BEFORE delta compaction
         List<ObsFilter> checks = List.of(
                 new ObsFilter.Builder().withDataStreams(occStreamA, occStreamB).build(),
                 new ObsFilter.Builder().withDataStreams(occStreamA, occStreamB)
@@ -4701,7 +4712,27 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         );
         for (int i = 0; i < checks.size(); i++) {
             ObsFilter check = checks.get(i);
-            assertEquals("Count parity failed at check index " + i,
+            assertEquals("Count parity failed before compaction at check index " + i,
+                    selectCount(tiered, check), tiered.countMatchingEntries(check));
+        }
+
+        // Lifecycle maintenance compacts oscar_mutable_stream_counts_delta into oscar_mutable_stream_counts
+        tiered.maintainArchiveLifecycle();
+        try (Connection connection = open()) {
+            assertEquals("Compaction must drain oscar_mutable_stream_counts_delta", 0L,
+                    queryLong(connection, "SELECT count(*) FROM oscar_mutable_stream_counts_delta " +
+                            "WHERE store_key='" + TABLE + "'"));
+            assertEquals(4L, queryLong(connection,
+                    "SELECT COALESCE(sum(total_rows),0) FROM oscar_mutable_stream_counts " +
+                            "WHERE store_key='" + TABLE + "' AND datastream_id IN (" +
+                            occStreamA.getIdAsLong() + "," + occStreamB.getIdAsLong() + ")"));
+            assertEquals(0L, queryLong(connection,
+                    "SELECT COALESCE(sum(null_result_time_rows),0) FROM oscar_mutable_stream_counts " +
+                            "WHERE store_key='" + TABLE + "'"));
+        }
+        for (int i = 0; i < checks.size(); i++) {
+            ObsFilter check = checks.get(i);
+            assertEquals("Count parity failed after compaction at check index " + i,
                     selectCount(tiered, check), tiered.countMatchingEntries(check));
         }
 
@@ -4726,6 +4757,234 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         obsStore = tiered;
         assertEquals(4L, tiered.countMatchingEntries(
                 new ObsFilter.Builder().withDataStreams(occStreamA, occStreamB).build()));
+    }
+
+    @Test
+    public void parquetPrimaryConcurrentOutOfOrderMutableTransactionsNeverDeadlockAndCompactCleanly() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.outputNames = List.of("gammaCounts");
+        primaryConfig.immutableStageWindowMinutes = 30;
+        primaryConfig.maximumGenerationsPerCycle = 2;
+        primaryConfig.maximumVerificationsPerCycle = 2;
+        primaryConfig.maximumDeletionsPerCycle = 2;
+        primaryConfig.deleteHotAfterArchive = true;
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        Instant base = Instant.parse("2026-09-04T00:00:00Z");
+        BigId occStreamA = addAlarmDataStream(bigId(961), "occupancy");
+        BigId occStreamB = addAlarmDataStream(bigId(962), "occupancy");
+
+        BigId idA1 = tiered.add(alarmObs(occStreamA, base.plusSeconds(1), base.plusSeconds(1), false, false, 10.0));
+        tiered.add(alarmObs(occStreamA, base.plusSeconds(2), base.plusSeconds(2), false, false, 11.0));
+        BigId idB1 = tiered.add(alarmObs(occStreamB, base.plusSeconds(3), base.plusSeconds(3), false, false, 12.0));
+        tiered.add(alarmObs(occStreamB, base.plusSeconds(4), base.plusSeconds(4), false, false, 13.0));
+        forceReadBackFromStorage();
+
+        java.util.concurrent.CyclicBarrier barrier = new java.util.concurrent.CyclicBarrier(2);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> batchWriterBThenA = pool.submit(() -> {
+                try (Connection conn = open()) {
+                    conn.setAutoCommit(false);
+                    try (PreparedStatement ins = conn.prepareStatement(
+                            "INSERT INTO " + TABLE + " (id, datastreamid, phenomenontime, resulttime, result) " +
+                                    "VALUES (?, ?, ?::timestamp, ?::timestamp, " +
+                                    "'{\"gammaAlarm\":false,\"neutronAlarm\":false,\"maxGamma\":14.0}'::jsonb)")) {
+                        ins.setLong(1, 900_001L);
+                        ins.setLong(2, occStreamB.getIdAsLong());
+                        ins.setString(3, "2026-09-04 00:01:00");
+                        ins.setString(4, "2026-09-04 00:01:00");
+                        assertEquals(1, ins.executeUpdate());
+
+                        barrier.await(5, TimeUnit.SECONDS);
+
+                        ins.setLong(1, 900_002L);
+                        ins.setLong(2, occStreamA.getIdAsLong());
+                        ins.setString(3, "2026-09-04 00:01:01");
+                        ins.setString(4, "2026-09-04 00:01:01");
+                        assertEquals(1, ins.executeUpdate());
+                        conn.commit();
+                    } catch (Exception e) {
+                        conn.rollback();
+                        throw e;
+                    }
+                }
+                return null;
+            });
+
+            Future<?> purgerAThenB = pool.submit(() -> {
+                try (Connection conn = open()) {
+                    conn.setAutoCommit(false);
+                    try (PreparedStatement del = conn.prepareStatement(
+                            "DELETE FROM " + TABLE + " WHERE id = ?")) {
+                        del.setLong(1, idA1.getIdAsLong());
+                        assertEquals(1, del.executeUpdate());
+
+                        barrier.await(5, TimeUnit.SECONDS);
+
+                        del.setLong(1, idB1.getIdAsLong());
+                        assertEquals(1, del.executeUpdate());
+                        conn.commit();
+                    } catch (Exception e) {
+                        conn.rollback();
+                        throw e;
+                    }
+                }
+                return null;
+            });
+
+            batchWriterBThenA.get(10, TimeUnit.SECONDS);
+            purgerAThenB.get(10, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+        }
+
+        ObsFilter bothStreams = new ObsFilter.Builder().withDataStreams(occStreamA, occStreamB).build();
+        assertEquals(4L, tiered.countMatchingEntries(bothStreams));
+        assertEquals(4L, selectCount(tiered, bothStreams));
+
+        tiered.maintainArchiveLifecycle();
+        try (Connection conn = open()) {
+            assertEquals(0L, queryLong(conn,
+                    "SELECT count(*) FROM oscar_mutable_stream_counts_delta WHERE store_key='" + TABLE + "'"));
+            assertEquals(4L, queryLong(conn,
+                    "SELECT COALESCE(sum(total_rows),0) FROM oscar_mutable_stream_counts " +
+                            "WHERE store_key='" + TABLE + "'"));
+        }
+        assertEquals(4L, tiered.countMatchingEntries(bothStreams));
+    }
+
+    @Test
+    public void nonAlarmKeysetAndUnadjudicatedAlarmPartialIndexesSupportGenericPreparedPlans() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.outputNames = List.of("gammaCounts");
+        primaryConfig.immutableStageWindowMinutes = 30;
+        primaryConfig.maximumGenerationsPerCycle = 2;
+        primaryConfig.maximumVerificationsPerCycle = 2;
+        primaryConfig.maximumDeletionsPerCycle = 2;
+        primaryConfig.deleteHotAfterArchive = true;
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        BigId occStreamA = addAlarmDataStream(bigId(971), "occupancy");
+        BigId occStreamB = addAlarmDataStream(bigId(972), "occupancy");
+        try (Connection conn = open()) {
+            try (PreparedStatement ins = conn.prepareStatement(
+                    "INSERT INTO " + TABLE + " (id, datastreamid, phenomenontime, resulttime, result) " +
+                            "VALUES (?, ?, ?::timestamp, ?::timestamp, ?::jsonb)")) {
+                for (int i = 1; i <= 60; i++) {
+                    ins.setLong(1, 950_000L + i);
+                    ins.setLong(2, (i % 2 == 0 ? occStreamA : occStreamB).getIdAsLong());
+                    String ts = String.format("2026-09-05 00:%02d:00", i % 60);
+                    ins.setString(3, ts);
+                    ins.setString(4, ts);
+                    String json = (i % 10 == 0)
+                            ? "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":0,\"maxGamma\":88.0}"
+                            : "{\"gammaAlarm\":false,\"neutronAlarm\":false,\"adjudicatedIdsCount\":0,\"maxGamma\":10.0}";
+                    ins.setString(5, json);
+                    ins.addBatch();
+                }
+                ins.executeBatch();
+            }
+            try (Statement stmt = conn.createStatement()) {
+                stmt.execute("SET max_parallel_maintenance_workers = 0");
+                stmt.execute("VACUUM ANALYZE " + TABLE);
+            }
+        }
+
+        QueryBuilderObsStore builder = new QueryBuilderObsStore(TABLE, false);
+        ObsFilter nonAlarmPageFilter = new ObsFilter.Builder()
+                .withDataStreams(occStreamA, occStreamB)
+                .withPhenomenonTime(new TemporalFilter.Builder()
+                        .withAllTimes().descendingOrder(true).build())
+                .withCQLFilter("gammaAlarm = false AND neutronAlarm = false")
+                .withLimit(5)
+                .build();
+        String nonAlarmSql = toPostgresPositionalSql(
+                builder.createParameterizedSelectEntriesQuery(nonAlarmPageFilter, null).sql());
+
+        ObsFilter unadjudicatedAlarmFilter = new ObsFilter.Builder()
+                .withDataStreams(occStreamA, occStreamB)
+                .withResultTime(new TemporalFilter.Builder()
+                        .withRange(Range.closed(Instant.MIN, Instant.parse("2026-09-05T01:00:00Z"))).build())
+                .withCQLFilter("(gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0")
+                .build();
+        String alarmCountSql = toPostgresPositionalSql(
+                builder.createParameterizedSelectEntriesCountQuery(unadjudicatedAlarmFilter).sql());
+
+        try (Connection conn = open(); Statement stmt = conn.createStatement()) {
+            stmt.execute("SET plan_cache_mode = force_generic_plan");
+            stmt.execute("SET enable_seqscan = off");
+            stmt.execute("SET enable_bitmapscan = off");
+
+            stmt.execute("PREPARE oscar_non_alarm_page(bigint, bigint) AS " + nonAlarmSql);
+            StringBuilder nonAlarmPlan = new StringBuilder();
+            try (ResultSet rs = stmt.executeQuery("EXPLAIN (COSTS OFF) EXECUTE oscar_non_alarm_page(" +
+                    occStreamA.getIdAsLong() + ", " + occStreamB.getIdAsLong() + ")")) {
+                while (rs.next())
+                    nonAlarmPlan.append(rs.getString(1)).append('\n');
+            }
+            assertTrue("Expected non-alarm partial index scan in generic plan:\n" + nonAlarmPlan,
+                    nonAlarmPlan.toString().contains(TABLE + "_non_alarm_ptime_desc_idx"));
+            assertFalse("Ordered partial index scan must not require a Sort:\n" + nonAlarmPlan,
+                    nonAlarmPlan.toString().contains("Sort"));
+
+            stmt.execute("PREPARE oscar_alarm_count(bigint, bigint, text) AS " + alarmCountSql);
+            StringBuilder alarmPlan = new StringBuilder();
+            try (ResultSet rs = stmt.executeQuery("EXPLAIN (COSTS OFF) EXECUTE oscar_alarm_count(" +
+                    occStreamA.getIdAsLong() + ", " + occStreamB.getIdAsLong() + ", '2026-09-05T01:00:00Z')")) {
+                while (rs.next())
+                    alarmPlan.append(rs.getString(1)).append('\n');
+            }
+            assertTrue("Expected unadjudicated alarm partial index in generic plan:\n" + alarmPlan,
+                    alarmPlan.toString().contains(TABLE + "_unadjudicated_alarm_idx"));
+        }
+
+        assertEquals(6L, tiered.countMatchingEntries(unadjudicatedAlarmFilter));
+    }
+
+    private static String toPostgresPositionalSql(String jdbcSql) {
+        StringBuilder out = new StringBuilder();
+        int index = 1;
+        for (int i = 0; i < jdbcSql.length(); i++) {
+            char ch = jdbcSql.charAt(i);
+            if (ch == '?')
+                out.append('$').append(index++);
+            else
+                out.append(ch);
+        }
+        return out.toString();
     }
 
     private BigId addAlarmDataStream(BigId systemId, String outputName) throws Exception {

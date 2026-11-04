@@ -26,6 +26,8 @@ public class CQLFilterHandler {
             "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T" +
             "([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?" +
             "(Z|[+-]((0[0-9]|1[0-7]):[0-5][0-9]|18:00))$";
+    private static final java.util.regex.Pattern SAFE_IDENTIFIER_PATH_PATTERN =
+            java.util.regex.Pattern.compile("^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$");
 
     private StringBuilder whereClause;
     private List<Object> parameters;
@@ -115,6 +117,13 @@ public class CQLFilterHandler {
         if (value == null) {
             // NULL checks can't use containment
             whereClause.append(buildJsonPathExtract(propertyName)).append(" IS NULL");
+        } else if ((value instanceof Boolean || isSafeFiniteNumber(value)) &&
+                SAFE_IDENTIFIER_PATH_PATTERN.matcher(propertyName).matches()) {
+            // Inline safe boolean/numeric JSONB literals so PostgreSQL partial indexes
+            // and MCV statistics remain usable even under pgjdbc generic prepared plans.
+            whereClause.append("result @> '")
+                    .append(buildNestedJsonObject(propertyName, value))
+                    .append("'::jsonb");
         } else if (value instanceof Boolean || value instanceof Number || value instanceof String) {
             // Use containment operator for GIN index optimization
             whereClause.append("result @> ?::jsonb");
@@ -124,6 +133,16 @@ public class CQLFilterHandler {
             whereClause.append(buildJsonPathExtract(propertyName)).append(" = ?");
             parameters.add(value.toString());
         }
+    }
+
+    private static boolean isSafeFiniteNumber(Object value) {
+        if (!(value instanceof Number number))
+            return false;
+        if (number instanceof Double d)
+            return Double.isFinite(d);
+        if (number instanceof Float f)
+            return Float.isFinite(f);
+        return true;
     }
 
     private void handleNotEquals(PropertyIsNotEqualTo filter) {
