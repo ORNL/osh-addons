@@ -134,6 +134,19 @@ public class QueryBuilderObsStore extends QueryBuilder {
         };
     }
 
+    /**
+     * Keeps PostgreSQL's visibility map current on insert-heavy observation
+     * tables so index-only scans and counts do not degrade into hundreds of
+     * thousands of heap page fetches between default 20%-scale autovacuums.
+     */
+    public String configureAutovacuumQuery() {
+        return "ALTER TABLE " + this.getStoreTableName() + " SET (" +
+                "autovacuum_vacuum_insert_scale_factor = 0.01, " +
+                "autovacuum_vacuum_insert_threshold = 5000, " +
+                "autovacuum_vacuum_scale_factor = 0.02, " +
+                "autovacuum_vacuum_threshold = 2000)";
+    }
+
     public String createKeysetPhenomenonTimeAscIndexQuery() {
         return "CREATE INDEX IF NOT EXISTS " + this.getStoreTableName() + "_phenomenon_time_id_nulls_first_idx on " +
                 this.getStoreTableName() + " (" + PHENOMENON_TIME + " ASC NULLS FIRST, id ASC)";
@@ -369,7 +382,12 @@ public class QueryBuilderObsStore extends QueryBuilder {
     }
 
     public ParameterizedQuery createParameterizedSelectEntriesQuery(ObsFilter filter, Set<IObsStore.ObsField> fields) {
-        return createParameterizedSelectEntriesQuery(filter, fields, true);
+        return createParameterizedSelectEntriesQuery(filter, fields, false);
+    }
+
+    public ParameterizedQuery createParameterizedSelectEntriesQuery(
+            ObsFilter filter, Set<IObsStore.ObsField> fields, boolean parentTableOnly) {
+        return createParameterizedSelectEntriesQuery(filter, fields, true, parentTableOnly);
     }
 
     /**
@@ -381,21 +399,34 @@ public class QueryBuilderObsStore extends QueryBuilder {
      */
     public ParameterizedQuery createParameterizedUnorderedSelectEntriesQuery(
             ObsFilter filter, Set<IObsStore.ObsField> fields) {
-        return createParameterizedUnorderedSelectEntriesQuery(filter, fields, new String[0]);
+        return createParameterizedUnorderedSelectEntriesQuery(filter, fields, false, new String[0]);
+    }
+
+    public ParameterizedQuery createParameterizedUnorderedSelectEntriesQuery(
+            ObsFilter filter, Set<IObsStore.ObsField> fields, boolean parentTableOnly) {
+        return createParameterizedUnorderedSelectEntriesQuery(filter, fields, parentTableOnly, new String[0]);
     }
 
     public ParameterizedQuery createParameterizedUnorderedSelectEntriesQuery(
             ObsFilter filter, Set<IObsStore.ObsField> fields, String... additionalSelectColumns) {
+        return createParameterizedUnorderedSelectEntriesQuery(filter, fields, false, additionalSelectColumns);
+    }
+
+    public ParameterizedQuery createParameterizedUnorderedSelectEntriesQuery(
+            ObsFilter filter, Set<IObsStore.ObsField> fields, boolean parentTableOnly,
+            String... additionalSelectColumns) {
         if ((filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
                 (filter.getResultTime() != null && filter.getResultTime().isLatestTime())) {
             throw new IllegalArgumentException(
                     "Latest observation selection requires its DISTINCT ON ordering");
         }
-        return createParameterizedSelectEntriesQuery(filter, fields, false, additionalSelectColumns);
+        return createParameterizedSelectEntriesQuery(
+                filter, fields, false, parentTableOnly, additionalSelectColumns);
     }
 
     private ParameterizedQuery createParameterizedSelectEntriesQuery(
-            ObsFilter filter, Set<IObsStore.ObsField> fields, boolean ordered, String... additionalSelectColumns) {
+            ObsFilter filter, Set<IObsStore.ObsField> fields, boolean ordered,
+            boolean parentTableOnly, String... additionalSelectColumns) {
         SelectEntriesObsQuery selectEntriesObsQuery = new SelectEntriesObsQuery.Builder()
                 .tableName(this.getStoreTableName())
                 .linkTo(this.systemStore)
@@ -404,6 +435,7 @@ public class QueryBuilderObsStore extends QueryBuilder {
                 .withFields(fields)
                 .withAdditionalSelectFields(additionalSelectColumns)
                 .withObsFilter(filter)
+                .parentTableOnly(parentTableOnly)
                 .withLimit(filter.getLimit())
                 .withoutOrderByIf(!ordered)
                 .build();
@@ -461,6 +493,13 @@ public class QueryBuilderObsStore extends QueryBuilder {
     public ParameterizedQuery createParameterizedLatestResultPerDataStreamQuery(
             ObsFilter filter,
             Set<IObsStore.ObsField> fields) {
+        return createParameterizedLatestResultPerDataStreamQuery(filter, fields, false);
+    }
+
+    public ParameterizedQuery createParameterizedLatestResultPerDataStreamQuery(
+            ObsFilter filter,
+            Set<IObsStore.ObsField> fields,
+            boolean parentTableOnly) {
         if (!supportsLatestResultPerDataStreamQuery(filter)) {
             throw new IllegalArgumentException("Filter is not eligible for the latest-result-per-stream query");
         }
@@ -497,13 +536,14 @@ public class QueryBuilderObsStore extends QueryBuilder {
             selectedColumns = "latest.*";
         }
 
+        String relation = (parentTableOnly ? "ONLY " : "") + this.getStoreTableName();
         StringBuilder sql = new StringBuilder("SELECT ")
                 .append(selectedColumns)
                 .append(" FROM unnest(ARRAY[")
                 .append(placeholders)
                 .append("]::bigint[]) AS requested(dataStreamID)")
                 .append(" CROSS JOIN LATERAL (SELECT candidate.* FROM ((SELECT non_null.* FROM ")
-                .append(this.getStoreTableName())
+                .append(relation)
                 .append(" non_null WHERE non_null.dataStreamID = requested.dataStreamID")
                 .append(" AND non_null.").append(timeColumn).append(" IS NOT NULL")
                 .append(" ORDER BY non_null.").append(timeColumn).append(" DESC, non_null.id DESC")
@@ -511,7 +551,7 @@ public class QueryBuilderObsStore extends QueryBuilder {
                 // decides whether to add paging. FETCH keeps this inner bound
                 // from being mistaken for the caller's outer result limit.
                 .append(" FETCH FIRST 1 ROW ONLY) UNION ALL (SELECT null_only.* FROM ")
-                .append(this.getStoreTableName())
+                .append(relation)
                 .append(" null_only WHERE null_only.dataStreamID = requested.dataStreamID")
                 .append(" AND null_only.").append(timeColumn).append(" IS NULL")
                 .append(" ORDER BY null_only.id DESC FETCH FIRST 1 ROW ONLY)) candidate")
@@ -533,12 +573,19 @@ public class QueryBuilderObsStore extends QueryBuilder {
     }
 
     public ParameterizedQuery createParameterizedSelectEntriesCountQuery(ObsFilter filter) {
+        return createParameterizedSelectEntriesCountQuery(filter, false, null);
+    }
+
+    public ParameterizedQuery createParameterizedSelectEntriesCountQuery(
+            ObsFilter filter, boolean parentTableOnly, String extraWhereClause, Object... extraParameters) {
         SelectEntriesObsQuery selectEntriesObsQuery = new SelectEntriesObsQuery.Builder()
                 .tableName(this.getStoreTableName())
                 .linkTo(this.systemStore)
                 .linkTo(this.dataStreamStore)
                 .linkTo(this.foiStore)
                 .withObsFilter(filter)
+                .parentTableOnly(parentTableOnly)
+                .withRawCondition(extraWhereClause, extraParameters)
                 .build();
         return selectEntriesObsQuery.toParameterizedCountQuery();
     }

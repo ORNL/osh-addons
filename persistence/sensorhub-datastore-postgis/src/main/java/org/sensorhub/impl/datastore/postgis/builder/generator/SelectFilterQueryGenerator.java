@@ -26,6 +26,15 @@ public class SelectFilterQueryGenerator extends FilterQueryGenerator {
     protected List<String> distinct;
     protected List<String> innerJoin;
     protected List<String> prioritizedInnerJoins;
+    protected boolean parentTableOnly;
+
+    public void setParentTableOnly(boolean parentTableOnly) {
+        this.parentTableOnly = parentTableOnly;
+    }
+
+    private String fromClause() {
+        return (this.parentTableOnly ? " FROM ONLY " : " FROM ") + this.tableName;
+    }
 
     public String toQuery() {
         StringBuilder sb = new StringBuilder();
@@ -43,7 +52,7 @@ public class SelectFilterQueryGenerator extends FilterQueryGenerator {
                 sb.append(" ").append(this.tableName).append(".* ");
             }
 
-            sb.append(" FROM ").append(this.tableName);
+            sb.append(fromClause());
         }
         if (this.prioritizedInnerJoins != null && !this.prioritizedInnerJoins.isEmpty()) {
             sb.append(" INNER JOIN ");
@@ -88,7 +97,7 @@ public class SelectFilterQueryGenerator extends FilterQueryGenerator {
     public String toCountQuery() {
         StringBuilder sb = new StringBuilder();
         sb.append("SELECT COUNT(*)");
-        sb.append(" FROM ").append(this.tableName);
+        sb.append(fromClause());
 
         if (this.prioritizedInnerJoins != null && !this.prioritizedInnerJoins.isEmpty()) {
             sb.append(" INNER JOIN ");

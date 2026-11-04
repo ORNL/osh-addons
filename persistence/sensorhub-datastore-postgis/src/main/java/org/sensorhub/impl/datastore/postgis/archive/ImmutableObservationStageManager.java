@@ -1,9 +1,15 @@
 package org.sensorhub.impl.datastore.postgis.archive;
 
+import com.google.common.collect.BoundType;
+import org.sensorhub.api.datastore.TemporalFilter;
+import org.sensorhub.api.datastore.obs.ObsFilter;
+import org.sensorhub.impl.datastore.postgis.utils.PostgisUtils;
+
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.sql.Array;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -45,6 +51,8 @@ public final class ImmutableObservationStageManager {
     private static final String ROUTE_TABLE = "oscar_obs_storage_route";
     private static final String PARTITION_TABLE = "oscar_obs_stage_partition";
     private static final String OWNER_TABLE = "oscar_obs_stage_owner";
+    private static final String MUTABLE_COUNTS_TABLE = "oscar_mutable_stream_counts";
+    private static final String MUTABLE_COUNTS_STATE_TABLE = "oscar_mutable_stream_counts_state";
     private static final DateTimeFormatter SQL_TIMESTAMP = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
 
     private final SqlConnectionProvider connections;
@@ -57,6 +65,14 @@ public final class ImmutableObservationStageManager {
     private final String identifierHash;
     private final String triggerName;
     private final String triggerFunction;
+    private final String mutableCountInsertTrigger;
+    private final String mutableCountInsertFunction;
+    private final String mutableCountUpdateTrigger;
+    private final String mutableCountUpdateFunction;
+    private final String mutableCountDeleteTrigger;
+    private final String mutableCountDeleteFunction;
+    private final String mutableCountTruncateTrigger;
+    private final String mutableCountTruncateFunction;
     private final Path archiveRoot;
 
     public ImmutableObservationStageManager(SqlConnectionProvider connections,
@@ -75,6 +91,14 @@ public final class ImmutableObservationStageManager {
         this.identifierHash = identifierDigest(storeKey + ":" + idScope);
         this.triggerName = safeIdentifier("oscar_stage_route_" + identifierHash);
         this.triggerFunction = safeIdentifier(triggerName + "_fn");
+        this.mutableCountInsertTrigger = safeIdentifier("oscar_mc_ins_" + identifierHash);
+        this.mutableCountInsertFunction = safeIdentifier(mutableCountInsertTrigger + "_fn");
+        this.mutableCountUpdateTrigger = safeIdentifier("oscar_mc_upd_" + identifierHash);
+        this.mutableCountUpdateFunction = safeIdentifier(mutableCountUpdateTrigger + "_fn");
+        this.mutableCountDeleteTrigger = safeIdentifier("oscar_mc_del_" + identifierHash);
+        this.mutableCountDeleteFunction = safeIdentifier(mutableCountDeleteTrigger + "_fn");
+        this.mutableCountTruncateTrigger = safeIdentifier("oscar_mc_trn_" + identifierHash);
+        this.mutableCountTruncateFunction = safeIdentifier(mutableCountTruncateTrigger + "_fn");
         this.archiveRoot = Path.of(config.rootDirectory).toAbsolutePath().normalize();
     }
 
@@ -124,6 +148,7 @@ public final class ImmutableObservationStageManager {
                     statement.execute("CREATE TRIGGER " + triggerName + " BEFORE INSERT ON " +
                             observationTable + " FOR EACH ROW EXECUTE FUNCTION " + triggerFunction + "()");
                 }
+                initializeMutableStreamCounts(connection);
                 reconcileCatalog(connection);
                 rejectLegacyRawRows(connection);
                 connection.commit();
@@ -740,6 +765,281 @@ public final class ImmutableObservationStageManager {
                 "  RETURN NULL;\n" +
                 "END;\n" +
                 "$$ LANGUAGE plpgsql";
+    }
+
+    /**
+     * Installs statement-level transition triggers maintaining exact per-stream
+     * row counts for unarchived mutable rows in {@code ONLY <observationTable>}.
+     * Immutable telemetry routed by {@link #triggerName} returns {@code NULL}
+     * before insert and is also guarded by {@link #ROUTE_TABLE} on parent-level
+     * updates/deletes, so telemetry ingestion incurs zero writes or locks on
+     * {@link #MUTABLE_COUNTS_TABLE}.
+     */
+    private void initializeMutableStreamCounts(Connection connection) throws SQLException {
+        String store = sqlLiteral(storeKey);
+        String mutableGuard = "%s.archivegenerationid IS NULL AND NOT EXISTS (" +
+                "SELECT 1 FROM " + ROUTE_TABLE + " route WHERE route.store_key='" + store +
+                "' AND route.id_scope=" + idScope +
+                " AND route.datastream_id=%s.datastreamid AND route.immutable)";
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE IF NOT EXISTS " + MUTABLE_COUNTS_TABLE + " (" +
+                    "store_key text NOT NULL, id_scope integer NOT NULL, " +
+                    "datastream_id bigint NOT NULL, total_rows bigint NOT NULL DEFAULT 0, " +
+                    "null_result_time_rows bigint NOT NULL DEFAULT 0, " +
+                    "PRIMARY KEY(store_key, id_scope, datastream_id))");
+            statement.execute("CREATE TABLE IF NOT EXISTS " + MUTABLE_COUNTS_STATE_TABLE + " (" +
+                    "store_key text NOT NULL, id_scope integer NOT NULL, " +
+                    "table_oid oid NOT NULL DEFAULT 0::oid, " +
+                    "initialized_at timestamptz NOT NULL DEFAULT now(), " +
+                    "PRIMARY KEY(store_key, id_scope))");
+            statement.execute("ALTER TABLE " + MUTABLE_COUNTS_STATE_TABLE +
+                    " ADD COLUMN IF NOT EXISTS table_oid oid NOT NULL DEFAULT 0::oid");
+
+            statement.execute("CREATE OR REPLACE FUNCTION " + mutableCountInsertFunction + "() RETURNS trigger AS $$\n" +
+                    "BEGIN\n" +
+                    "  INSERT INTO " + MUTABLE_COUNTS_TABLE +
+                    " (store_key, id_scope, datastream_id, total_rows, null_result_time_rows)\n" +
+                    "  SELECT '" + store + "', " + idScope + ", ins.datastreamid,\n" +
+                    "         count(*)::bigint,\n" +
+                    "         count(*) FILTER (WHERE ins.resulttime IS NULL)::bigint\n" +
+                    "  FROM ins\n" +
+                    "  WHERE " + String.format(mutableGuard, "ins", "ins") + "\n" +
+                    "  GROUP BY ins.datastreamid\n" +
+                    "  HAVING count(*) <> 0\n" +
+                    "  ORDER BY ins.datastreamid\n" +
+                    "  ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET\n" +
+                    "    total_rows = " + MUTABLE_COUNTS_TABLE + ".total_rows + EXCLUDED.total_rows,\n" +
+                    "    null_result_time_rows = " + MUTABLE_COUNTS_TABLE +
+                    ".null_result_time_rows + EXCLUDED.null_result_time_rows;\n" +
+                    "  RETURN NULL;\n" +
+                    "END;\n" +
+                    "$$ LANGUAGE plpgsql");
+
+            statement.execute("CREATE OR REPLACE FUNCTION " + mutableCountUpdateFunction + "() RETURNS trigger AS $$\n" +
+                    "BEGIN\n" +
+                    "  INSERT INTO " + MUTABLE_COUNTS_TABLE +
+                    " (store_key, id_scope, datastream_id, total_rows, null_result_time_rows)\n" +
+                    "  SELECT '" + store + "', " + idScope + ", delta.datastreamid,\n" +
+                    "         sum(delta.d_total)::bigint,\n" +
+                    "         sum(delta.d_null)::bigint\n" +
+                    "  FROM (\n" +
+                    "    SELECT del.datastreamid,\n" +
+                    "           -1::bigint AS d_total,\n" +
+                    "           CASE WHEN del.resulttime IS NULL THEN -1::bigint ELSE 0::bigint END AS d_null\n" +
+                    "    FROM del WHERE " + String.format(mutableGuard, "del", "del") + "\n" +
+                    "    UNION ALL\n" +
+                    "    SELECT ins.datastreamid,\n" +
+                    "           1::bigint AS d_total,\n" +
+                    "           CASE WHEN ins.resulttime IS NULL THEN 1::bigint ELSE 0::bigint END AS d_null\n" +
+                    "    FROM ins WHERE " + String.format(mutableGuard, "ins", "ins") + "\n" +
+                    "  ) delta\n" +
+                    "  GROUP BY delta.datastreamid\n" +
+                    "  HAVING sum(delta.d_total) <> 0 OR sum(delta.d_null) <> 0\n" +
+                    "  ORDER BY delta.datastreamid\n" +
+                    "  ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET\n" +
+                    "    total_rows = " + MUTABLE_COUNTS_TABLE + ".total_rows + EXCLUDED.total_rows,\n" +
+                    "    null_result_time_rows = " + MUTABLE_COUNTS_TABLE +
+                    ".null_result_time_rows + EXCLUDED.null_result_time_rows;\n" +
+                    "  RETURN NULL;\n" +
+                    "END;\n" +
+                    "$$ LANGUAGE plpgsql");
+
+            statement.execute("CREATE OR REPLACE FUNCTION " + mutableCountDeleteFunction + "() RETURNS trigger AS $$\n" +
+                    "BEGIN\n" +
+                    "  INSERT INTO " + MUTABLE_COUNTS_TABLE +
+                    " (store_key, id_scope, datastream_id, total_rows, null_result_time_rows)\n" +
+                    "  SELECT '" + store + "', " + idScope + ", del.datastreamid,\n" +
+                    "         -count(*)::bigint,\n" +
+                    "         -count(*) FILTER (WHERE del.resulttime IS NULL)::bigint\n" +
+                    "  FROM del\n" +
+                    "  WHERE " + String.format(mutableGuard, "del", "del") + "\n" +
+                    "  GROUP BY del.datastreamid\n" +
+                    "  HAVING count(*) <> 0\n" +
+                    "  ORDER BY del.datastreamid\n" +
+                    "  ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET\n" +
+                    "    total_rows = " + MUTABLE_COUNTS_TABLE + ".total_rows + EXCLUDED.total_rows,\n" +
+                    "    null_result_time_rows = " + MUTABLE_COUNTS_TABLE +
+                    ".null_result_time_rows + EXCLUDED.null_result_time_rows;\n" +
+                    "  RETURN NULL;\n" +
+                    "END;\n" +
+                    "$$ LANGUAGE plpgsql");
+
+            statement.execute("CREATE OR REPLACE FUNCTION " + mutableCountTruncateFunction + "() RETURNS trigger AS $$\n" +
+                    "BEGIN\n" +
+                    "  DELETE FROM " + MUTABLE_COUNTS_TABLE +
+                    " WHERE store_key='" + store + "' AND id_scope=" + idScope + ";\n" +
+                    "  RETURN NULL;\n" +
+                    "END;\n" +
+                    "$$ LANGUAGE plpgsql");
+
+            statement.execute("DROP TRIGGER IF EXISTS " + mutableCountInsertTrigger + " ON " + observationTable);
+            statement.execute("CREATE TRIGGER " + mutableCountInsertTrigger + " AFTER INSERT ON " +
+                    observationTable + " REFERENCING NEW TABLE AS ins FOR EACH STATEMENT EXECUTE FUNCTION " +
+                    mutableCountInsertFunction + "()");
+
+            statement.execute("DROP TRIGGER IF EXISTS " + mutableCountUpdateTrigger + " ON " + observationTable);
+            statement.execute("CREATE TRIGGER " + mutableCountUpdateTrigger + " AFTER UPDATE ON " +
+                    observationTable + " REFERENCING OLD TABLE AS del NEW TABLE AS ins FOR EACH STATEMENT EXECUTE FUNCTION " +
+                    mutableCountUpdateFunction + "()");
+
+            statement.execute("DROP TRIGGER IF EXISTS " + mutableCountDeleteTrigger + " ON " + observationTable);
+            statement.execute("CREATE TRIGGER " + mutableCountDeleteTrigger + " AFTER DELETE ON " +
+                    observationTable + " REFERENCING OLD TABLE AS del FOR EACH STATEMENT EXECUTE FUNCTION " +
+                    mutableCountDeleteFunction + "()");
+
+            statement.execute("DROP TRIGGER IF EXISTS " + mutableCountTruncateTrigger + " ON " + observationTable);
+            statement.execute("CREATE TRIGGER " + mutableCountTruncateTrigger + " AFTER TRUNCATE ON " +
+                    observationTable + " FOR EACH STATEMENT EXECUTE FUNCTION " +
+                    mutableCountTruncateFunction + "()");
+        }
+
+        long currentTableOid;
+        try (PreparedStatement oidQuery = connection.prepareStatement(
+                "SELECT to_regclass(?)::oid::bigint")) {
+            oidQuery.setString(1, observationTable);
+            try (ResultSet rs = oidQuery.executeQuery()) {
+                if (!rs.next() || rs.getObject(1) == null)
+                    throw new SQLException("Observation table does not exist: " + observationTable);
+                currentTableOid = rs.getLong(1);
+            }
+        }
+
+        boolean initialized;
+        try (PreparedStatement check = connection.prepareStatement(
+                "SELECT table_oid::bigint FROM " + MUTABLE_COUNTS_STATE_TABLE +
+                        " WHERE store_key=? AND id_scope=? FOR UPDATE")) {
+            check.setString(1, storeKey);
+            check.setInt(2, idScope);
+            try (ResultSet rs = check.executeQuery()) {
+                initialized = rs.next() && rs.getLong(1) == currentTableOid && currentTableOid != 0L;
+            }
+        }
+        if (!initialized) {
+            try (PreparedStatement clear = connection.prepareStatement(
+                    "DELETE FROM " + MUTABLE_COUNTS_TABLE + " WHERE store_key=? AND id_scope=?")) {
+                clear.setString(1, storeKey);
+                clear.setInt(2, idScope);
+                clear.executeUpdate();
+            }
+            try (PreparedStatement populate = connection.prepareStatement(
+                    "INSERT INTO " + MUTABLE_COUNTS_TABLE +
+                            " (store_key, id_scope, datastream_id, total_rows, null_result_time_rows) " +
+                            "SELECT ?, ?, o.datastreamid, count(*)::bigint, " +
+                            "count(*) FILTER (WHERE o.resulttime IS NULL)::bigint " +
+                            "FROM ONLY " + observationTable + " o " +
+                            "WHERE " + String.format(mutableGuard, "o", "o") +
+                            " GROUP BY o.datastreamid")) {
+                populate.setString(1, storeKey);
+                populate.setInt(2, idScope);
+                populate.executeUpdate();
+            }
+            try (PreparedStatement mark = connection.prepareStatement(
+                    "INSERT INTO " + MUTABLE_COUNTS_STATE_TABLE +
+                            " (store_key, id_scope, table_oid) VALUES (?, ?, ?::bigint::oid) " +
+                            "ON CONFLICT (store_key, id_scope) DO UPDATE SET " +
+                            "table_oid = EXCLUDED.table_oid, initialized_at = now()")) {
+                mark.setString(1, storeKey);
+                mark.setInt(2, idScope);
+                mark.setLong(3, currentTableOid);
+                mark.executeUpdate();
+            }
+        }
+    }
+
+    /**
+     * Returns whether an unarchived mutable-only count query can be answered
+     * in {@code O(streams + post-cutoff tail)} via {@link #MUTABLE_COUNTS_TABLE}
+     * rather than scanning the complete mutable B-tree history.
+     */
+    public boolean supportsFastMutableStreamCount(ObsFilter filter,
+                                                  Set<Long> dataStreams,
+                                                  Set<Long> fois) {
+        if (filter == null || dataStreams == null || dataStreams.isEmpty() || fois != null)
+            return false;
+        if (filter.getFoiFilter() != null ||
+                (filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty()) ||
+                filter.getCQLFilter() != null ||
+                filter.getValuePredicate() != null ||
+                filter.getPhenomenonLocation() != null) {
+            return false;
+        }
+        TemporalFilter pt = filter.getPhenomenonTime();
+        if (pt != null) {
+            if (pt.isLatestTime() || pt.isCurrentTime())
+                return false;
+            if (isValidBound(PostgisUtils.checkAndGetValidInstant(pt.getMin())) ||
+                    isValidBound(PostgisUtils.checkAndGetValidInstant(pt.getMax()))) {
+                return false;
+            }
+        }
+        TemporalFilter rt = filter.getResultTime();
+        if (rt != null) {
+            if (rt.isLatestTime() || rt.isCurrentTime())
+                return false;
+            if (isValidBound(PostgisUtils.checkAndGetValidInstant(rt.getMin())))
+                return false;
+        }
+        return true;
+    }
+
+    /**
+     * Computes the exact MVCC-consistent count of unarchived mutable observations
+     * matching {@code filter} across {@code dataStreams} in a single SQL snapshot.
+     */
+    public long countMutableStreamObservations(ObsFilter filter, Set<Long> dataStreams) {
+        if (dataStreams == null || dataStreams.isEmpty())
+            return 0L;
+        TemporalFilter rt = filter.getResultTime();
+        String maxBound = rt == null ? null : PostgisUtils.checkAndGetValidInstant(rt.getMax());
+        boolean hasMaxBound = isValidBound(maxBound);
+
+        String sql;
+        String complementOp = null;
+        if (!hasMaxBound) {
+            sql = "SELECT COALESCE(sum(total_rows), 0)::bigint FROM " + MUTABLE_COUNTS_TABLE +
+                    " WHERE store_key=? AND id_scope=? AND datastream_id=ANY (?::bigint[])";
+        } else {
+            complementOp = rt.getRange().upperBoundType() == BoundType.CLOSED ? ">" : ">=";
+            sql = "SELECT (COALESCE((SELECT sum(total_rows - null_result_time_rows) FROM " +
+                    MUTABLE_COUNTS_TABLE +
+                    " WHERE store_key=? AND id_scope=? AND datastream_id=ANY (?::bigint[])), 0) - " +
+                    "(SELECT count(*) FROM ONLY " + observationTable + " o " +
+                    "WHERE o.datastreamid=ANY (?::bigint[]) AND o.archivegenerationid IS NULL " +
+                    "AND o.resulttime " + complementOp + " ?::timestamp))::bigint";
+        }
+
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            Array streamArray = connection.createArrayOf("bigint", dataStreams.toArray());
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, storeKey);
+                statement.setInt(2, idScope);
+                statement.setArray(3, streamArray);
+                if (hasMaxBound) {
+                    statement.setArray(4, streamArray);
+                    statement.setString(5, maxBound);
+                }
+                try (ResultSet rs = statement.executeQuery()) {
+                    if (!rs.next())
+                        return 0L;
+                    long count = rs.getLong(1);
+                    if (count < 0)
+                        throw new IllegalStateException("Negative mutable stream count: " + count);
+                    return count;
+                }
+            } finally {
+                streamArray.free();
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("Cannot count mutable stream observations", error);
+        }
+    }
+
+    private static boolean isValidBound(String bound) {
+        if (bound == null || bound.isEmpty())
+            return false;
+        String lower = bound.toLowerCase(java.util.Locale.ROOT).trim();
+        return !"-infinity".equals(lower) && !"infinity".equals(lower);
     }
 
     private static String sqlTimestamp(Instant instant) {

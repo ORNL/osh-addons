@@ -38,7 +38,8 @@ import java.util.function.Predicate;
 final class ObservationKeysetIterator<T> implements Iterator<T>, AutoCloseable {
     private final ParameterizedQuery query;
     private final ConnectionManager connections;
-    private final int pageSize;
+    private final int maxPageSize;
+    private int currentPageSize;
     private final long resultLimit;
     private final boolean descending;
     private final Function<ResultSet, T> parser;
@@ -61,19 +62,33 @@ final class ObservationKeysetIterator<T> implements Iterator<T>, AutoCloseable {
                               Function<ResultSet, T> parser,
                               Predicate<T> predicate,
                               boolean predicateRequiresPostFiltering) {
-        if (pageSize <= 0)
+        this(query, connections, pageSize, pageSize, resultLimit, descending,
+                parser, predicate, predicateRequiresPostFiltering);
+    }
+
+    ObservationKeysetIterator(ParameterizedQuery query,
+                              ConnectionManager connections,
+                              int initialPageSize,
+                              int maxPageSize,
+                              long resultLimit,
+                              boolean descending,
+                              Function<ResultSet, T> parser,
+                              Predicate<T> predicate,
+                              boolean predicateRequiresPostFiltering) {
+        if (initialPageSize <= 0 || maxPageSize <= 0)
             throw new IllegalArgumentException("Observation page size must be positive");
         if (resultLimit < 0)
             throw new IllegalArgumentException("Observation result limit cannot be negative");
         this.query = query;
         this.connections = connections;
-        this.pageSize = pageSize;
+        this.maxPageSize = maxPageSize;
+        this.currentPageSize = Math.min(initialPageSize, maxPageSize);
         this.resultLimit = resultLimit;
         this.descending = descending;
         this.parser = parser;
         this.predicate = predicate;
         this.predicateRequiresPostFiltering = predicateRequiresPostFiltering;
-        this.ready = new ArrayDeque<>(Math.min(pageSize, 1_024));
+        this.ready = new ArrayDeque<>(Math.min(this.currentPageSize, 1_024));
         this.exhausted = resultLimit == 0;
     }
 
@@ -104,9 +119,10 @@ final class ObservationKeysetIterator<T> implements Iterator<T>, AutoCloseable {
         // A SQL-safe query can stop at the exact caller bound. A Java value
         // predicate must continue reading raw rows until enough matches have
         // been accepted or the source is exhausted.
+        int pageTarget = currentPageSize;
         int requested = predicateRequiresPostFiltering
-                ? pageSize
-                : (int) Math.min(pageSize, remaining);
+                ? pageTarget
+                : (int) Math.min(pageTarget, remaining);
         String pageSql = pageSql(query.sql(), hasContinuation, lastPhenomenonTime,
                 descending);
         int fetched = 0;
@@ -144,8 +160,11 @@ final class ObservationKeysetIterator<T> implements Iterator<T>, AutoCloseable {
         } catch (SQLException error) {
             throw new IllegalStateException("Cannot read keyset observation page", error);
         }
-        if (fetched < requested || accepted >= resultLimit)
+        if (fetched < requested || accepted >= resultLimit) {
             exhausted = true;
+        } else if (currentPageSize < maxPageSize) {
+            currentPageSize = (int) Math.min((long) maxPageSize, (long) currentPageSize * 2L);
+        }
     }
 
     /**

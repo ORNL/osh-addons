@@ -4,6 +4,7 @@ import com.google.common.collect.BoundType;
 import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.datastore.TemporalFilter;
 import org.sensorhub.api.datastore.obs.ObsFilter;
+import org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -19,10 +20,12 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.Set;
@@ -1981,6 +1984,8 @@ public final class ArchiveCatalog {
      * Streams only query-relevant overlays in the same global order used by
      * hot and Parquet observations. Structured predicates are pushed into
      * PostgreSQL; payload predicates remain in the tiered store after decode.
+     * Tombstoned observations are excluded even if they were overlaid prior to
+     * deletion.
      */
     public Stream<ArchivedOverlay> streamOverlays(int scope, ObsFilter filter,
                                                    Set<Long> dataStreams, Set<Long> fois) {
@@ -1989,15 +1994,142 @@ public final class ArchiveCatalog {
         if (fois != null && fois.isEmpty())
             return Stream.empty();
 
-        StringBuilder sql = new StringBuilder(
-                "SELECT overlay_row.generation_id, overlay_row.observation_id, overlay_row.datastream_id, " +
+        List<QueryParameter> parameters = new ArrayList<>();
+        String baseSql = buildOverlayQuerySql(
+                "overlay_row.generation_id, overlay_row.observation_id, overlay_row.datastream_id, " +
                         "overlay_row.foi_id, overlay_row.phenomenon_time, overlay_row.result_time, " +
-                        "overlay_row.result_json::text, overlay_row.schema_json::text FROM oscar_obs_overlay overlay_row " +
+                        "overlay_row.result_json::text, overlay_row.schema_json::text",
+                filter, dataStreams, fois, parameters);
+        boolean descending = filter.getPhenomenonTime() != null &&
+                filter.getPhenomenonTime().descendingOrder();
+        // Do not retain a PostgreSQL connection while the tier merge invokes
+        // the hot iterator or a base-row mutation lookup: those callbacks use
+        // the same bounded pool and a retained cursor can deadlock at pool size
+        // one (or when every pool connection is serving a concurrent merge).
+        // Keyset pages keep memory bounded without OFFSET's quadratic rescans.
+        OverlayCursor cursor = new OverlayCursor(scope, baseSql,
+                List.copyOf(parameters), descending);
+        openOverlayCursors.incrementAndGet();
+        return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
+                        Spliterator.ORDERED | Spliterator.NONNULL), false)
+                .onClose(cursor::close);
+    }
+
+    /**
+     * Counts non-tombstoned active/sealed overlays matching {@code filter}
+     * without SWE {@code DataBlock} decoding.
+     */
+    public long countMatchingOverlays(ObsFilter filter, Set<Long> dataStreams, Set<Long> fois) {
+        if (dataStreams != null && dataStreams.isEmpty())
+            return 0L;
+        if (fois != null && fois.isEmpty())
+            return 0L;
+
+        List<QueryParameter> parameters = new ArrayList<>();
+        boolean hasCql = filter.getCQLFilter() != null;
+        String sql = buildOverlayQuerySql(
+                hasCql ? "overlay_row.result_json::text" : "count(*)::bigint",
+                filter, dataStreams, fois, parameters);
+        try (Connection connection = connections.open()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setReadOnly(true);
+            if (hasCql)
+                connection.setAutoCommit(false);
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                int parameter = 1;
+                for (QueryParameter qp : parameters)
+                    qp.bind(connection, statement, parameter++);
+                if (hasCql)
+                    statement.setFetchSize(1_000);
+                try (ResultSet result = statement.executeQuery()) {
+                    if (!hasCql)
+                        return result.next() ? result.getLong(1) : 0L;
+                    long matched = 0L;
+                    while (result.next()) {
+                        if (JsonCqlEvaluator.matches(filter.getCQLFilter(), result.getString(1)))
+                            matched = Math.addExact(matched, 1L);
+                    }
+                    return matched;
+                }
+            } finally {
+                if (hasCql) {
+                    connection.rollback();
+                    connection.setAutoCommit(oldAutoCommit);
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot count observation overlays", e);
+        }
+    }
+
+    /**
+     * Returns mutated (overlaid or tombstoned) observation IDs grouped by
+     * owning generation for the given candidate generation set.
+     */
+    public Map<UUID, Set<Long>> mutatedObservationIdsByGeneration(Collection<UUID> generationIds) {
+        if (generationIds == null || generationIds.isEmpty())
+            return Map.of();
+        String sql = "WITH target_gen(id) AS (SELECT unnest(?::uuid[])) " +
+                "SELECT overlay_row.generation_id, overlay_row.observation_id " +
+                "FROM oscar_obs_overlay overlay_row " +
+                "JOIN target_gen tg ON tg.id=overlay_row.generation_id " +
+                "JOIN oscar_archive_generation generation ON generation.id=overlay_row.generation_id " +
+                "WHERE overlay_row.store_key=? AND overlay_row.id_scope=? " +
+                "AND generation.store_key=overlay_row.store_key AND generation.id_scope=overlay_row.id_scope " +
+                "AND generation.state IN ('ACTIVE','SEALED') " +
+                "UNION " +
+                "SELECT tombstone.generation_id, tombstone.subject_id::bigint " +
+                "FROM oscar_tombstone tombstone " +
+                "JOIN target_gen tg ON tg.id=tombstone.generation_id " +
+                "JOIN oscar_archive_generation generation ON generation.id=tombstone.generation_id " +
+                "WHERE tombstone.store_key=? AND tombstone.id_scope=? " +
+                "AND tombstone.subject_type='OBSERVATION' AND tombstone.subject_id ~ '^[0-9]+$' " +
+                "AND generation.store_key=tombstone.store_key AND generation.id_scope=tombstone.id_scope " +
+                "AND generation.state IN ('ACTIVE','SEALED')";
+        Map<UUID, Set<Long>> byGeneration = new HashMap<>();
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            java.sql.Array genArray = connection.createArrayOf("uuid", generationIds.toArray());
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setArray(1, genArray);
+                statement.setString(2, storeKey);
+                statement.setInt(3, idScope);
+                statement.setString(4, storeKey);
+                statement.setInt(5, idScope);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next()) {
+                        UUID genId = result.getObject(1, UUID.class);
+                        long obsId = result.getLong(2);
+                        byGeneration.computeIfAbsent(genId, ignored -> new HashSet<>()).add(obsId);
+                    }
+                }
+            } finally {
+                genArray.free();
+            }
+            return byGeneration;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot resolve mutated observation IDs by generation", e);
+        }
+    }
+
+    private String buildOverlayQuerySql(String projection, ObsFilter filter,
+                                        Set<Long> dataStreams, Set<Long> fois,
+                                        List<QueryParameter> parameters) {
+        StringBuilder sql = new StringBuilder("SELECT ").append(projection)
+                .append(" FROM oscar_obs_overlay overlay_row " +
                         "JOIN oscar_archive_generation generation ON generation.id=overlay_row.generation_id " +
                         "WHERE overlay_row.store_key=? AND overlay_row.id_scope=? " +
                         "AND generation.store_key=overlay_row.store_key AND generation.id_scope=overlay_row.id_scope " +
-                        "AND generation.state IN ('ACTIVE','SEALED')");
-        List<QueryParameter> parameters = new ArrayList<>();
+                        "AND generation.state IN ('ACTIVE','SEALED') " +
+                        "AND NOT EXISTS (SELECT 1 FROM oscar_tombstone tombstone " +
+                        "WHERE tombstone.store_key=overlay_row.store_key " +
+                        "AND tombstone.id_scope=overlay_row.id_scope " +
+                        "AND tombstone.subject_type='OBSERVATION' " +
+                        "AND tombstone.subject_id=overlay_row.observation_id::text " +
+                        "AND tombstone.generation_id IS NOT NULL " +
+                        "AND EXISTS (SELECT 1 FROM oscar_archive_generation tg " +
+                        "WHERE tg.id=tombstone.generation_id AND tg.store_key=tombstone.store_key " +
+                        "AND tg.id_scope=tombstone.id_scope AND tg.state IN ('ACTIVE','SEALED')))");
         parameters.add(new StringParameter(storeKey));
         parameters.add(new IntegerParameter(idScope));
 
@@ -2023,19 +2155,7 @@ public final class ArchiveCatalog {
         }
         appendTime(sql, "overlay_row.phenomenon_time", filter.getPhenomenonTime(), parameters);
         appendTime(sql, "overlay_row.result_time", filter.getResultTime(), parameters);
-        boolean descending = filter.getPhenomenonTime() != null &&
-                filter.getPhenomenonTime().descendingOrder();
-        // Do not retain a PostgreSQL connection while the tier merge invokes
-        // the hot iterator or a base-row mutation lookup: those callbacks use
-        // the same bounded pool and a retained cursor can deadlock at pool size
-        // one (or when every pool connection is serving a concurrent merge).
-        // Keyset pages keep memory bounded without OFFSET's quadratic rescans.
-        OverlayCursor cursor = new OverlayCursor(scope, sql.toString(),
-                List.copyOf(parameters), descending);
-        openOverlayCursors.incrementAndGet();
-        return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
-                        Spliterator.ORDERED | Spliterator.NONNULL), false)
-                .onClose(cursor::close);
+        return sql.toString();
     }
 
     public int getOpenOverlayCursorCount() {

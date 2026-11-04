@@ -729,6 +729,67 @@ public class TestParquetArchiveReader {
                         .stream().map(row -> row.observation().id()).toList());
     }
 
+    @Test
+    public void countMatchingIdsAndCountCqlRespectExclusionsChunkingAndEmptyInputs() throws Exception {
+        Path root = temporary.newFolder("count-cql-and-ids").toPath();
+        ArchiveGeneration first = new ArchiveGeneration(
+                UUID.randomUUID(), "PARQUET_PRIMARY",
+                Instant.parse("2026-01-01T00:00:00Z"),
+                Instant.parse("2026-01-01T00:30:00Z"),
+                writeGeneration(root, "c1.parquet", new TestRow[]{
+                        new TestRow(1, 10, "2026-01-01T00:01:00Z",
+                                "{\"gammaAlarm\":false,\"neutronAlarm\":false,\"maxGamma\":12.5}"),
+                        new TestRow(2, 10, "2026-01-01T00:02:00Z",
+                                "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"maxGamma\":99.0}"),
+                        new TestRow(3, 20, "2026-01-01T00:03:00Z",
+                                "{\"gammaAlarm\":false,\"neutronAlarm\":false,\"maxGamma\":8.0}")
+                }).objectPath(),
+                ArchiveExporter.sha256(root.resolve("c1.parquet")), 3, 1, 3, "SEALED", true);
+        ArchiveGeneration second = new ArchiveGeneration(
+                UUID.randomUUID(), "PARQUET_PRIMARY",
+                Instant.parse("2026-01-01T00:30:00Z"),
+                Instant.parse("2026-01-01T01:00:00Z"),
+                writeGeneration(root, "c2.parquet", new TestRow[]{
+                        new TestRow(2005, 10, "2026-01-01T00:31:00Z",
+                                "{\"gammaAlarm\":false,\"neutronAlarm\":false,\"maxGamma\":42.0}"),
+                        new TestRow(2006, 10, "2026-01-01T00:32:00Z",
+                                "{\"alarmState\":\"\\u0046ault - Gamma Low\",\"gammaAlarm\":false,\"neutronAlarm\":false}")
+                }).objectPath(),
+                ArchiveExporter.sha256(root.resolve("c2.parquet")), 2, 2005, 2006, "SEALED", true);
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+        ObsFilter all = new ObsFilter.Builder().build();
+        assertEquals(0L, reader.count(List.of(), all, null, null));
+        assertEquals(0L, reader.count(List.of(first), all, Set.of(), null));
+        assertEquals(0L, reader.count(List.of(first), all, null, Set.of()));
+
+        java.util.Set<Long> largeIdSet = new java.util.HashSet<>();
+        for (long id = 10_000; id < 12_150; id++)
+            largeIdSet.add(id);
+        largeIdSet.add(1L);
+        largeIdSet.add(3L);
+        largeIdSet.add(2005L);
+
+        assertEquals(2L, reader.countMatchingIds(
+                List.of(first, second), 4, largeIdSet, all, Set.of(10L), null));
+
+        ObsFilter noneFilter = new ObsFilter.Builder()
+                .withCQLFilter("gammaAlarm = false AND neutronAlarm = false")
+                .build();
+        assertEquals(4L, reader.countCql(
+                List.of(first, second), noneFilter, null, null, Set.of()));
+        assertEquals(2L, reader.countCql(
+                List.of(first, second), noneFilter, Set.of(10L), null, Set.of(2005L)));
+
+        ObsFilter escapedFilter = new ObsFilter.Builder()
+                .withCQLFilter("alarmState = 'Fault - Gamma Low'")
+                .build();
+        assertEquals(1L, reader.countCql(
+                List.of(first, second), escapedFilter, null, null, Set.of()));
+        assertEquals(0L, reader.countCql(
+                List.of(first, second), escapedFilter, null, null, Set.of(2006L)));
+    }
+
     private record TestRow(long id, long dataStreamId, String time, String resultJson) {
         private TestRow(long id, long dataStreamId, String time) {
             this(id, dataStreamId, time, "{\"value\":" + id + "}");

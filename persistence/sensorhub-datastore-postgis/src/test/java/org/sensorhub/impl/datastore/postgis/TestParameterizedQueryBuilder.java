@@ -471,6 +471,46 @@ public class TestParameterizedQueryBuilder {
         assertEquals(Arrays.asList("gammaCount"), query.parameters());
     }
 
+    @Test
+    public void testParentTableOnlyQueriesUseFromOnlyClauseAndConfigureAutovacuum() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        ObsFilter filter = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(2, 101), BigId.fromLong(2, 202))
+                .withCQLFilter("gammaAlarm = false AND neutronAlarm = false")
+                .withLimit(15)
+                .build();
+
+        ParameterizedQuery selectOnly = builder.createParameterizedSelectEntriesQuery(filter, null, true);
+        assertTrue(selectOnly.sql().contains(" FROM ONLY obs "));
+        assertFalse(selectOnly.sql().contains(" FROM obs "));
+
+        ParameterizedQuery unorderedOnly = builder.createParameterizedUnorderedSelectEntriesQuery(
+                new ObsFilter.Builder().withDataStreams(BigId.fromLong(2, 101)).build(),
+                Set.of(IObsStore.ObsField.PHENOMENON_TIME),
+                true,
+                "tableoid");
+        assertTrue(unorderedOnly.sql().contains("obs.id,obs.tableoid FROM ONLY obs "));
+
+        ParameterizedQuery countOnly = builder.createParameterizedSelectEntriesCountQuery(
+                filter, true, "obs.archivegenerationid IS NULL");
+        assertTrue(countOnly.sql().startsWith("SELECT COUNT(*) FROM ONLY obs WHERE "));
+        assertTrue(countOnly.sql().contains("(obs.archivegenerationid IS NULL)"));
+
+        ObsFilter latestFilter = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(2, 101), BigId.fromLong(2, 202))
+                .withLatestResult()
+                .build();
+        ParameterizedQuery latestOnly = builder.createParameterizedLatestResultPerDataStreamQuery(
+                latestFilter, null, true);
+        assertTrue(latestOnly.sql().contains("FROM ONLY obs non_null"));
+        assertTrue(latestOnly.sql().contains("FROM ONLY obs null_only"));
+
+        String autovacuum = builder.configureAutovacuumQuery();
+        assertTrue(autovacuum.startsWith("ALTER TABLE obs SET ("));
+        assertTrue(autovacuum.contains("autovacuum_vacuum_insert_scale_factor = 0.01"));
+        assertTrue(autovacuum.contains("autovacuum_vacuum_insert_threshold = 5000"));
+    }
+
     private void assertSqlDoesNotContainInjection(ParameterizedQuery query) {
         assertFalse(query.sql().contains(INJECTION));
         assertTrue(query.parameters().stream().anyMatch(parameter -> parameter.toString().contains(INJECTION)));
