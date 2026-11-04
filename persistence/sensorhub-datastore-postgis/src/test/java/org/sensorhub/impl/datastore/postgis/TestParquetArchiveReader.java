@@ -80,6 +80,40 @@ public class TestParquetArchiveReader {
     }
 
     @Test
+    public void coalescesConcurrentFirstUseVerificationAcrossParallelDatastreamReads() throws Exception {
+        Path root = temporary.newFolder("concurrent-verify").toPath();
+        TestRow[] seedRows = new TestRow[64];
+        for (int i = 0; i < seedRows.length; i++) {
+            seedRows[i] = new TestRow(1000L + i, 10L + (i % 6),
+                    Instant.parse("2026-01-01T00:00:00Z").plusSeconds(i).toString());
+        }
+        ArchiveGeneration generation = writeGeneration(root, "shared.parquet", seedRows);
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+
+        int threads = 8;
+        java.util.concurrent.CyclicBarrier barrier = new java.util.concurrent.CyclicBarrier(threads);
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        try {
+            java.util.List<java.util.concurrent.Future<Integer>> futures = new java.util.ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                final long streamId = 10L + (t % 6);
+                futures.add(pool.submit(() -> {
+                    barrier.await(5, TimeUnit.SECONDS);
+                    ObsFilter filter = new ObsFilter.Builder()
+                            .withDataStreams(BigId.fromLong(4, streamId))
+                            .build();
+                    return reader.read(generation, filter, null, null).size();
+                }));
+            }
+            for (var future : futures) {
+                assertTrue(future.get(10, TimeUnit.SECONDS) >= 10);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
     public void rejectsChecksumMismatchBeforeQuery() throws Exception {
         Path root = temporary.newFolder("bad-archive").toPath();
         Path object = root.resolve("bad.parquet");

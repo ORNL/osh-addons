@@ -52,7 +52,10 @@ public final class ImmutableObservationStageManager {
     private static final String PARTITION_TABLE = "oscar_obs_stage_partition";
     private static final String OWNER_TABLE = "oscar_obs_stage_owner";
     private static final String MUTABLE_COUNTS_TABLE = "oscar_mutable_stream_counts";
+    private static final String MUTABLE_COUNTS_DELTA_TABLE = "oscar_mutable_stream_counts_delta";
     private static final String MUTABLE_COUNTS_STATE_TABLE = "oscar_mutable_stream_counts_state";
+    private static final int MUTABLE_COUNTS_DELTA_COMPACT_BATCH = 50_000;
+    private static final int MUTABLE_COUNTS_DELTA_MAX_BATCHES_PER_CYCLE = 4;
     private static final DateTimeFormatter SQL_TIMESTAMP = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
 
     private final SqlConnectionProvider connections;
@@ -202,6 +205,7 @@ public final class ImmutableObservationStageManager {
 
     /** Verifies and reclaims a bounded number of complete physical children. */
     public int retireVerifiedPartitions() {
+        compactMutableStreamCountDeltas();
         List<PartitionState> candidates = listRetirementCandidates(
                 config.maximumStagePartitionsPerCycle);
         int retired = 0;
@@ -770,10 +774,13 @@ public final class ImmutableObservationStageManager {
     /**
      * Installs statement-level transition triggers maintaining exact per-stream
      * row counts for unarchived mutable rows in {@code ONLY <observationTable>}.
-     * Immutable telemetry routed by {@link #triggerName} returns {@code NULL}
-     * before insert and is also guarded by {@link #ROUTE_TABLE} on parent-level
-     * updates/deletes, so telemetry ingestion incurs zero writes or locks on
-     * {@link #MUTABLE_COUNTS_TABLE}.
+     *
+     * <p>Triggers append lock-free delta rows into {@link #MUTABLE_COUNTS_DELTA_TABLE}
+     * rather than updating {@link #MUTABLE_COUNTS_TABLE} in place, so multi-statement
+     * observation batches and concurrent {@code DatabasePurger} deletions never
+     * contend or deadlock on shared per-stream counter rows. Committed deltas are
+     * folded into {@link #MUTABLE_COUNTS_TABLE} via {@code FOR UPDATE SKIP LOCKED}
+     * during {@link #retireVerifiedPartitions()} and {@link #compactMutableStreamCountDeltas()}.</p>
      */
     private void initializeMutableStreamCounts(Connection connection) throws SQLException {
         String store = sqlLiteral(storeKey);
@@ -787,6 +794,16 @@ public final class ImmutableObservationStageManager {
                     "datastream_id bigint NOT NULL, total_rows bigint NOT NULL DEFAULT 0, " +
                     "null_result_time_rows bigint NOT NULL DEFAULT 0, " +
                     "PRIMARY KEY(store_key, id_scope, datastream_id))");
+            statement.execute("CREATE TABLE IF NOT EXISTS " + MUTABLE_COUNTS_DELTA_TABLE + " (" +
+                    "store_key text NOT NULL, id_scope integer NOT NULL, " +
+                    "datastream_id bigint NOT NULL, total_rows bigint NOT NULL, " +
+                    "null_result_time_rows bigint NOT NULL) WITH (" +
+                    "autovacuum_vacuum_scale_factor = 0.01, " +
+                    "autovacuum_vacuum_threshold = 500, " +
+                    "autovacuum_analyze_scale_factor = 0.02, " +
+                    "autovacuum_analyze_threshold = 500)");
+            statement.execute("CREATE INDEX IF NOT EXISTS oscar_mutable_stream_counts_delta_lookup_idx ON " +
+                    MUTABLE_COUNTS_DELTA_TABLE + " (store_key, id_scope, datastream_id)");
             statement.execute("CREATE TABLE IF NOT EXISTS " + MUTABLE_COUNTS_STATE_TABLE + " (" +
                     "store_key text NOT NULL, id_scope integer NOT NULL, " +
                     "table_oid oid NOT NULL DEFAULT 0::oid, " +
@@ -797,7 +814,7 @@ public final class ImmutableObservationStageManager {
 
             statement.execute("CREATE OR REPLACE FUNCTION " + mutableCountInsertFunction + "() RETURNS trigger AS $$\n" +
                     "BEGIN\n" +
-                    "  INSERT INTO " + MUTABLE_COUNTS_TABLE +
+                    "  INSERT INTO " + MUTABLE_COUNTS_DELTA_TABLE +
                     " (store_key, id_scope, datastream_id, total_rows, null_result_time_rows)\n" +
                     "  SELECT '" + store + "', " + idScope + ", ins.datastreamid,\n" +
                     "         count(*)::bigint,\n" +
@@ -805,19 +822,14 @@ public final class ImmutableObservationStageManager {
                     "  FROM ins\n" +
                     "  WHERE " + String.format(mutableGuard, "ins", "ins") + "\n" +
                     "  GROUP BY ins.datastreamid\n" +
-                    "  HAVING count(*) <> 0\n" +
-                    "  ORDER BY ins.datastreamid\n" +
-                    "  ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET\n" +
-                    "    total_rows = " + MUTABLE_COUNTS_TABLE + ".total_rows + EXCLUDED.total_rows,\n" +
-                    "    null_result_time_rows = " + MUTABLE_COUNTS_TABLE +
-                    ".null_result_time_rows + EXCLUDED.null_result_time_rows;\n" +
+                    "  HAVING count(*) <> 0;\n" +
                     "  RETURN NULL;\n" +
                     "END;\n" +
                     "$$ LANGUAGE plpgsql");
 
             statement.execute("CREATE OR REPLACE FUNCTION " + mutableCountUpdateFunction + "() RETURNS trigger AS $$\n" +
                     "BEGIN\n" +
-                    "  INSERT INTO " + MUTABLE_COUNTS_TABLE +
+                    "  INSERT INTO " + MUTABLE_COUNTS_DELTA_TABLE +
                     " (store_key, id_scope, datastream_id, total_rows, null_result_time_rows)\n" +
                     "  SELECT '" + store + "', " + idScope + ", delta.datastreamid,\n" +
                     "         sum(delta.d_total)::bigint,\n" +
@@ -834,19 +846,14 @@ public final class ImmutableObservationStageManager {
                     "    FROM ins WHERE " + String.format(mutableGuard, "ins", "ins") + "\n" +
                     "  ) delta\n" +
                     "  GROUP BY delta.datastreamid\n" +
-                    "  HAVING sum(delta.d_total) <> 0 OR sum(delta.d_null) <> 0\n" +
-                    "  ORDER BY delta.datastreamid\n" +
-                    "  ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET\n" +
-                    "    total_rows = " + MUTABLE_COUNTS_TABLE + ".total_rows + EXCLUDED.total_rows,\n" +
-                    "    null_result_time_rows = " + MUTABLE_COUNTS_TABLE +
-                    ".null_result_time_rows + EXCLUDED.null_result_time_rows;\n" +
+                    "  HAVING sum(delta.d_total) <> 0 OR sum(delta.d_null) <> 0;\n" +
                     "  RETURN NULL;\n" +
                     "END;\n" +
                     "$$ LANGUAGE plpgsql");
 
             statement.execute("CREATE OR REPLACE FUNCTION " + mutableCountDeleteFunction + "() RETURNS trigger AS $$\n" +
                     "BEGIN\n" +
-                    "  INSERT INTO " + MUTABLE_COUNTS_TABLE +
+                    "  INSERT INTO " + MUTABLE_COUNTS_DELTA_TABLE +
                     " (store_key, id_scope, datastream_id, total_rows, null_result_time_rows)\n" +
                     "  SELECT '" + store + "', " + idScope + ", del.datastreamid,\n" +
                     "         -count(*)::bigint,\n" +
@@ -854,18 +861,15 @@ public final class ImmutableObservationStageManager {
                     "  FROM del\n" +
                     "  WHERE " + String.format(mutableGuard, "del", "del") + "\n" +
                     "  GROUP BY del.datastreamid\n" +
-                    "  HAVING count(*) <> 0\n" +
-                    "  ORDER BY del.datastreamid\n" +
-                    "  ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET\n" +
-                    "    total_rows = " + MUTABLE_COUNTS_TABLE + ".total_rows + EXCLUDED.total_rows,\n" +
-                    "    null_result_time_rows = " + MUTABLE_COUNTS_TABLE +
-                    ".null_result_time_rows + EXCLUDED.null_result_time_rows;\n" +
+                    "  HAVING count(*) <> 0;\n" +
                     "  RETURN NULL;\n" +
                     "END;\n" +
                     "$$ LANGUAGE plpgsql");
 
             statement.execute("CREATE OR REPLACE FUNCTION " + mutableCountTruncateFunction + "() RETURNS trigger AS $$\n" +
                     "BEGIN\n" +
+                    "  DELETE FROM " + MUTABLE_COUNTS_DELTA_TABLE +
+                    " WHERE store_key='" + store + "' AND id_scope=" + idScope + ";\n" +
                     "  DELETE FROM " + MUTABLE_COUNTS_TABLE +
                     " WHERE store_key='" + store + "' AND id_scope=" + idScope + ";\n" +
                     "  RETURN NULL;\n" +
@@ -915,6 +919,12 @@ public final class ImmutableObservationStageManager {
             }
         }
         if (!initialized) {
+            try (PreparedStatement clearDelta = connection.prepareStatement(
+                    "DELETE FROM " + MUTABLE_COUNTS_DELTA_TABLE + " WHERE store_key=? AND id_scope=?")) {
+                clearDelta.setString(1, storeKey);
+                clearDelta.setInt(2, idScope);
+                clearDelta.executeUpdate();
+            }
             try (PreparedStatement clear = connection.prepareStatement(
                     "DELETE FROM " + MUTABLE_COUNTS_TABLE + " WHERE store_key=? AND id_scope=?")) {
                 clear.setString(1, storeKey);
@@ -942,6 +952,82 @@ public final class ImmutableObservationStageManager {
                 mark.setInt(2, idScope);
                 mark.setLong(3, currentTableOid);
                 mark.executeUpdate();
+            }
+        } else {
+            compactMutableStreamCountDeltasInTx(connection, MUTABLE_COUNTS_DELTA_COMPACT_BATCH);
+        }
+    }
+
+    /**
+     * Folds committed lock-free delta rows from {@link #MUTABLE_COUNTS_DELTA_TABLE}
+     * into {@link #MUTABLE_COUNTS_TABLE} without blocking concurrent writers.
+     */
+    public int compactMutableStreamCountDeltas() {
+        int totalDrained = 0;
+        for (int batch = 0; batch < MUTABLE_COUNTS_DELTA_MAX_BATCHES_PER_CYCLE; batch++) {
+            int drained;
+            try (Connection connection = connections.open()) {
+                boolean oldAutoCommit = connection.getAutoCommit();
+                connection.setAutoCommit(false);
+                try {
+                    drained = compactMutableStreamCountDeltasInTx(
+                            connection, MUTABLE_COUNTS_DELTA_COMPACT_BATCH);
+                    connection.commit();
+                } catch (SQLException error) {
+                    connection.rollback();
+                    throw error;
+                } finally {
+                    connection.setAutoCommit(oldAutoCommit);
+                }
+            } catch (SQLException error) {
+                throw new IllegalStateException("Cannot compact mutable stream count deltas", error);
+            }
+            totalDrained += drained;
+            if (drained < MUTABLE_COUNTS_DELTA_COMPACT_BATCH)
+                break;
+        }
+        return totalDrained;
+    }
+
+    private int compactMutableStreamCountDeltasInTx(Connection connection, int limit) throws SQLException {
+        requireTransaction(connection);
+        try (PreparedStatement lock = connection.prepareStatement(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(?, 0))")) {
+            lock.setString(1, "oscar-mc-compact:" + storeKey + ":" + idScope);
+            try (ResultSet rs = lock.executeQuery()) {
+                if (!rs.next() || !rs.getBoolean(1))
+                    return 0;
+            }
+        }
+        String sql = "WITH claimed AS (" +
+                "  SELECT ctid FROM " + MUTABLE_COUNTS_DELTA_TABLE +
+                "  WHERE store_key=? AND id_scope=? LIMIT ? FOR UPDATE SKIP LOCKED" +
+                "), drained AS (" +
+                "  DELETE FROM " + MUTABLE_COUNTS_DELTA_TABLE + " d USING claimed" +
+                "  WHERE d.ctid = claimed.ctid" +
+                "  RETURNING d.store_key, d.id_scope, d.datastream_id, d.total_rows, d.null_result_time_rows" +
+                "), folded AS (" +
+                "  INSERT INTO " + MUTABLE_COUNTS_TABLE +
+                "  (store_key, id_scope, datastream_id, total_rows, null_result_time_rows)" +
+                "  SELECT store_key, id_scope, datastream_id," +
+                "         sum(total_rows)::bigint," +
+                "         sum(null_result_time_rows)::bigint" +
+                "  FROM drained" +
+                "  GROUP BY store_key, id_scope, datastream_id" +
+                "  ORDER BY store_key, id_scope, datastream_id" +
+                "  ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET" +
+                "    total_rows = " + MUTABLE_COUNTS_TABLE + ".total_rows + EXCLUDED.total_rows," +
+                "    null_result_time_rows = " + MUTABLE_COUNTS_TABLE +
+                ".null_result_time_rows + EXCLUDED.null_result_time_rows" +
+                "  RETURNING 1" +
+                ") SELECT (SELECT count(*) FROM drained)::integer, " +
+                "(SELECT count(*) FROM folded)::integer";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, storeKey);
+            statement.setInt(2, idScope);
+            statement.setInt(3, limit);
+            try (ResultSet rs = statement.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
             }
         }
     }
@@ -996,12 +1082,20 @@ public final class ImmutableObservationStageManager {
         String sql;
         String complementOp = null;
         if (!hasMaxBound) {
-            sql = "SELECT COALESCE(sum(total_rows), 0)::bigint FROM " + MUTABLE_COUNTS_TABLE +
-                    " WHERE store_key=? AND id_scope=? AND datastream_id=ANY (?::bigint[])";
+            sql = "SELECT (" +
+                    "COALESCE((SELECT sum(total_rows) FROM " + MUTABLE_COUNTS_TABLE +
+                    " WHERE store_key=? AND id_scope=? AND datastream_id=ANY (?::bigint[])), 0) + " +
+                    "COALESCE((SELECT sum(total_rows) FROM " + MUTABLE_COUNTS_DELTA_TABLE +
+                    " WHERE store_key=? AND id_scope=? AND datastream_id=ANY (?::bigint[])), 0)" +
+                    ")::bigint";
         } else {
             complementOp = rt.getRange().upperBoundType() == BoundType.CLOSED ? ">" : ">=";
-            sql = "SELECT (COALESCE((SELECT sum(total_rows - null_result_time_rows) FROM " +
+            sql = "SELECT (" +
+                    "COALESCE((SELECT sum(total_rows - null_result_time_rows) FROM " +
                     MUTABLE_COUNTS_TABLE +
+                    " WHERE store_key=? AND id_scope=? AND datastream_id=ANY (?::bigint[])), 0) + " +
+                    "COALESCE((SELECT sum(total_rows - null_result_time_rows) FROM " +
+                    MUTABLE_COUNTS_DELTA_TABLE +
                     " WHERE store_key=? AND id_scope=? AND datastream_id=ANY (?::bigint[])), 0) - " +
                     "(SELECT count(*) FROM ONLY " + observationTable + " o " +
                     "WHERE o.datastreamid=ANY (?::bigint[]) AND o.archivegenerationid IS NULL " +
@@ -1015,9 +1109,12 @@ public final class ImmutableObservationStageManager {
                 statement.setString(1, storeKey);
                 statement.setInt(2, idScope);
                 statement.setArray(3, streamArray);
+                statement.setString(4, storeKey);
+                statement.setInt(5, idScope);
+                statement.setArray(6, streamArray);
                 if (hasMaxBound) {
-                    statement.setArray(4, streamArray);
-                    statement.setString(5, maxBound);
+                    statement.setArray(7, streamArray);
+                    statement.setString(8, maxBound);
                 }
                 try (ResultSet rs = statement.executeQuery()) {
                     if (!rs.next())

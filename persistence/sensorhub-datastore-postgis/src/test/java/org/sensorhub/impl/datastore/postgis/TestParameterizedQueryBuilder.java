@@ -119,6 +119,15 @@ public class TestParameterizedQueryBuilder {
         assertSqlDoesNotContainInjection(query);
         assertTrue(query.sql().contains("result @> ?::jsonb"));
         assertTrue(query.parameters().get(0).toString().contains(INJECTION));
+
+        ParameterizedQuery partialIndexable = new QueryBuilderObsStore("obs")
+                .createParameterizedSelectEntriesCountQuery(new ObsFilter.Builder()
+                        .withCQLFilter("(gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0")
+                        .build());
+        assertTrue(partialIndexable.sql().contains("result @> '{\"gammaAlarm\": true}'::jsonb"));
+        assertTrue(partialIndexable.sql().contains("result @> '{\"neutronAlarm\": true}'::jsonb"));
+        assertTrue(partialIndexable.sql().contains("result @> '{\"adjudicatedIdsCount\": 0}'::jsonb"));
+        assertTrue(partialIndexable.parameters().isEmpty());
     }
 
     @Test
@@ -320,8 +329,15 @@ public class TestParameterizedQueryBuilder {
         assertTrue(indexes.contains("WHERE jsonb_typeof(result->'occupancyCount') = 'number'"));
         assertTrue(indexes.contains("WHERE jsonb_typeof(result->'maxGamma') = 'number'"));
         assertTrue(indexes.contains("WHERE jsonb_typeof(result->'maxNeutron') = 'number'"));
+        assertTrue(indexes.contains("_non_alarm_ptime_desc_idx"));
+        assertTrue(indexes.contains("WHERE (result @> '{\"gammaAlarm\": false}'::jsonb AND result @> '{\"neutronAlarm\": false}'::jsonb)"));
         assertTrue(Arrays.stream(builder.createEventFilterIndexQueries())
                 .allMatch(query -> query.startsWith("CREATE INDEX IF NOT EXISTS")));
+
+        String alarmIdx = builder.createTieredUnadjudicatedAlarmIndexQuery();
+        assertTrue(alarmIdx.startsWith("CREATE INDEX IF NOT EXISTS obs_unadjudicated_alarm_idx ON obs"));
+        assertTrue(alarmIdx.contains("INCLUDE (archivegenerationid)"));
+        assertTrue(alarmIdx.contains("\"adjudicatedIdsCount\": 0"));
     }
 
     @Test
