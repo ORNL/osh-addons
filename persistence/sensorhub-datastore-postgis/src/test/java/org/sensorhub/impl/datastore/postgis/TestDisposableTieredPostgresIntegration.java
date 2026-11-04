@@ -4288,4 +4288,77 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             assertEquals(newerHotTime, selected.get(0).getValue().getPhenomenonTime());
         }
     }
+
+    @Test
+    public void boundedResultTimeQueriesPruneOlderColdGenerationsAndBackfillLegacyNullMaxResultTime() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant firstWindow = Instant.parse("2026-01-09T00:00:00Z");
+        Instant secondWindow = firstWindow.plus(1, ChronoUnit.HOURS);
+        Instant thirdWindow = firstWindow.plus(2, ChronoUnit.HOURS);
+        BigId stream = addSimpleDataStream(bigId(903), "gammaCounts");
+
+        DataBlock firstBlock = new DataBlockDouble(5);
+        firstBlock.setDoubleValue(0, 111.0);
+        Instant firstResultTime = firstWindow.plus(10, ChronoUnit.MINUTES);
+        tiered.add(new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(firstWindow.plus(5, ChronoUnit.MINUTES))
+                .withResultTime(firstResultTime)
+                .withResult(firstBlock)
+                .build());
+
+        DataBlock secondBlock = new DataBlockDouble(5);
+        secondBlock.setDoubleValue(0, 222.0);
+        Instant secondResultTime = secondWindow.plus(15, ChronoUnit.MINUTES);
+        tiered.add(new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(secondWindow.plus(5, ChronoUnit.MINUTES))
+                .withResultTime(secondResultTime)
+                .withResult(secondBlock)
+                .build());
+        forceReadBackFromStorage();
+
+        ArchiveGeneration olderGen = tiered.archiveWindow(firstWindow, secondWindow, "RAW_GATED").orElseThrow();
+        ArchiveGeneration newerGen = tiered.archiveWindow(secondWindow, thirdWindow, "RAW_GATED").orElseThrow();
+        try (Connection connection = open();
+             PreparedStatement deleteHot = connection.prepareStatement(
+                     "DELETE FROM " + TABLE + " WHERE datastreamid=?")) {
+            deleteHot.setLong(1, stream.getIdAsLong());
+            deleteHot.executeUpdate();
+        }
+
+        ArchiveCatalog catalog = tiered.getArchiveCatalog();
+        Set<Long> streamSet = Set.of(stream.getIdAsLong());
+        assertEquals(List.of(newerGen.id()),
+                catalog.candidates(firstWindow, thirdWindow, null, null, null, streamSet, secondWindow)
+                        .stream().map(ArchiveGeneration::id).toList());
+        assertEquals(List.of(newerGen.id()),
+                catalog.candidatesInitialClusters(firstWindow, thirdWindow, streamSet, secondWindow, false, 8)
+                        .generations().stream().map(ArchiveGeneration::id).toList());
+
+        // Simulate a pre-3.11.0 upgraded generation row with NULL max_result_time.
+        try (Connection connection = open();
+             PreparedStatement clearMaxResult = connection.prepareStatement(
+                     "UPDATE oscar_archive_generation SET max_result_time=NULL WHERE id=?")) {
+            clearMaxResult.setObject(1, olderGen.id());
+            assertEquals(1, clearMaxResult.executeUpdate());
+        }
+        assertEquals(2, catalog.candidates(firstWindow, thirdWindow, null, null, null, streamSet, secondWindow).size());
+
+        ObsFilter boundedResultFilter = new ObsFilter.Builder()
+                .withDataStreams(stream)
+                .withResultTimeDuring(secondWindow, thirdWindow)
+                .withLimit(1)
+                .build();
+        try (var rows = tiered.selectEntries(boundedResultFilter)) {
+            var selected = rows.toList();
+            assertEquals(1, selected.size());
+            assertEquals(222.0, selected.get(0).getValue().getResult().getDoubleValue(0), 0.0);
+        }
+
+        // Legacy NULL max_result_time must now be backfilled so subsequent SQL plans prune olderGen directly.
+        assertEquals(List.of(newerGen.id()),
+                catalog.candidates(firstWindow, thirdWindow, null, null, null, streamSet, secondWindow)
+                        .stream().map(ArchiveGeneration::id).toList());
+    }
 }

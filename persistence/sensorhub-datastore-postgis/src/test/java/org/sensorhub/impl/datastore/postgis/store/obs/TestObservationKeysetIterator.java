@@ -94,6 +94,51 @@ public class TestObservationKeysetIterator {
     }
 
     @Test
+    public void minResultTimeBoundExtractsConcreteLowerBoundsAndSkipsLatestOrUnbounded() {
+        Instant lower = Instant.parse("2026-11-04T01:04:36.850Z");
+        Instant upper = Instant.parse("2026-11-04T01:04:45.883Z");
+
+        org.junit.Assert.assertNull(OscarTieredObsStore.minResultTimeBound(null));
+        org.junit.Assert.assertNull(OscarTieredObsStore.minResultTimeBound(
+                new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                        .withPhenomenonTimeDuring(lower, upper)
+                        .build()));
+        org.junit.Assert.assertNull(OscarTieredObsStore.minResultTimeBound(
+                new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                        .withLatestResult()
+                        .build()));
+        org.junit.Assert.assertNull(OscarTieredObsStore.minResultTimeBound(
+                new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                        .withResultTime(new org.sensorhub.api.datastore.TemporalFilter.Builder()
+                                .withAllTimes()
+                                .build())
+                        .build()));
+        org.junit.Assert.assertNull(OscarTieredObsStore.minResultTimeBound(
+                new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                        .withResultTime(new org.sensorhub.api.datastore.TemporalFilter.Builder()
+                                .withRange(Instant.MIN, upper)
+                                .build())
+                        .build()));
+
+        assertEquals(lower, OscarTieredObsStore.minResultTimeBound(
+                new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                        .withResultTimeDuring(lower, upper)
+                        .build()));
+        assertEquals(lower, OscarTieredObsStore.minResultTimeBound(
+                new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                        .withResultTime(new org.sensorhub.api.datastore.TemporalFilter.Builder()
+                                .withSingleValue(lower)
+                                .build())
+                        .build()));
+        org.junit.Assert.assertNotNull(OscarTieredObsStore.minResultTimeBound(
+                new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                        .withResultTime(new org.sensorhub.api.datastore.TemporalFilter.Builder()
+                                .withCurrentTime()
+                                .build())
+                        .build()));
+    }
+
+    @Test
     public void sparsePostFilterCrossesTwentyThousandEqualAndNullTimestampsBothDirections()
             throws Exception {
         Assume.assumeTrue("OSCAR_IT_ARCHIVE_DIR enables the disposable PostgreSQL probe",

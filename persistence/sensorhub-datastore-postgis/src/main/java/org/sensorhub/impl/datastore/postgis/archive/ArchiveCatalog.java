@@ -1188,11 +1188,17 @@ public final class ArchiveCatalog {
     public List<ArchiveGeneration> candidates(Instant start, Instant end, Long observationId,
                                               Long minObservationId, Long maxObservationId,
                                               Set<Long> dataStreams) {
+        return candidates(start, end, observationId, minObservationId, maxObservationId, dataStreams, null);
+    }
+
+    public List<ArchiveGeneration> candidates(Instant start, Instant end, Long observationId,
+                                              Long minObservationId, Long maxObservationId,
+                                              Set<Long> dataStreams, Instant minResultTime) {
         if (dataStreams != null && dataStreams.isEmpty())
             return List.of();
         try (Connection connection = connections.open()) {
             return candidates(connection, start, end, observationId,
-                    minObservationId, maxObservationId, dataStreams);
+                    minObservationId, maxObservationId, dataStreams, minResultTime);
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot plan archive query", e);
         }
@@ -1206,13 +1212,22 @@ public final class ArchiveCatalog {
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
                                                Instant end, Long observationId)
             throws SQLException {
-        return candidates(connection, start, end, observationId, null, null, null);
+        return candidates(connection, start, end, observationId, null, null, null, null);
     }
 
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
                                                Instant end, Long observationId,
                                                Long minObservationId, Long maxObservationId,
                                                Set<Long> dataStreams)
+            throws SQLException {
+        return candidates(connection, start, end, observationId,
+                minObservationId, maxObservationId, dataStreams, null);
+    }
+
+    public List<ArchiveGeneration> candidates(Connection connection, Instant start,
+                                               Instant end, Long observationId,
+                                               Long minObservationId, Long maxObservationId,
+                                               Set<Long> dataStreams, Instant minResultTime)
             throws SQLException {
         if (dataStreams != null && dataStreams.isEmpty())
             return List.of();
@@ -1227,6 +1242,8 @@ public final class ArchiveCatalog {
             sql += "JOIN oscar_archive_id_block b ON b.generation_id=g.id ";
         sql += "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
                 "AND g.window_start < ? AND g.window_end > ? ";
+        if (minResultTime != null)
+            sql += "AND (g.max_result_time IS NULL OR g.max_result_time >= ?) ";
         if (observationId != null)
             sql += "AND ? BETWEEN b.min_id AND b.max_id ";
         if (filterIdRange)
@@ -1246,6 +1263,8 @@ public final class ArchiveCatalog {
             statement.setInt(parameter++, idScope);
             UtcJdbcTime.setInstant(statement, parameter++, end);
             UtcJdbcTime.setInstant(statement, parameter++, start);
+            if (minResultTime != null)
+                UtcJdbcTime.setInstant(statement, parameter++, minResultTime);
             if (observationId != null)
                 statement.setLong(parameter++, observationId);
             if (filterIdRange) {
@@ -1267,54 +1286,14 @@ public final class ArchiveCatalog {
     }
 
     /**
-     * Pushes {@code resultTime=latest} high-water filtering into PostgreSQL so
-     * multi-year archives do not materialize tens of thousands of historical
-     * generations whose {@code max_result_time} is older than the hot tier.
+     * Pushes {@code resultTime} lower-bound / {@code resultTime=latest} high-water
+     * filtering into PostgreSQL so multi-year archives do not materialize tens of
+     * thousands of historical generations whose {@code max_result_time} is older
+     * than the requested lower bound or hot tier.
      */
     public List<ArchiveGeneration> candidatesPotentiallyNewerThanResultTime(
             Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime) {
-        if (dataStreams != null && dataStreams.isEmpty())
-            return List.of();
-        if (minResultTime == null)
-            return candidates(start, end, null, null, null, dataStreams);
-        boolean filterDataStreams = dataStreams != null;
-        String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
-                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time " +
-                "FROM oscar_archive_generation g " +
-                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
-                "AND g.window_start < ? AND g.window_end > ? " +
-                "AND (g.max_result_time IS NULL OR g.max_result_time >= ?) ";
-        if (filterDataStreams)
-            sql += "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
-                    "WHERE s.generation_id=g.id AND s.datastream_id=ANY (?::bigint[])) ";
-        sql += "ORDER BY g.window_start, g.id";
-
-        List<ArchiveGeneration> generations = new ArrayList<>();
-        try (Connection connection = connections.open()) {
-            java.sql.Array streamArray = filterDataStreams
-                    ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
-                    : null;
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                int parameter = 1;
-                statement.setString(parameter++, storeKey);
-                statement.setInt(parameter++, idScope);
-                UtcJdbcTime.setInstant(statement, parameter++, end);
-                UtcJdbcTime.setInstant(statement, parameter++, start);
-                UtcJdbcTime.setInstant(statement, parameter++, minResultTime);
-                if (streamArray != null)
-                    statement.setArray(parameter, streamArray);
-                try (ResultSet result = statement.executeQuery()) {
-                    while (result.next())
-                        generations.add(readGeneration(result));
-                }
-            } finally {
-                if (streamArray != null)
-                    streamArray.free();
-            }
-            return generations;
-        } catch (SQLException e) {
-            throw new IllegalStateException("Cannot plan result-time archive query", e);
-        }
+        return candidates(start, end, null, null, null, dataStreams, minResultTime);
     }
 
     /**
@@ -1350,6 +1329,12 @@ public final class ArchiveCatalog {
     public InitialCandidateBatch candidatesInitialClusters(
             Instant start, Instant end, Set<Long> dataStreams,
             boolean descending, int batchLimit) {
+        return candidatesInitialClusters(start, end, dataStreams, null, descending, batchLimit);
+    }
+
+    public InitialCandidateBatch candidatesInitialClusters(
+            Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime,
+            boolean descending, int batchLimit) {
         if (batchLimit < 2)
             throw new IllegalArgumentException("Candidate batch limit must be at least 2");
         if (dataStreams != null && dataStreams.isEmpty())
@@ -1363,6 +1348,8 @@ public final class ArchiveCatalog {
                 "FROM oscar_archive_generation g " +
                 "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
                 "AND g.window_start < ? AND g.window_end > ? ";
+        if (minResultTime != null)
+            sql += "AND (g.max_result_time IS NULL OR g.max_result_time >= ?) ";
         if (filterDataStreams)
             sql += "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
                     "WHERE s.generation_id=g.id AND s.datastream_id=ANY (?::bigint[])) ";
@@ -1379,6 +1366,8 @@ public final class ArchiveCatalog {
                 statement.setInt(parameter++, idScope);
                 UtcJdbcTime.setInstant(statement, parameter++, end);
                 UtcJdbcTime.setInstant(statement, parameter++, start);
+                if (minResultTime != null)
+                    UtcJdbcTime.setInstant(statement, parameter++, minResultTime);
                 if (streamArray != null)
                     statement.setArray(parameter++, streamArray);
                 statement.setInt(parameter, Math.addExact(batchLimit, 1));
@@ -1416,7 +1405,8 @@ public final class ArchiveCatalog {
             clusters.get(clusters.size() - 1).add(generation);
         }
         if (clusters.size() < 2) {
-            List<ArchiveGeneration> all = candidates(start, end, null, null, null, dataStreams);
+            List<ArchiveGeneration> all = candidates(
+                    start, end, null, null, null, dataStreams, minResultTime);
             return new InitialCandidateBatch(all, true);
         }
         List<List<ArchiveGeneration>> completeClusters = descending

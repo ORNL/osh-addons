@@ -193,6 +193,149 @@ public class TestArchiveLifecycleInvariants {
                 () -> ArchiveLifecycleManager.resolveArchiveObject(root, Path.of("linked.parquet")));
     }
 
+    @Test
+    public void candidatesAndInitialClustersPushBoundedMinResultTimePredicateIntoSql() throws Exception {
+        List<String> capturedSql = new ArrayList<>();
+        List<List<Object>> capturedBinds = new ArrayList<>();
+        AtomicInteger freedArrays = new AtomicInteger();
+
+        Array array = (Array) Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{Array.class}, (proxy, method, arguments) -> {
+                    if (method.getName().equals("free")) {
+                        freedArrays.incrementAndGet();
+                        return null;
+                    }
+                    return defaultValue(method.getReturnType());
+                });
+        ResultSet emptyResult = (ResultSet) Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{ResultSet.class}, (proxy, method, arguments) ->
+                        method.getName().equals("next") ? false : defaultValue(method.getReturnType()));
+        SqlConnectionProvider provider = () -> (Connection) Proxy.newProxyInstance(
+                getClass().getClassLoader(),
+                new Class<?>[]{Connection.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "createArrayOf" -> {
+                        assertEquals("bigint", arguments[0]);
+                        yield array;
+                    }
+                    case "prepareStatement" -> {
+                        capturedSql.add((String) arguments[0]);
+                        List<Object> binds = new ArrayList<>();
+                        capturedBinds.add(binds);
+                        yield Proxy.newProxyInstance(getClass().getClassLoader(),
+                                new Class<?>[]{PreparedStatement.class},
+                                (stmtProxy, stmtMethod, stmtArgs) -> switch (stmtMethod.getName()) {
+                                    case "setString", "setInt", "setLong", "setTimestamp", "setArray", "setObject" -> {
+                                        int index = (int) stmtArgs[0];
+                                        while (binds.size() < index)
+                                            binds.add(null);
+                                        binds.set(index - 1, stmtArgs[1]);
+                                        yield null;
+                                    }
+                                    case "executeQuery" -> emptyResult;
+                                    default -> defaultValue(stmtMethod.getReturnType());
+                                });
+                    }
+                    default -> defaultValue(method.getReturnType());
+                });
+
+        ArchiveCatalog catalog = new ArchiveCatalog(provider, "result_probe", 5);
+        java.time.Instant start = java.time.Instant.parse("2026-11-01T00:00:00Z");
+        java.time.Instant end = java.time.Instant.parse("2026-11-05T00:00:00Z");
+        java.time.Instant minResultTime = java.time.Instant.parse("2026-11-04T01:04:36.850Z");
+
+        assertTrue(catalog.candidates(start, end, null, null, null, Set.of(42L), minResultTime).isEmpty());
+        assertTrue(catalog.candidates(start, end, null, null, null, Set.of(42L)).isEmpty());
+        assertTrue(catalog.candidatesInitialClusters(start, end, Set.of(42L), minResultTime, false, 8)
+                .generations().isEmpty());
+        assertTrue(catalog.candidatesInitialClusters(start, end, Set.of(42L), false, 8)
+                .generations().isEmpty());
+
+        assertEquals(4, capturedSql.size());
+        assertTrue(capturedSql.get(0).contains("AND (g.max_result_time IS NULL OR g.max_result_time >= ?)"));
+        assertFalse(capturedSql.get(1).contains("g.max_result_time >= ?"));
+        assertTrue(capturedSql.get(2).contains("AND (g.max_result_time IS NULL OR g.max_result_time >= ?)"));
+        assertTrue(capturedSql.get(2).endsWith("ORDER BY g.window_start ASC, g.window_end ASC, g.id ASC LIMIT ?"));
+        assertFalse(capturedSql.get(3).contains("g.max_result_time >= ?"));
+
+        assertEquals("result_probe", capturedBinds.get(0).get(0));
+        assertEquals(5, capturedBinds.get(0).get(1));
+        assertEquals(6, capturedBinds.get(0).size());
+        assertEquals(5, capturedBinds.get(1).size());
+        assertEquals(7, capturedBinds.get(2).size());
+        assertEquals(9, capturedBinds.get(2).get(6));
+        assertEquals(6, capturedBinds.get(3).size());
+        assertEquals(4, freedArrays.get());
+    }
+
+    @Test
+    public void parquetReaderPrunesGenerationsOlderThanMinResultTimeAndCachesLegacyMetadata() throws Exception {
+        Path root = temporary.newFolder("parquet-result-prune").toPath().toAbsolutePath().normalize();
+        Path spill = temporary.getRoot().toPath().resolve("parquet-result-spill").toAbsolutePath().normalize();
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.rootDirectory = root.toString();
+        config.duckDbTemporaryDirectory = spill.toString();
+
+        Path olderRelative = Path.of("older.parquet");
+        Path newerRelative = Path.of("newer.parquet");
+        java.time.Instant olderStart = java.time.Instant.parse("2026-11-04T00:00:00Z");
+        java.time.Instant olderResult = java.time.Instant.parse("2026-11-04T00:15:00Z");
+        java.time.Instant newerStart = java.time.Instant.parse("2026-11-04T01:00:00Z");
+        java.time.Instant newerResult = java.time.Instant.parse("2026-11-04T01:04:40Z");
+
+        writeSingleObservationParquet(config, root.resolve(olderRelative), 101L, 42L, olderStart, olderResult);
+        writeSingleObservationParquet(config, root.resolve(newerRelative), 102L, 42L, newerStart, newerResult);
+
+        ArchiveGeneration catalogPruned = new ArchiveGeneration(
+                UUID.randomUUID(), "RAW_GATED",
+                olderStart.minusSeconds(3600), olderStart,
+                Path.of("never-opened.parquet"),
+                "0".repeat(64),
+                1L, 90L, 90L, "SEALED", true,
+                olderStart.minusSeconds(60));
+        ArchiveGeneration legacyOlder = new ArchiveGeneration(
+                UUID.randomUUID(), "RAW_GATED",
+                olderStart, newerStart,
+                olderRelative, ArchiveExporter.sha256(root.resolve(olderRelative)),
+                1L, 101L, 101L, "SEALED", true,
+                null);
+        ArchiveGeneration legacyNewer = new ArchiveGeneration(
+                UUID.randomUUID(), "RAW_GATED",
+                newerStart, newerStart.plusSeconds(3600),
+                newerRelative, ArchiveExporter.sha256(root.resolve(newerRelative)),
+                1L, 102L, 102L, "SEALED", true,
+                null);
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root, config);
+        List<ArchiveGeneration> retained = reader.generationsPotentiallyNewerThanResultTime(
+                List.of(catalogPruned, legacyOlder, legacyNewer),
+                java.time.Instant.parse("2026-11-04T01:04:36.850Z"));
+
+        assertEquals(List.of(legacyNewer), retained);
+        assertEquals(java.util.Optional.of(olderResult), reader.cachedMaxResultTime(legacyOlder));
+        assertEquals(java.util.Optional.of(newerResult), reader.cachedMaxResultTime(legacyNewer));
+    }
+
+    private static void writeSingleObservationParquet(
+            TieredArchiveConfig config, Path target, long obsId, long streamId,
+            java.time.Instant phenomenonTime, java.time.Instant resultTime) throws Exception {
+        try (DuckDbResourcePolicy.Session session = DuckDbResourcePolicy.open(config, "test-export");
+             Statement create = session.connection().createStatement()) {
+            create.execute("CREATE TABLE archive_rows (id_scope INTEGER, id_value BIGINT, datastream_scope INTEGER, " +
+                    "datastream_id BIGINT, foi_scope INTEGER, foi_id BIGINT, phenomenon_time TIMESTAMP, " +
+                    "result_time TIMESTAMP, result_json VARCHAR, archive_version INTEGER, profile VARCHAR)");
+            try (PreparedStatement insert = session.connection().prepareStatement(
+                    "INSERT INTO archive_rows VALUES (1, ?, 1, ?, NULL, NULL, ?, ?, '{\"v\":1}', 1, 'RAW_GATED')")) {
+                insert.setLong(1, obsId);
+                insert.setLong(2, streamId);
+                UtcJdbcTime.setDuckDbInstant(insert, 3, phenomenonTime);
+                UtcJdbcTime.setDuckDbInstant(insert, 4, resultTime);
+                insert.executeUpdate();
+            }
+            String escaped = target.toString().replace("'", "''");
+            create.execute("COPY archive_rows TO '" + escaped + "' (FORMAT PARQUET, COMPRESSION ZSTD)");
+        }
+    }
+
     private PreparedStatement preparedStatement(AtomicInteger executions,
                                                 AtomicReference<List<Long>> boundIds) {
         return (PreparedStatement) Proxy.newProxyInstance(getClass().getClassLoader(),
