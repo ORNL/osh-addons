@@ -700,9 +700,38 @@ public final class ArchiveCatalog {
         }
     }
 
+    private int staleExportingTimeoutMinutes() {
+        return resourceConfig.isParquetPrimary()
+                ? Math.max(20, resourceConfig.maximumCycleMinutes * 2)
+                : 120;
+    }
+
     /**
-     * Returns the oldest latest-revision FAILED job, or EXPORTING job stale for
-     * two hours, that is wholly before the current retention cutoff.
+     * Marks in-flight {@code EXPORTING} jobs for this store as {@code FAILED}
+     * during single-owner module startup so a container restart or upgrade does
+     * not leave an interrupted window waiting for the stale-export timeout
+     * (which would otherwise breach the 1-hour Parquet-primary staging SLO).
+     */
+    public int reclaimInterruptedExportingJobsOnStartup() {
+        String sql = "UPDATE oscar_archive_job job " +
+                "SET state='FAILED', error='Interrupted by process restart before activation', updated_at=now() " +
+                "WHERE job.store_key=? AND job.id_scope=? AND job.state='EXPORTING' " +
+                "AND NOT EXISTS (SELECT 1 FROM oscar_archive_generation gen " +
+                "WHERE gen.job_id=job.id AND gen.store_key=job.store_key AND gen.id_scope=job.id_scope)";
+        try (Connection connection = connections.open();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, storeKey);
+            statement.setInt(2, idScope);
+            return statement.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot reclaim interrupted archive jobs on startup", e);
+        }
+    }
+
+    /**
+     * Returns the oldest latest-revision FAILED job, or EXPORTING job stale
+     * beyond {@link #staleExportingTimeoutMinutes()}, that is wholly before the
+     * current retention cutoff.
      *
      * <p>This exact-window lookup preserves upgrade recovery for sub-hour jobs
      * created by the former time-bisection scheduler.  Reclaiming those jobs
@@ -718,7 +747,7 @@ public final class ArchiveCatalog {
         String sql = "SELECT job.window_start, job.window_end FROM oscar_archive_job job " +
                 "WHERE job.store_key=? AND job.id_scope=? AND job.profile=? AND job.window_end<=? " +
                 "AND (job.state='FAILED' OR (job.state='EXPORTING' " +
-                "AND job.updated_at < now()-interval '2 hours')) " +
+                "AND job.updated_at < now() - (? * interval '1 minute'))) " +
                 "AND NOT EXISTS (SELECT 1 FROM oscar_archive_job newer " +
                 "WHERE newer.store_key=job.store_key AND newer.id_scope=job.id_scope " +
                 "AND newer.profile=job.profile AND newer.window_start=job.window_start " +
@@ -730,6 +759,7 @@ public final class ArchiveCatalog {
             statement.setInt(2, idScope);
             statement.setString(3, profile);
             UtcJdbcTime.setInstant(statement, 4, cutoff);
+            statement.setInt(5, staleExportingTimeoutMinutes());
             try (ResultSet result = statement.executeQuery()) {
                 if (!result.next())
                     return Optional.empty();
@@ -759,15 +789,16 @@ public final class ArchiveCatalog {
                 int revision = 0;
                 boolean stale = false;
                 try (PreparedStatement latest = connection.prepareStatement(
-                        "SELECT id, revision, state, updated_at < now()-interval '2 hours' stale " +
+                        "SELECT id, revision, state, updated_at < now() - (? * interval '1 minute') stale " +
                                 "FROM oscar_archive_job WHERE store_key=? AND id_scope=? " +
                                 "AND profile=? AND window_start=? AND window_end=? " +
                                 "ORDER BY revision DESC LIMIT 1")) {
-                    latest.setString(1, storeKey);
-                    latest.setInt(2, idScope);
-                    latest.setString(3, profile);
-                    UtcJdbcTime.setInstant(latest, 4, start);
-                    UtcJdbcTime.setInstant(latest, 5, end);
+                    latest.setInt(1, staleExportingTimeoutMinutes());
+                    latest.setString(2, storeKey);
+                    latest.setInt(3, idScope);
+                    latest.setString(4, profile);
+                    UtcJdbcTime.setInstant(latest, 5, start);
+                    UtcJdbcTime.setInstant(latest, 6, end);
                     try (ResultSet result = latest.executeQuery()) {
                         if (result.next()) {
                             previousId = result.getObject(1, UUID.class);

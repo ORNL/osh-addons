@@ -38,6 +38,12 @@ public class OscarTieredObsSystemDatabase extends PostgisObsSystemDatabase {
         TieredArchiveConfig archive = archiveConfig();
         if (!archive.enabled)
             return;
+        OscarTieredObsStore store = (OscarTieredObsStore) obsStore;
+        int reclaimed = store.reclaimInterruptedExportingJobsOnStartup();
+        if (reclaimed > 0) {
+            getLogger().info("Reclaimed {} interrupted OSCAR archive export job(s) on startup for immediate retry",
+                    reclaimed);
+        }
         archiveExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "oscar-observation-archive");
             thread.setDaemon(true);

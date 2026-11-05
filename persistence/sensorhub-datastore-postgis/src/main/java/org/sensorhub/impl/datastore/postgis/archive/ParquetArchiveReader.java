@@ -7,10 +7,13 @@ import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator;
 import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.security.MessageDigest;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -19,9 +22,11 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
@@ -33,6 +38,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
@@ -54,6 +60,16 @@ public final class ParquetArchiveReader {
     private final Object[] verificationLocks = createVerificationLocks();
     private final Map<String, java.util.Optional<Instant>> maxResultTimeBySha256 = new ConcurrentHashMap<>();
     private final AtomicInteger openCursors = new AtomicInteger();
+    private volatile DirectReadFaultInjector directReadFaultInjector;
+
+    @FunctionalInterface
+    interface DirectReadFaultInjector {
+        void beforeDirectRead(Set<String> filenames) throws SQLException;
+    }
+
+    void setDirectReadFaultInjectorForTesting(DirectReadFaultInjector injector) {
+        this.directReadFaultInjector = injector;
+    }
 
     private static Object[] createVerificationLocks() {
         Object[] locks = new Object[VERIFICATION_LOCK_STRIPES];
@@ -127,9 +143,8 @@ public final class ParquetArchiveReader {
             AuthorizedObjects objects = authorize(generations);
             if (objects.byFilename().isEmpty())
                 return Stream.empty();
-            QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois,
-                    true, !javaCql, javaCql ? Long.MAX_VALUE : limit);
-            rows = openRowStream(objects, plan, generations.size());
+            rows = openRowStream(objects, auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
+                    true, !javaCql, javaCql ? Long.MAX_VALUE : limit), generations.size());
         }
         if (javaCql)
             rows = rows.filter(row -> matchesCql(filter, row.observation().resultJson()));
@@ -160,7 +175,7 @@ public final class ParquetArchiveReader {
         boolean batchSelectiveCql = limit == Long.MAX_VALUE && filter.getCQLFilter() != null &&
                 JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(filter.getCQLFilter());
         List<List<ArchiveGeneration>> clusters = batchSelectiveCql
-                ? batchWindowClusters(generations, MAX_RESULT_TIME_METADATA_BATCH)
+                ? batchWindowClusters(generations, MAX_CQL_PAYLOAD_BATCH)
                 : windowClusters(generations);
         if (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().descendingOrder())
             java.util.Collections.reverse(clusters);
@@ -184,9 +199,8 @@ public final class ParquetArchiveReader {
             AuthorizedObjects objects = authorize(generations);
             if (objects.byFilename().isEmpty())
                 return Stream.empty();
-            QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois,
-                    true, true, limit);
-            return openRowStream(objects, plan, generations.size());
+            return openRowStream(objects, auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
+                    true, true, limit), generations.size());
         }
 
         boolean latestResult = filter.getResultTime() != null && filter.getResultTime().isLatestTime();
@@ -236,9 +250,11 @@ public final class ParquetArchiveReader {
             AuthorizedObjects objects = authorize(clusterGenerations);
             if (objects.byFilename().isEmpty())
                 continue;
-            QueryPlan plan = queryPlan(objects, filter, clusterStreams, allowedFois,
-                    true, true, Long.MAX_VALUE);
-            try (Stream<ArchivedRow> clusterRows = openRowStream(objects, plan, clusterGenerations.size())) {
+            final Set<Long> effectiveClusterStreams = clusterStreams;
+            try (Stream<ArchivedRow> clusterRows = openRowStream(objects,
+                    auth -> queryPlan(auth, filter, effectiveClusterStreams, allowedFois,
+                            true, true, Long.MAX_VALUE),
+                    clusterGenerations.size())) {
                 clusterRows.forEach(row -> {
                     long streamId = row.observation().dataStreamId();
                     bestByStream.merge(streamId, row,
@@ -256,6 +272,8 @@ public final class ParquetArchiveReader {
     }
 
     private static final int MAX_RESULT_TIME_METADATA_BATCH = 64;
+    private static final int MAX_CQL_PAYLOAD_BATCH = 16;
+    private static final int LOCAL_STAGE_COPY_RETRIES = 3;
 
     /**
      * Returns only those generations whose maximum {@code result_time} is at
@@ -306,20 +324,16 @@ public final class ParquetArchiveReader {
         AuthorizedObjects objects = authorize(uncached);
         if (objects.byFilename().isEmpty())
             return;
-        String fileList = objects.byFilename().keySet().stream()
-                .map(path -> "'" + sqlLiteral(path) + "'")
-                .collect(Collectors.joining(","));
-        String sql = "SELECT filename, max(COALESCE(result_time, phenomenon_time)) FROM read_parquet([" + fileList +
-                "], filename=true) GROUP BY filename";
         Map<String, java.util.Optional<Instant>> discovered = new HashMap<>();
-        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "metadata-max-result");
-             PreparedStatement statement = ConnectionManager.trackCancellableStatement(
-                     duckSession.connection().prepareStatement(sql), "DuckDB max result time metadata query");
-             ResultSet result = statement.executeQuery()) {
-            while (nextCancellable(result)) {
-                ArchiveGeneration generation = generationForFilename(objects, result.getString(1));
-                Instant maxResult = UtcJdbcTime.getDuckDbInstant(result, 2);
-                discovered.put(generation.sha256(), java.util.Optional.ofNullable(maxResult));
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "metadata-max-result")) {
+            try {
+                executeMaxResultTimesQuery(duckSession, objects, true, discovered);
+            } catch (Exception directError) {
+                if (!isTransientReadMemoryError(directError))
+                    throw directError;
+                AuthorizedObjects staged = stageAuthorizedObjectsLocally(objects, duckSession.operationDirectory());
+                discovered.clear();
+                executeMaxResultTimesQuery(duckSession, staged, false, discovered);
             }
         } catch (Exception e) {
             throw new IllegalStateException("Cannot inspect max result_time from " + uncached.size() +
@@ -329,6 +343,28 @@ public final class ParquetArchiveReader {
             maxResultTimeBySha256.putIfAbsent(
                     generation.sha256(),
                     discovered.getOrDefault(generation.sha256(), java.util.Optional.empty()));
+        }
+    }
+
+    private void executeMaxResultTimesQuery(DuckDbResourcePolicy.Session duckSession,
+                                            AuthorizedObjects objects,
+                                            boolean directRead,
+                                            Map<String, java.util.Optional<Instant>> discovered) throws Exception {
+        if (directRead)
+            maybeInjectDirectReadFault(objects);
+        String fileList = objects.byFilename().keySet().stream()
+                .map(path -> "'" + sqlLiteral(path) + "'")
+                .collect(Collectors.joining(","));
+        String sql = "SELECT filename, max(COALESCE(result_time, phenomenon_time)) FROM read_parquet([" + fileList +
+                "], filename=true) GROUP BY filename";
+        try (PreparedStatement statement = ConnectionManager.trackCancellableStatement(
+                     duckSession.connection().prepareStatement(sql), "DuckDB max result time metadata query");
+             ResultSet result = statement.executeQuery()) {
+            while (nextCancellable(result)) {
+                ArchiveGeneration generation = generationForFilename(objects, result.getString(1));
+                Instant maxResult = UtcJdbcTime.getDuckDbInstant(result, 2);
+                discovered.put(generation.sha256(), java.util.Optional.ofNullable(maxResult));
+            }
         }
     }
 
@@ -352,17 +388,37 @@ public final class ParquetArchiveReader {
         return clusters;
     }
 
-    private Stream<ArchivedRow> openRowStream(AuthorizedObjects objects, QueryPlan plan, int generationCount) {
+    private Stream<ArchivedRow> openRowStream(AuthorizedObjects objects,
+                                              Function<AuthorizedObjects, QueryPlan> planFactory,
+                                              int generationCount) {
         DuckDbResourcePolicy.Session duckSession = null;
         PreparedStatement statement = null;
         ResultSet result = null;
         try {
             duckSession = DuckDbResourcePolicy.open(config, "cold-query");
-            statement = ConnectionManager.trackCancellableStatement(
-                    duckSession.connection().prepareStatement(plan.sql()), "DuckDB cold query");
-            bind(statement, plan.parameters());
-            result = statement.executeQuery();
-            RowCursor cursor = new RowCursor(duckSession, statement, result, objects);
+            AuthorizedObjects activeObjects = objects;
+            try {
+                maybeInjectDirectReadFault(objects);
+                QueryPlan plan = planFactory.apply(objects);
+                statement = ConnectionManager.trackCancellableStatement(
+                        duckSession.connection().prepareStatement(plan.sql()), "DuckDB cold query");
+                bind(statement, plan.parameters());
+                result = statement.executeQuery();
+            } catch (Exception directError) {
+                if (!isTransientReadMemoryError(directError))
+                    throw directError;
+                closeAndSuppress(result, directError);
+                closeAndSuppress(statement, directError);
+                result = null;
+                statement = null;
+                activeObjects = stageAuthorizedObjectsLocally(objects, duckSession.operationDirectory());
+                QueryPlan stagedPlan = planFactory.apply(activeObjects);
+                statement = ConnectionManager.trackCancellableStatement(
+                        duckSession.connection().prepareStatement(stagedPlan.sql()), "DuckDB cold query");
+                bind(statement, stagedPlan.parameters());
+                result = statement.executeQuery();
+            }
+            RowCursor cursor = new RowCursor(duckSession, statement, result, activeObjects);
             openCursors.incrementAndGet();
             return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
                             Spliterator.ORDERED | Spliterator.NONNULL), false)
@@ -407,11 +463,34 @@ public final class ParquetArchiveReader {
         AuthorizedObjects objects = authorize(generations);
         if (objects.byFilename().isEmpty())
             return;
-        QueryPlan plan = queryPlan(
-                objects, filter, allowedDataStreams, allowedFois, false, true, limit,
+        Function<AuthorizedObjects, QueryPlan> planFactory = auth -> queryPlan(
+                auth, filter, allowedDataStreams, allowedFois, false, true, limit,
                 limit != Long.MAX_VALUE);
-        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "metadata-query");
-             PreparedStatement statement = ConnectionManager.trackCancellableStatement(
+        boolean[] emittedAny = {false};
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "metadata-query")) {
+            try {
+                executeForEachMetadataPlan(duckSession, planFactory.apply(objects), objects, true, consumer, emittedAny);
+            } catch (Exception directError) {
+                if (emittedAny[0] || !isTransientReadMemoryError(directError))
+                    throw directError;
+                AuthorizedObjects staged = stageAuthorizedObjectsLocally(objects, duckSession.operationDirectory());
+                executeForEachMetadataPlan(duckSession, planFactory.apply(staged), staged, false, consumer, emittedAny);
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot scan metadata from " + generations.size() +
+                    " archive generation(s)", e);
+        }
+    }
+
+    private void executeForEachMetadataPlan(DuckDbResourcePolicy.Session duckSession,
+                                            QueryPlan plan,
+                                            AuthorizedObjects objects,
+                                            boolean directRead,
+                                            Consumer<ArchivedMetadataRow> consumer,
+                                            boolean[] emittedAny) throws Exception {
+        if (directRead)
+            maybeInjectDirectReadFault(objects);
+        try (PreparedStatement statement = ConnectionManager.trackCancellableStatement(
                      duckSession.connection().prepareStatement(plan.sql()), "DuckDB metadata query")) {
             bind(statement, plan.parameters());
             try (ResultSet result = statement.executeQuery()) {
@@ -421,15 +500,13 @@ public final class ParquetArchiveReader {
                     Long foiId = result.getObject(7, Long.class);
                     Instant phenomenon = UtcJdbcTime.getDuckDbInstant(result, 8);
                     Instant resultTime = UtcJdbcTime.getDuckDbInstant(result, 9);
+                    emittedAny[0] = true;
                     consumer.accept(new ArchivedMetadataRow(generation,
                             result.getInt(2), result.getLong(3), result.getInt(4), result.getLong(5),
                             foiScope, foiId, phenomenon,
                             resultTime, result.getString(10)));
                 }
             }
-        } catch (Exception e) {
-            throw new IllegalStateException("Cannot scan metadata from " + generations.size() +
-                    " archive generation(s)", e);
         }
     }
 
@@ -517,7 +594,7 @@ public final class ParquetArchiveReader {
 
         long total = 0;
         Set<Long> exclusions = excludedIds == null ? Set.of() : excludedIds;
-        for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_RESULT_TIME_METADATA_BATCH)) {
+        for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_CQL_PAYLOAD_BATCH)) {
             total = Math.addExact(total, countCqlSingleBatch(
                     batch, filter, allowedDataStreams, allowedFois, exclusions));
             if (filter.getLimit() != Long.MAX_VALUE && total >= filter.getLimit())
@@ -532,6 +609,27 @@ public final class ParquetArchiveReader {
         AuthorizedObjects objects = authorize(generations);
         if (objects.byFilename().isEmpty())
             return 0;
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "cold-cql-count")) {
+            try {
+                return executeCountCqlPlan(
+                        duckSession, cqlCountPlan(objects, filter, allowedDataStreams, allowedFois),
+                        objects, filter, excludedIds, true);
+            } catch (Exception directError) {
+                if (!isTransientReadMemoryError(directError))
+                    throw directError;
+                AuthorizedObjects staged = stageAuthorizedObjectsLocally(objects, duckSession.operationDirectory());
+                return executeCountCqlPlan(
+                        duckSession, cqlCountPlan(staged, filter, allowedDataStreams, allowedFois),
+                        staged, filter, excludedIds, false);
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot count CQL matches from " + generations.size() +
+                    " archive generation(s)", e);
+        }
+    }
+
+    private QueryPlan cqlCountPlan(AuthorizedObjects objects, ObsFilter filter,
+                                   Set<Long> allowedDataStreams, Set<Long> allowedFois) {
         String fileList = objects.byFilename().keySet().stream()
                 .map(path -> "'" + sqlLiteral(path) + "'")
                 .collect(Collectors.joining(","));
@@ -561,12 +659,21 @@ public final class ParquetArchiveReader {
         appendTime(sql, "result_time", filter.getResultTime(), parameters);
         if (filter.getCQLFilter() != null)
             JsonCqlEvaluator.appendDuckDbPrefilter(filter.getCQLFilter(), "result_json", sql, parameters);
+        return new QueryPlan(sql.toString(), parameters);
+    }
 
+    private long executeCountCqlPlan(DuckDbResourcePolicy.Session duckSession,
+                                     QueryPlan plan,
+                                     AuthorizedObjects objects,
+                                     ObsFilter filter,
+                                     Set<Long> excludedIds,
+                                     boolean directRead) throws Exception {
+        if (directRead)
+            maybeInjectDirectReadFault(objects);
         long matched = 0;
-        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "cold-cql-count");
-             PreparedStatement statement = ConnectionManager.trackCancellableStatement(
-                     duckSession.connection().prepareStatement(sql.toString()), "DuckDB cold CQL count")) {
-            bind(statement, parameters);
+        try (PreparedStatement statement = ConnectionManager.trackCancellableStatement(
+                     duckSession.connection().prepareStatement(plan.sql()), "DuckDB cold CQL count")) {
+            bind(statement, plan.parameters());
             try (ResultSet result = statement.executeQuery()) {
                 while (nextCancellable(result)) {
                     long id = result.getLong(1);
@@ -580,9 +687,6 @@ public final class ParquetArchiveReader {
                 }
             }
             return matched;
-        } catch (Exception e) {
-            throw new IllegalStateException("Cannot count CQL matches from " + generations.size() +
-                    " archive generation(s)", e);
         }
     }
 
@@ -592,10 +696,30 @@ public final class ParquetArchiveReader {
         if (objects.byFilename().isEmpty())
             return 0;
         ObsFilter unbounded = ObsFilter.Builder.from(filter).withLimit(Long.MAX_VALUE).build();
-        QueryPlan plan = queryPlan(objects, unbounded, allowedDataStreams, allowedFois,
-                false, true, Long.MAX_VALUE, false);
-        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "cold-count");
-             PreparedStatement statement = ConnectionManager.trackCancellableStatement(
+        Function<AuthorizedObjects, QueryPlan> planFactory = auth -> queryPlan(
+                auth, unbounded, allowedDataStreams, allowedFois, false, true, Long.MAX_VALUE, false);
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "cold-count")) {
+            try {
+                return executeCountPlan(duckSession, planFactory.apply(objects), objects, filter, true);
+            } catch (Exception directError) {
+                if (!isTransientReadMemoryError(directError))
+                    throw directError;
+                AuthorizedObjects staged = stageAuthorizedObjectsLocally(objects, duckSession.operationDirectory());
+                return executeCountPlan(duckSession, planFactory.apply(staged), staged, filter, false);
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot count " + generations.size() + " archive generation(s)", e);
+        }
+    }
+
+    private long executeCountPlan(DuckDbResourcePolicy.Session duckSession,
+                                  QueryPlan plan,
+                                  AuthorizedObjects objects,
+                                  ObsFilter filter,
+                                  boolean directRead) throws Exception {
+        if (directRead)
+            maybeInjectDirectReadFault(objects);
+        try (PreparedStatement statement = ConnectionManager.trackCancellableStatement(
                      duckSession.connection().prepareStatement(
                              "SELECT count(*) FROM (" + plan.sql() + ") archive_matches"),
                      "DuckDB cold count")) {
@@ -604,8 +728,89 @@ public final class ParquetArchiveReader {
                 long count = nextCancellable(result) ? result.getLong(1) : 0;
                 return filter.getLimit() == Long.MAX_VALUE ? count : Math.min(count, filter.getLimit());
             }
-        } catch (Exception e) {
-            throw new IllegalStateException("Cannot count " + generations.size() + " archive generation(s)", e);
+        }
+    }
+
+    private void maybeInjectDirectReadFault(AuthorizedObjects objects) throws SQLException {
+        DirectReadFaultInjector injector = directReadFaultInjector;
+        if (injector != null)
+            injector.beforeDirectRead(objects.byFilename().keySet());
+    }
+
+    static boolean isTransientReadMemoryError(Throwable error) {
+        int depth = 0;
+        for (Throwable current = error; current != null && depth < 16; current = current.getCause(), depth++) {
+            String message = current.getMessage();
+            if (message == null)
+                continue;
+            String normalized = message.toLowerCase(Locale.ROOT);
+            if (normalized.contains("cannot allocate memory") &&
+                    (normalized.contains("could not read from file") || normalized.contains("io error"))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Copies already-authorized Parquet objects into the bounded DuckDB session's
+     * private local temporary directory using 16 KiB stream reads (safe on WSL2
+     * 9p drvFs where multi-megabyte {@code pread} calls can fail with {@code ENOMEM})
+     * and re-verifies each object's SHA-256 digest during staging.
+     */
+    private AuthorizedObjects stageAuthorizedObjectsLocally(AuthorizedObjects objects, Path operationDirectory)
+            throws Exception {
+        Path normalizedOperationDir = operationDirectory.toAbsolutePath().normalize();
+        Path stageDir = normalizedOperationDir.resolve("staged-" + UUID.randomUUID()).normalize();
+        if (!stageDir.getParent().equals(normalizedOperationDir))
+            throw new IllegalStateException("Unsafe local Parquet stage directory: " + stageDir);
+        Files.createDirectory(stageDir);
+        Map<String, ArchiveGeneration> staged = new LinkedHashMap<>();
+        int index = 0;
+        for (ArchiveGeneration generation : objects.byFilename().values()) {
+            ConnectionManager.throwIfCancellableOperationCancelled();
+            Path source = resolveObject(generation.objectPath());
+            Path target = stageDir.resolve("object-" + (index++) + "-" + generation.id() + ".parquet").normalize();
+            if (!target.getParent().equals(stageDir))
+                throw new IllegalStateException("Unsafe staged Parquet path: " + target);
+            copyAndVerifyParquet(source, target, generation.sha256());
+            staged.put(canonicalFilename(target), generation);
+        }
+        return new AuthorizedObjects(staged);
+    }
+
+    private static void copyAndVerifyParquet(Path source, Path target, String expectedSha256) throws Exception {
+        for (int attempt = 1; ; attempt++) {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (var input = Files.newInputStream(source, LinkOption.NOFOLLOW_LINKS);
+                 var output = Files.newOutputStream(
+                         target,
+                         StandardOpenOption.CREATE,
+                         StandardOpenOption.TRUNCATE_EXISTING,
+                         StandardOpenOption.WRITE,
+                         LinkOption.NOFOLLOW_LINKS)) {
+                byte[] buffer = new byte[ArchiveExporter.SHA256_READ_BUFFER_BYTES];
+                int read;
+                while ((read = input.read(buffer)) >= 0) {
+                    if (read > 0) {
+                        digest.update(buffer, 0, read);
+                        output.write(buffer, 0, read);
+                    }
+                }
+                String actualSha256 = HexFormat.of().formatHex(digest.digest());
+                if (!expectedSha256.equals(actualSha256)) {
+                    Files.deleteIfExists(target);
+                    throw new IllegalStateException("Archive checksum mismatch while staging object: " + source);
+                }
+                return;
+            } catch (IOException error) {
+                Files.deleteIfExists(target);
+                if (attempt >= LOCAL_STAGE_COPY_RETRIES ||
+                        !ArchiveExporter.isTransientAllocationIoError(error)) {
+                    throw error;
+                }
+                Thread.sleep(20L * attempt);
+            }
         }
     }
 
@@ -1000,9 +1205,11 @@ public final class ParquetArchiveReader {
                     List<ArchiveGeneration> cluster = clusters.next();
                     AuthorizedObjects objects = authorize(cluster);
                     boolean javaCql = filter.getCQLFilter() != null;
-                    QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois,
-                            true, !javaCql, javaCql ? Long.MAX_VALUE : remaining);
-                    currentStream = openRowStream(objects, plan, cluster.size());
+                    final long clusterLimit = javaCql ? Long.MAX_VALUE : remaining;
+                    currentStream = openRowStream(objects,
+                            auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
+                                    true, !javaCql, clusterLimit),
+                            cluster.size());
                     currentRows = currentStream.iterator();
                 }
             } catch (RuntimeException | Error error) {
