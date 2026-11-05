@@ -631,6 +631,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         return archiveCatalog.nextRetryableJobWindow(profile, cutoff);
     }
 
+    /** Marks interrupted in-flight {@code EXPORTING} jobs as {@code FAILED} on module startup. */
+    public int reclaimInterruptedExportingJobsOnStartup() {
+        return archiveCatalog.reclaimInterruptedExportingJobsOnStartup();
+    }
+
     /**
      * Measures at most {@code rowCap + 1} candidates using the same uncompressed-byte
      * accounting as {@link ArchiveExporter}. If the returned row count is at most the

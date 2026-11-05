@@ -336,6 +336,168 @@ public class TestArchiveLifecycleInvariants {
         assertEquals(java.util.Optional.of(newerResult), reader.cachedMaxResultTime(legacyNewer));
     }
 
+    @Test
+    public void startupReclaimsInterruptedExportingJobsAndParquetPrimaryShortensStaleTimeout() throws Exception {
+        List<String> capturedSql = new ArrayList<>();
+        List<Integer> boundInts = new ArrayList<>();
+        List<String> boundStrings = new ArrayList<>();
+
+        PreparedStatement statement = (PreparedStatement) Proxy.newProxyInstance(
+                getClass().getClassLoader(),
+                new Class<?>[]{PreparedStatement.class},
+                (proxy, method, args) -> switch (method.getName()) {
+                    case "setInt" -> {
+                        boundInts.add((Integer) args[1]);
+                        yield null;
+                    }
+                    case "setString" -> {
+                        boundStrings.add((String) args[1]);
+                        yield null;
+                    }
+                    case "executeUpdate" -> 1;
+                    case "executeQuery" -> Proxy.newProxyInstance(
+                            getClass().getClassLoader(),
+                            new Class<?>[]{ResultSet.class},
+                            (rs, rsMethod, rsArgs) -> defaultValue(rsMethod.getReturnType()));
+                    default -> defaultValue(method.getReturnType());
+                });
+        Connection connection = (Connection) Proxy.newProxyInstance(
+                getClass().getClassLoader(),
+                new Class<?>[]{Connection.class},
+                (proxy, method, args) -> switch (method.getName()) {
+                    case "prepareStatement" -> {
+                        capturedSql.add((String) args[0]);
+                        yield statement;
+                    }
+                    default -> defaultValue(method.getReturnType());
+                });
+
+        TieredArchiveConfig parquetPrimary = new TieredArchiveConfig();
+        parquetPrimary.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        parquetPrimary.maximumCycleMinutes = 15;
+        parquetPrimary.duckDbTemporaryDirectory = temporary.newFolder("pp-duck-tmp").toPath().toString();
+        ArchiveCatalog ppCatalog = new ArchiveCatalog(() -> connection, "obs_store", 3, parquetPrimary);
+
+        assertEquals(1, ppCatalog.reclaimInterruptedExportingJobsOnStartup());
+        assertTrue(capturedSql.get(0).contains("SET state='FAILED'"));
+        assertTrue(capturedSql.get(0).contains("NOT EXISTS (SELECT 1 FROM oscar_archive_generation gen"));
+        assertEquals(List.of("obs_store"), boundStrings);
+        assertEquals(List.of(3), boundInts);
+
+        boundInts.clear();
+        assertTrue(ppCatalog.nextRetryableJobWindow("RAW_GATED", java.time.Instant.now()).isEmpty());
+        assertEquals("PARQUET_PRIMARY stale timeout must be 30 minutes (2x 15m cycle)",
+                List.of(3, 30), boundInts);
+
+        TieredArchiveConfig hotRetention = new TieredArchiveConfig();
+        hotRetention.storageMode = TieredArchiveConfig.StorageMode.HOT_RETENTION;
+        hotRetention.duckDbTemporaryDirectory = temporary.newFolder("hr-duck-tmp").toPath().toString();
+        ArchiveCatalog hrCatalog = new ArchiveCatalog(() -> connection, "obs_store", 3, hotRetention);
+        boundInts.clear();
+        assertTrue(hrCatalog.nextRetryableJobWindow("RAW_GATED", java.time.Instant.now()).isEmpty());
+        assertEquals("HOT_RETENTION stale timeout must remain 120 minutes",
+                List.of(3, 120), boundInts);
+    }
+
+    @Test
+    public void parquetArchiveReaderStagesLocallyOn9pReadMemoryFailureAndCleansUpTempDir() throws Exception {
+        Path root = temporary.newFolder("wsl9p-archive").toPath();
+        Path duckTmp = temporary.getRoot().toPath().resolve("wsl9p-duck-tmp");
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.rootDirectory = root.toString();
+        config.duckDbTemporaryDirectory = duckTmp.toString();
+
+        Path rel = Path.of("datasets/observations/date=2026-11-05/profile=RAW_GATED/g1.parquet");
+        Path file = root.resolve(rel);
+        Files.createDirectories(file.getParent());
+        java.time.Instant t1 = java.time.Instant.parse("2026-11-05T10:00:00Z");
+        java.time.Instant t2 = java.time.Instant.parse("2026-11-05T10:01:00Z");
+        try (DuckDbResourcePolicy.Session session = DuckDbResourcePolicy.open(config, "test-export");
+             Statement create = session.connection().createStatement()) {
+            create.execute("CREATE TABLE archive_rows (id_scope INTEGER, id_value BIGINT, datastream_scope INTEGER, " +
+                    "datastream_id BIGINT, foi_scope INTEGER, foi_id BIGINT, phenomenon_time TIMESTAMP, " +
+                    "result_time TIMESTAMP, result_json VARCHAR, archive_version INTEGER, profile VARCHAR)");
+            try (PreparedStatement insert = session.connection().prepareStatement(
+                    "INSERT INTO archive_rows VALUES (1, ?, 1, 10, NULL, NULL, ?, ?, ?, 1, 'RAW_GATED')")) {
+                insert.setLong(1, 501L);
+                UtcJdbcTime.setDuckDbInstant(insert, 2, t1);
+                UtcJdbcTime.setDuckDbInstant(insert, 3, t1);
+                insert.setString(4, "{\"adjudicatedIds\":[\"eml-non-threat\"]}");
+                insert.executeUpdate();
+
+                insert.setLong(1, 502L);
+                UtcJdbcTime.setDuckDbInstant(insert, 2, t2);
+                UtcJdbcTime.setDuckDbInstant(insert, 3, t2);
+                insert.setString(4, "{\"adjudicatedIds\":[\"operator-review\"]}");
+                insert.executeUpdate();
+            }
+            create.execute("COPY archive_rows TO '" + file.toString().replace("'", "''") + "' (FORMAT PARQUET, COMPRESSION ZSTD)");
+        }
+
+        ArchiveGeneration generation = new ArchiveGeneration(
+                UUID.randomUUID(), "RAW_GATED",
+                t1, t2.plusSeconds(60),
+                rel, ArchiveExporter.sha256(file),
+                2L, 501L, 502L, "SEALED", true, null);
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root, config);
+        AtomicInteger injectedFaults = new AtomicInteger();
+        reader.setDirectReadFaultInjectorForTesting(filenames -> {
+            injectedFaults.incrementAndGet();
+            throw new SQLException("java.sql.SQLException: IO Error: Could not read from file \"" +
+                    filenames.iterator().next() + "\": Cannot allocate memory");
+        });
+
+        org.sensorhub.api.datastore.obs.ObsFilter notEmlFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIds!='eml-non-threat'")
+                .build();
+        org.sensorhub.api.datastore.obs.ObsFilter allFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .build();
+
+        assertEquals(1L, reader.countCql(List.of(generation), notEmlFilter, null, null, Set.of()));
+        assertEquals(2L, reader.count(List.of(generation), allFilter, null, null));
+        List<ParquetArchiveReader.ArchivedRow> rows = reader.read(List.of(generation), notEmlFilter, null, null, 10);
+        assertEquals(1, rows.size());
+        assertEquals(502L, rows.get(0).observation().id());
+
+        List<Long> metadataIds = new ArrayList<>();
+        reader.forEachMetadata(List.of(generation), allFilter, null, null, Long.MAX_VALUE,
+                row -> metadataIds.add(row.id()));
+        assertEquals(List.of(501L, 502L), metadataIds);
+
+        List<ArchiveGeneration> newer = reader.generationsPotentiallyNewerThanResultTime(
+                List.of(generation), t2);
+        assertEquals(List.of(generation), newer);
+        assertEquals(5, injectedFaults.get());
+
+        try (var remaining = Files.list(duckTmp)) {
+            List<String> names = remaining.map(p -> p.getFileName().toString()).toList();
+            assertEquals("Only the root lock file may remain after staged fallback sessions close",
+                    List.of(DuckDbResourcePolicy.ROOT_LOCK_FILE_NAME), names);
+        }
+    }
+
+    @Test
+    public void cqlNotEqualsArrayFilterMatchesBothPostgresBuilderAndColdJsonEvaluator() {
+        org.sensorhub.api.datastore.obs.ObsFilter filter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIds!='eml-non-threat'")
+                .build();
+
+        var query = new org.sensorhub.impl.datastore.postgis.builder.QueryBuilderObsStore("obs")
+                .createParameterizedSelectEntriesQuery(filter, null);
+        assertTrue("PostgreSQL CQL builder must negate JSONB array containment for !=",
+                query.sql().contains("NOT (") && query.sql().contains("result @> ?::jsonb"));
+
+        assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(
+                filter.getCQLFilter(), "{\"adjudicatedIds\":[\"eml-non-threat\"]}"));
+        assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(
+                filter.getCQLFilter(), "{\"adjudicatedIds\":[\"eml-non-threat\",\"other\"]}"));
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(
+                filter.getCQLFilter(), "{\"adjudicatedIds\":[]}"));
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(
+                filter.getCQLFilter(), "{\"adjudicatedIds\":[\"operator-threat\"]}"));
+    }
+
     private static void writeSingleObservationParquet(
             TieredArchiveConfig config, Path target, long obsId, long streamId,
             java.time.Instant phenomenonTime, java.time.Instant resultTime) throws Exception {
