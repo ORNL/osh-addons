@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.regex.Pattern;
+import java.util.stream.StreamSupport;
 
 /** Evaluates the supported OSCAR CQL subset directly against archived JSON. */
 public final class JsonCqlEvaluator {
@@ -202,11 +203,31 @@ public final class JsonCqlEvaluator {
         Object expected = literal.getValue();
         boolean absent = actual == null || actual instanceof JsonNull || actual.isJsonNull();
 
-        if (filter instanceof PropertyIsEqualTo)
-            return expected == null ? absent : !absent && equalsScalar(actual, expected, filter.isMatchingCase());
-        if (filter instanceof PropertyIsNotEqualTo)
-            return expected == null ? !absent : !absent && sameScalarType(actual, expected) &&
+        if (filter instanceof PropertyIsEqualTo) {
+            if (expected == null)
+                return absent;
+            if (absent)
+                return false;
+            if (actual.isJsonArray()) {
+                return StreamSupport.stream(actual.getAsJsonArray().spliterator(), false)
+                        .anyMatch(el -> el != null && el.isJsonPrimitive() &&
+                                equalsScalar(el, expected, filter.isMatchingCase()));
+            }
+            return equalsScalar(actual, expected, filter.isMatchingCase());
+        }
+        if (filter instanceof PropertyIsNotEqualTo) {
+            if (expected == null)
+                return !absent;
+            if (absent)
+                return false;
+            if (actual.isJsonArray()) {
+                return StreamSupport.stream(actual.getAsJsonArray().spliterator(), false)
+                        .noneMatch(el -> el != null && el.isJsonPrimitive() &&
+                                equalsScalar(el, expected, filter.isMatchingCase()));
+            }
+            return sameScalarType(actual, expected) &&
                     !equalsScalar(actual, expected, filter.isMatchingCase());
+        }
         if (absent || !actual.isJsonPrimitive())
             return false;
 
@@ -257,10 +278,18 @@ public final class JsonCqlEvaluator {
         if (!(filter.getExpression() instanceof PropertyName property))
             throw new IllegalArgumentException("Archived CQL LIKE requires a property expression");
         JsonElement actual = resolve(json, property.getPropertyName());
-        if (actual == null || actual.isJsonNull() || !actual.isJsonPrimitive())
+        if (actual == null || actual.isJsonNull())
             return false;
         int flags = filter.isMatchingCase() ? 0 : Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE;
-        return Pattern.compile(likeRegex(filter), flags).matcher(actual.getAsString()).matches();
+        Pattern compiled = Pattern.compile(likeRegex(filter), flags);
+        if (actual.isJsonArray()) {
+            return StreamSupport.stream(actual.getAsJsonArray().spliterator(), false)
+                    .anyMatch(el -> el != null && el.isJsonPrimitive() &&
+                            compiled.matcher(el.getAsString()).matches());
+        }
+        if (!actual.isJsonPrimitive())
+            return false;
+        return compiled.matcher(actual.getAsString()).matches();
     }
 
     private static String likeRegex(PropertyIsLike filter) {

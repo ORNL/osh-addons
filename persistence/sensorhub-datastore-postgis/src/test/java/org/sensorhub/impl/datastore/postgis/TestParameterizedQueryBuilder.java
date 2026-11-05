@@ -527,6 +527,43 @@ public class TestParameterizedQueryBuilder {
         assertTrue(autovacuum.contains("autovacuum_vacuum_insert_threshold = 5000"));
     }
 
+    @Test
+    public void testStringArrayElementCqlMatchingForPostgisAndArchivedJson() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        ObsFilter emlFilter = new ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIds = 'eml-non-threat'")
+                .build();
+        ParameterizedQuery emlQuery = builder.createParameterizedSelectEntriesQuery(emlFilter, null);
+        assertTrue(emlQuery.sql().contains("(result @> ?::jsonb OR result @> ?::jsonb)"));
+        assertEquals(List.of(
+                "{\"adjudicatedIds\": \"eml-non-threat\"}",
+                "{\"adjudicatedIds\": [\"eml-non-threat\"]}"
+        ), emlQuery.parameters());
+
+        String emlOccupancyJson = "{\"gammaAlarm\":true,\"adjudicatedIdsCount\":2,\"adjudicatedIds\":[\"eml-non-threat\",\"21c3abcd\"]}";
+        String manualOccupancyJson = "{\"gammaAlarm\":true,\"adjudicatedIdsCount\":1,\"adjudicatedIds\":[\"21c3abcd\"]}";
+        String unadjudicatedJson = "{\"gammaAlarm\":true,\"adjudicatedIdsCount\":0}";
+
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(
+                emlFilter.getCQLFilter(), emlOccupancyJson));
+        assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(
+                emlFilter.getCQLFilter(), manualOccupancyJson));
+        assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(
+                emlFilter.getCQLFilter(), unadjudicatedJson));
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(
+                emlFilter.getCQLFilter()));
+
+        ObsFilter notEmlFilter = new ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount > 0 AND NOT (adjudicatedIds = 'eml-non-threat')")
+                .build();
+        assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(
+                notEmlFilter.getCQLFilter(), emlOccupancyJson));
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(
+                notEmlFilter.getCQLFilter(), manualOccupancyJson));
+        assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(
+                notEmlFilter.getCQLFilter(), unadjudicatedJson));
+    }
+
     private void assertSqlDoesNotContainInjection(ParameterizedQuery query) {
         assertFalse(query.sql().contains(INJECTION));
         assertTrue(query.parameters().stream().anyMatch(parameter -> parameter.toString().contains(INJECTION)));
