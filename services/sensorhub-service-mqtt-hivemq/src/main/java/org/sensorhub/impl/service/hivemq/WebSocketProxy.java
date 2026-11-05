@@ -14,6 +14,7 @@ Copyright (C) 2022 Sensia Software LLC. All Rights Reserved.
 
 package org.sensorhub.impl.service.hivemq;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
@@ -21,8 +22,10 @@ import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousCloseException;
 import java.nio.channels.AsynchronousSocketChannel;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.CompletionHandler;
 import java.util.Arrays;
+import java.util.Locale;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -65,6 +68,43 @@ public class WebSocketProxy implements WebSocketListener
     }
 
 
+    static boolean isExpectedDisconnect(Throwable error)
+    {
+        Throwable current = error;
+        for (int depth = 0; current != null && depth < 16; depth++)
+        {
+            String className = current.getClass().getName();
+            if (current instanceof AsynchronousCloseException ||
+                current instanceof ClosedChannelException ||
+                current instanceof EOFException ||
+                "org.eclipse.jetty.io.EofException".equals(className) ||
+                "org.eclipse.jetty.websocket.api.CloseException".equals(className))
+            {
+                return true;
+            }
+            if (current instanceof IOException || className.contains("WebSocketException"))
+            {
+                String message = current.getMessage();
+                if (message != null)
+                {
+                    String lower = message.toLowerCase(Locale.ROOT);
+                    if (lower.contains("broken pipe") ||
+                        lower.contains("connection reset") ||
+                        lower.contains("forcibly closed") ||
+                        lower.contains("closed channel") ||
+                        lower.contains("remoteendpoint unavailable") ||
+                        lower.contains("session is closed"))
+                    {
+                        return true;
+                    }
+                }
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+
     @Override
     public void onWebSocketConnect(Session session)
     {
@@ -94,16 +134,27 @@ public class WebSocketProxy implements WebSocketListener
                 @Override
                 public void completed(Integer readBytes, Void attachment)
                 {
+                    if (readBytes == null || readBytes < 0)
+                        return;
+
                     if (readBytes > 0)
                     {
+                        Session currentSession = WebSocketProxy.this.session;
+                        if (currentSession == null || !currentSession.isOpen())
+                            return;
+
                         try
                         {
                             socketReadBuffer.flip();
-                            session.getRemote().sendBytes(socketReadBuffer);
+                            currentSession.getRemote().sendBytes(socketReadBuffer);
                         }
-                        catch (IOException e)
+                        catch (Exception e)
                         {
-                            log.error("Error forwarding data to websocket");
+                            if (isExpectedDisconnect(e) || !currentSession.isOpen())
+                                log.debug("WebSocket session closed while forwarding MQTT packet: {}", e.toString());
+                            else
+                                log.error("Error forwarding data to websocket", e);
+                            return;
                         }
                     }
                     
@@ -114,7 +165,9 @@ public class WebSocketProxy implements WebSocketListener
                 @Override
                 public void failed(Throwable e, Void attachment)
                 {
-                    if (!(e instanceof AsynchronousCloseException))
+                    if (isExpectedDisconnect(e))
+                        log.debug("MQTT TCP socket closed during read: {}", e.toString());
+                    else
                         log.error("Error reading data from MQTT TCP socket", e);
                 }
             };
@@ -131,8 +184,21 @@ public class WebSocketProxy implements WebSocketListener
     
     protected void readFromTcpSocket()
     {
-        if (mqttSocket != null && mqttSocket.isOpen())
-            mqttSocket.read(socketReadBuffer, null, socketReadHandler);
+        AsynchronousSocketChannel sock = mqttSocket;
+        if (sock != null && sock.isOpen())
+        {
+            try
+            {
+                sock.read(socketReadBuffer, null, socketReadHandler);
+            }
+            catch (RuntimeException e)
+            {
+                if (isExpectedDisconnect(e) || mqttSocket == null || !sock.isOpen())
+                    log.debug("MQTT TCP socket already closed before read: {}", e.toString());
+                else
+                    log.error("Error starting MQTT TCP socket read", e);
+            }
+        }
     }
     
 
@@ -141,24 +207,30 @@ public class WebSocketProxy implements WebSocketListener
     {
         try
         {
-            if (mqttSocket != null)
+            writeQueue.clear();
+            AsynchronousSocketChannel sock = mqttSocket;
+            mqttSocket = null;
+            if (sock != null)
             {
-                mqttSocket.close();
-                mqttSocket = null;
+                sock.close();
             }
             
             WebSocketUtils.logClose(session, statusCode, reason, log);
         }
         catch (IOException e)
         {
-            log.error("Error closing connection to MQTT server", e);
+            if (isExpectedDisconnect(e))
+                log.debug("MQTT TCP socket already closed on disconnect: {}", e.toString());
+            else
+                log.error("Error closing connection to MQTT server", e);
         }
     }
 
 
     @Override
     public void onWebSocketBinary(byte[] payload, int offset, int len) {
-        if (mqttSocket == null || !mqttSocket.isOpen())
+        AsynchronousSocketChannel sock = mqttSocket;
+        if (sock == null || !sock.isOpen())
             return;
 
         ByteBuffer buf = ByteBuffer.wrap(Arrays.copyOfRange(payload, offset, offset + len));
@@ -170,6 +242,13 @@ public class WebSocketProxy implements WebSocketListener
     private void tryWrite() {
         if (!writeInProgress.compareAndSet(false, true))
             return;
+
+        AsynchronousSocketChannel sock = mqttSocket;
+        if (sock == null || !sock.isOpen()) {
+            writeQueue.clear();
+            writeInProgress.set(false);
+            return;
+        }
 
         ByteBuffer first = writeQueue.poll();
         if (first == null) {
@@ -184,32 +263,63 @@ public class WebSocketProxy implements WebSocketListener
 
         State state = new State();
 
-        mqttSocket.write(state.current, null, new CompletionHandler<Integer, Void>() {
-            @Override
-            public void completed(Integer result, Void attachment) {
-                // Write the remaining bytes
-                if (state.current.hasRemaining()) {
-                    mqttSocket.write(state.current, null, this);
-                    return;
+        try {
+            sock.write(state.current, null, new CompletionHandler<Integer, Void>() {
+                @Override
+                public void completed(Integer result, Void attachment) {
+                    AsynchronousSocketChannel activeSock = mqttSocket;
+                    if (activeSock == null || !activeSock.isOpen()) {
+                        writeQueue.clear();
+                        writeInProgress.set(false);
+                        return;
+                    }
+
+                    try {
+                        // Write the remaining bytes
+                        if (state.current.hasRemaining()) {
+                            activeSock.write(state.current, null, this);
+                            return;
+                        }
+
+                        // Get next buffer if finished
+                        ByteBuffer next = writeQueue.poll();
+                        if (next == null) {
+                            writeInProgress.set(false);
+                            return;
+                        }
+
+                        state.current = next;
+                        activeSock.write(state.current, null, this);
+                    } catch (RuntimeException e) {
+                        writeQueue.clear();
+                        writeInProgress.set(false);
+                        if (isExpectedDisconnect(e) || mqttSocket == null || !activeSock.isOpen())
+                            log.debug("MQTT TCP socket closed while draining write queue: {}", e.toString());
+                        else
+                            log.error("Error writing to MQTT TCP socket", e);
+                    }
                 }
 
-                // Get next buffer if finished
-                ByteBuffer next = writeQueue.poll();
-                if (next == null) {
+                @Override
+                public void failed(Throwable exc, Void attachment) {
                     writeInProgress.set(false);
-                    return;
+                    AsynchronousSocketChannel activeSock = mqttSocket;
+                    if (isExpectedDisconnect(exc) || activeSock == null || !activeSock.isOpen()) {
+                        writeQueue.clear();
+                        log.debug("MQTT TCP socket closed during write: {}", exc.toString());
+                    } else {
+                        log.error("Error writing to MQTT TCP socket", exc);
+                    }
                 }
-
-                state.current = next;
-                mqttSocket.write(state.current, null, this);
-            }
-
-            @Override
-            public void failed(Throwable exc, Void attachment) {
-                writeInProgress.set(false);
-                log.error("Error writing to MQTT TCP socket", exc);
-            }
-        });
+            });
+        } catch (RuntimeException e) {
+            writeQueue.clear();
+            writeInProgress.set(false);
+            if (isExpectedDisconnect(e) || mqttSocket == null || !sock.isOpen())
+                log.debug("MQTT TCP socket closed before write started: {}", e.toString());
+            else
+                log.error("Error writing to MQTT TCP socket", e);
+        }
     }
 
 
@@ -224,7 +334,10 @@ public class WebSocketProxy implements WebSocketListener
     @Override
     public void onWebSocketError(Throwable cause)
     {
-        log.error("Internal websocket proxy error", cause);
+        if (isExpectedDisconnect(cause))
+            log.debug("WebSocket client disconnected: {}", cause.toString());
+        else
+            log.error("Internal websocket proxy error", cause);
     }
 
 }

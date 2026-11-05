@@ -124,7 +124,12 @@ public class CQLFilterHandler {
             whereClause.append("result @> '")
                     .append(buildNestedJsonObject(propertyName, value))
                     .append("'::jsonb");
-        } else if (value instanceof Boolean || value instanceof Number || value instanceof String) {
+        } else if (value instanceof String) {
+            // Match both scalar JSON string fields and string elements inside JSON arrays (e.g. adjudicatedIds)
+            whereClause.append("(result @> ?::jsonb OR result @> ?::jsonb)");
+            parameters.add(buildNestedJsonObject(propertyName, value));
+            parameters.add(buildNestedJsonArrayElementObject(propertyName, value));
+        } else if (value instanceof Boolean || value instanceof Number) {
             // Use containment operator for GIN index optimization
             whereClause.append("result @> ?::jsonb");
             parameters.add(buildNestedJsonObject(propertyName, value));
@@ -151,7 +156,18 @@ public class CQLFilterHandler {
 
         if (value == null) {
             whereClause.append(buildJsonPathExtract(propertyName)).append(" IS NOT NULL");
-        } else if (value instanceof Boolean || value instanceof Number || value instanceof String) {
+        } else if (value instanceof String) {
+            String[] parts = propertyName.split("\\.");
+            StringBuilder jsonbPath = new StringBuilder("result");
+            for (String part : parts) {
+                jsonbPath.append("->'").append(escapeJsonKey(part)).append("'");
+            }
+            whereClause.append("((jsonb_typeof(").append(jsonbPath)
+                    .append(") = 'string' AND NOT (result @> ?::jsonb)) OR (jsonb_typeof(")
+                    .append(jsonbPath).append(") = 'array' AND NOT (result @> ?::jsonb)))");
+            parameters.add(buildNestedJsonObject(propertyName, value));
+            parameters.add(buildNestedJsonArrayElementObject(propertyName, value));
+        } else if (value instanceof Boolean || value instanceof Number) {
             // Guard with jsonb_typeof to ensure the field exists before negating containment,
             // otherwise NOT @> matches all rows where the field is missing
             String[] parts = propertyName.split("\\.");
@@ -314,6 +330,19 @@ public class CQLFilterHandler {
             json.append("}");
         }
 
+        return json.toString();
+    }
+
+    private String buildNestedJsonArrayElementObject(String propertyPath, Object elementValue) {
+        String[] parts = propertyPath.split("\\.");
+        StringBuilder json = new StringBuilder();
+        for (int i = 0; i < parts.length; i++) {
+            json.append("{\"").append(escapeJsonKey(parts[i])).append("\": ");
+        }
+        json.append("[").append(formatJsonValue(elementValue)).append("]");
+        for (int i = 0; i < parts.length; i++) {
+            json.append("}");
+        }
         return json.toString();
     }
 
