@@ -743,6 +743,15 @@ public class TestParquetArchiveReader {
                 .withCQLFilter("alarmState = 'Fault - Gamma Low' OR alarmState = 'Fault - Gamma High'")
                 .build();
         assertTrue(JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(faultFilter.getCQLFilter()));
+        StringBuilder prefilterSql = new StringBuilder();
+        List<Object> prefilterParams = new java.util.ArrayList<>();
+        assertTrue(JsonCqlEvaluator.appendDuckDbPrefilter(
+                faultFilter.getCQLFilter(), "result_json", prefilterSql, prefilterParams));
+        assertTrue("Multi-branch string OR prefilter should factor common prefix and single unicode-escape check: " + prefilterSql,
+                prefilterSql.toString().startsWith(" AND ((strpos(result_json, ?) > 0 AND strpos(result_json, ?) > 0 AND (")
+                        && prefilterSql.toString().endsWith(")) OR strpos(result_json, '\\u') > 0)"));
+        assertEquals("Fault - Gamma ", prefilterParams.get(0));
+        assertEquals("alarmState", prefilterParams.get(1));
         assertEquals(List.of(2L, 4L),
                 reader.read(List.of(first, second), faultFilter, null, null, Long.MAX_VALUE)
                         .stream().map(row -> row.observation().id()).toList());
