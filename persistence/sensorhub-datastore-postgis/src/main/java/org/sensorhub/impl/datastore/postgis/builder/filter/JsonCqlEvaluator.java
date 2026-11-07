@@ -61,7 +61,12 @@ public final class JsonCqlEvaluator {
         PrefilterClause clause = buildDuckDbPrefilter(filter, column);
         if (clause == null)
             return false;
-        sql.append(" AND (").append(clause.sql()).append(')');
+        if ("FALSE".equals(clause.sql())) {
+            sql.append(" AND FALSE");
+        } else {
+            sql.append(" AND ((").append(clause.sql())
+                    .append(") OR strpos(").append(column).append(", '\\u') > 0)");
+        }
         parameters.addAll(clause.parameters());
         return true;
     }
@@ -96,6 +101,9 @@ public final class JsonCqlEvaluator {
         if (filter instanceof Or or) {
             if (or.getChildren().isEmpty())
                 return null;
+            PrefilterClause factored = tryBuildFactoredStringOrPrefilter(or, column);
+            if (factored != null)
+                return factored;
             List<String> clauses = new ArrayList<>();
             List<Object> params = new ArrayList<>();
             boolean selective = true;
@@ -126,11 +134,7 @@ public final class JsonCqlEvaluator {
                 if (expected instanceof String text && !text.isEmpty() &&
                         SAFE_JSON_STRING_LITERAL.matcher(text).matches()) {
                     List<Object> params = new ArrayList<>();
-                    StringBuilder expr = new StringBuilder("(");
-                    if (leafKey != null) {
-                        expr.append("strpos(").append(column).append(", ?) > 0 AND ");
-                        params.add(leafKey);
-                    }
+                    StringBuilder expr = new StringBuilder();
                     if (comparison.isMatchingCase()) {
                         expr.append("strpos(").append(column).append(", ?) > 0");
                         params.add(text);
@@ -138,15 +142,17 @@ public final class JsonCqlEvaluator {
                         expr.append("strpos(lower(").append(column).append("), ?) > 0");
                         params.add(text.toLowerCase(Locale.ROOT));
                     }
-                    expr.append(") OR strpos(").append(column).append(", '\\u') > 0");
+                    if (leafKey != null) {
+                        expr.append(" AND strpos(").append(column).append(", ?) > 0");
+                        params.add(leafKey);
+                    }
                     return new PrefilterClause(expr.toString(), params, true);
                 }
                 if (expected instanceof Boolean boolVal) {
                     List<Object> params = new ArrayList<>();
                     StringBuilder expr = new StringBuilder();
                     if (leafKey != null) {
-                        expr.append("(strpos(").append(column).append(", ?) > 0 OR strpos(")
-                                .append(column).append(", '\\u') > 0) AND ");
+                        expr.append("strpos(").append(column).append(", ?) > 0 AND ");
                         params.add(leafKey);
                     }
                     expr.append("strpos(lower(").append(column).append("), ?) > 0");
@@ -159,12 +165,78 @@ public final class JsonCqlEvaluator {
         return null;
     }
 
+    /**
+     * Optimizes multi-branch string equality OR filters (such as {@code faultCQL} over 90M+ archived count rows)
+     * by testing a shared selective literal prefix and shared property key once before evaluating individual branches.
+     */
+    private static PrefilterClause tryBuildFactoredStringOrPrefilter(Or or, String column) {
+        if (or.getChildren().size() < 2)
+            return null;
+        String sharedLeafKey = null;
+        boolean firstBranch = true;
+        List<String> caseSensitiveLiterals = new ArrayList<>(or.getChildren().size());
+        for (Filter child : or.getChildren()) {
+            if (!(child instanceof PropertyIsEqualTo eq) || !eq.isMatchingCase())
+                return null;
+            if (!(eq.getExpression1() instanceof PropertyName prop) ||
+                    !(eq.getExpression2() instanceof Literal lit) ||
+                    !(lit.getValue() instanceof String text) ||
+                    text.isEmpty() ||
+                    !SAFE_JSON_STRING_LITERAL.matcher(text).matches())
+                return null;
+            String leafKey = extractSafeLeafKey(prop.getPropertyName());
+            if (firstBranch) {
+                sharedLeafKey = leafKey;
+                firstBranch = false;
+            } else if (!java.util.Objects.equals(sharedLeafKey, leafKey)) {
+                sharedLeafKey = null;
+            }
+            caseSensitiveLiterals.add(text);
+        }
+
+        String commonPrefix = longestCommonPrefix(caseSensitiveLiterals);
+        List<Object> params = new ArrayList<>();
+        StringBuilder expr = new StringBuilder();
+        if (commonPrefix.length() >= 4) {
+            expr.append("strpos(").append(column).append(", ?) > 0 AND ");
+            params.add(commonPrefix);
+        }
+        if (sharedLeafKey != null) {
+            expr.append("strpos(").append(column).append(", ?) > 0 AND ");
+            params.add(sharedLeafKey);
+        }
+        expr.append('(');
+        for (int i = 0; i < caseSensitiveLiterals.size(); i++) {
+            if (i > 0)
+                expr.append(" OR ");
+            expr.append("strpos(").append(column).append(", ?) > 0");
+            params.add(caseSensitiveLiterals.get(i));
+        }
+        expr.append(')');
+        return new PrefilterClause(expr.toString(), params, true);
+    }
+
+    private static String longestCommonPrefix(List<String> values) {
+        if (values == null || values.isEmpty())
+            return "";
+        String prefix = values.get(0);
+        for (int i = 1; i < values.size() && !prefix.isEmpty(); i++) {
+            String candidate = values.get(i);
+            int max = Math.min(prefix.length(), candidate.length());
+            int j = 0;
+            while (j < max && prefix.charAt(j) == candidate.charAt(j))
+                j++;
+            prefix = prefix.substring(0, j);
+        }
+        return prefix;
+    }
+
     private static PrefilterClause leafKeyPrefilter(String propertyPath, String column) {
         String leafKey = extractSafeLeafKey(propertyPath);
         if (leafKey == null)
             return null;
         return new PrefilterClause(
-                "strpos(" + column + ", ?) > 0 OR strpos(" + column + ", '\\u') > 0",
+                "strpos(" + column + ", ?) > 0",
                 List.of(leafKey),
                 false);
     }

@@ -45,7 +45,7 @@ import java.util.stream.StreamSupport;
 
 /** Reads only catalog-authorized Parquet objects and validates each object before first use. */
 public final class ParquetArchiveReader {
-    private static final long VERIFICATION_TTL_NANOS = java.time.Duration.ofMinutes(5).toNanos();
+    private static final long VERIFICATION_TTL_NANOS = java.time.Duration.ofMinutes(30).toNanos();
     private static final int VERIFICATION_LOCK_STRIPES = 64;
     private static final String METADATA_COLUMNS =
             "filename, id_scope, id_value, datastream_scope, datastream_id, " +
@@ -272,7 +272,7 @@ public final class ParquetArchiveReader {
     }
 
     private static final int MAX_RESULT_TIME_METADATA_BATCH = 64;
-    private static final int MAX_CQL_PAYLOAD_BATCH = 16;
+    private static final int MAX_CQL_PAYLOAD_BATCH = 64;
     private static final int LOCAL_STAGE_COPY_RETRIES = 3;
 
     /**
