@@ -348,6 +348,11 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
         ICommandStatus oldCommand = this.get(key);
         if (oldCommand == null)
             throw new UnsupportedOperationException("put can only be used to update existing entries");
+        if ((oldCommand.getCommandID() != null && commandStore.isImmutableCommandId(oldCommand.getCommandID()))
+                || (rec != null && rec.getCommandID() != null && commandStore.isImmutableCommandId(rec.getCommandID()))) {
+            throw new UnsupportedOperationException(
+                    "Adjudication status records are immutable and cannot be modified; append a new adjudication record instead");
+        }
 
         try (Connection connection = this.connectionManager.getConnection()) {
             try (PreparedStatement preparedStatement = connection.prepareStatement(queryBuilder.updateByIdQuery())) {
@@ -419,6 +424,10 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
         }
         BigId key = (BigId) o;
         ICommandStatus data = this.get(o);
+        if (data != null && data.getCommandID() != null && commandStore.isImmutableCommandId(data.getCommandID())) {
+            throw new UnsupportedOperationException(
+                    "Adjudication status records are immutable and cannot be deleted");
+        }
         try (Connection connection = this.connectionManager.getConnection()) {
             try (PreparedStatement preparedStatement = connection.prepareStatement(queryBuilder.removeByIdQuery())) {
                 preparedStatement.setLong(1, key.getIdAsLong());
@@ -428,6 +437,19 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
             throw new RuntimeException(e);
         }
         return data;
+    }
+
+    @Override
+    public long removeEntries(CommandStatusFilter filter) {
+        try (Stream<Entry<BigId, ICommandStatus>> matching = selectEntries(filter, Set.of(COMMAND_ID))) {
+            if (matching.anyMatch(entry -> entry.getValue() != null
+                    && entry.getValue().getCommandID() != null
+                    && commandStore.isImmutableCommandId(entry.getValue().getCommandID()))) {
+                throw new UnsupportedOperationException(
+                        "Adjudication status records are immutable and cannot be deleted");
+            }
+        }
+        return ICommandStatusStore.super.removeEntries(filter);
     }
 
     @Override

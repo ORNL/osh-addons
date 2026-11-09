@@ -44,6 +44,7 @@ import static org.sensorhub.api.datastore.obs.IObsStore.ObsField.FOI_ID;
 
 public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandStore> implements ICommandStore {
     private static final Logger logger = LoggerFactory.getLogger(PostgisCommandStoreImpl.class);
+    public static final String IMMUTABLE_ADJUDICATION_CONTROL_NAME = "adjudicationControl";
 
     protected PostgisCommandStreamStoreImpl commandStreamStore;
     protected PostgisCommandStatusStore commandStatusStore;
@@ -76,6 +77,91 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
 
         linkTo(commandStreamStore);
         linkTo(commandStatusStore);
+        installAdjudicationImmutabilityTriggers();
+    }
+
+    protected void installAdjudicationImmutabilityTriggers() {
+        String commandTable = queryBuilder.getStoreTableName();
+        String streamTable = commandStreamStore.getDatastoreName();
+        String statusTable = commandStatusStore.getDatastoreName();
+        String commandGuardFn = sanitizeSqlIdentifier(commandTable + "_adj_immutable_guard_fn");
+        String commandTrigger = sanitizeSqlIdentifier(commandTable + "_adj_immutable_guard_trg");
+        String statusGuardFn = sanitizeSqlIdentifier(statusTable + "_adj_immutable_guard_fn");
+        String statusTrigger = sanitizeSqlIdentifier(statusTable + "_adj_immutable_guard_trg");
+
+        String commandFnSql = "CREATE OR REPLACE FUNCTION " + commandGuardFn + "() RETURNS trigger AS $$ "
+                + "BEGIN "
+                + "IF to_regclass('" + streamTable + "') IS NOT NULL AND EXISTS ("
+                + "SELECT 1 FROM " + streamTable + " cs "
+                + "WHERE cs.id = OLD." + COMMANDSTREAM_ID + " "
+                + "AND cs.data->>'controlInputName' = '" + IMMUTABLE_ADJUDICATION_CONTROL_NAME + "'"
+                + ") THEN "
+                + "RAISE EXCEPTION 'Adjudication command records are immutable and cannot be modified or deleted'; "
+                + "END IF; "
+                + "IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; "
+                + "RETURN NEW; "
+                + "END; $$ LANGUAGE plpgsql";
+        String commandTriggerSql = "DO $$ BEGIN "
+                + "IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = '" + commandTrigger + "') THEN "
+                + "CREATE TRIGGER " + commandTrigger + " BEFORE UPDATE OR DELETE ON " + commandTable
+                + " FOR EACH ROW EXECUTE FUNCTION " + commandGuardFn + "(); "
+                + "END IF; END $$";
+        String statusFnSql = "CREATE OR REPLACE FUNCTION " + statusGuardFn + "() RETURNS trigger AS $$ "
+                + "BEGIN "
+                + "IF to_regclass('" + commandTable + "') IS NOT NULL "
+                + "AND to_regclass('" + streamTable + "') IS NOT NULL AND EXISTS ("
+                + "SELECT 1 FROM " + commandTable + " c "
+                + "JOIN " + streamTable + " cs ON cs.id = c." + COMMANDSTREAM_ID + " "
+                + "WHERE c.id = OLD." + ICommandStatusStore.CommandStatusField.COMMAND_ID + " "
+                + "AND cs.data->>'controlInputName' = '" + IMMUTABLE_ADJUDICATION_CONTROL_NAME + "'"
+                + ") THEN "
+                + "RAISE EXCEPTION 'Adjudication status records are immutable and cannot be modified or deleted'; "
+                + "END IF; "
+                + "IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; "
+                + "RETURN NEW; "
+                + "END; $$ LANGUAGE plpgsql";
+        String statusTriggerSql = "DO $$ BEGIN "
+                + "IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = '" + statusTrigger + "') THEN "
+                + "CREATE TRIGGER " + statusTrigger + " BEFORE UPDATE OR DELETE ON " + statusTable
+                + " FOR EACH ROW EXECUTE FUNCTION " + statusGuardFn + "(); "
+                + "END IF; END $$";
+
+        try (Connection connection = this.connectionManager.getConnection();
+             Statement statement = connection.createStatement()) {
+            statement.execute(commandFnSql);
+            statement.execute(commandTriggerSql);
+            statement.execute(statusFnSql);
+            statement.execute(statusTriggerSql);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to install adjudication immutability triggers", e);
+        }
+    }
+
+    private static String sanitizeSqlIdentifier(String raw) {
+        String normalized = raw.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_]", "_");
+        if (normalized.length() > 60) {
+            normalized = normalized.substring(0, 48) + "_" + Integer.toHexString(raw.hashCode());
+        }
+        return normalized;
+    }
+
+    public boolean isImmutableCommandStream(BigId commandStreamId) {
+        if (commandStreamId == null || commandStreamStore == null) {
+            return false;
+        }
+        ICommandStreamInfo info = commandStreamStore.get(new CommandStreamKey(commandStreamId));
+        return info != null && IMMUTABLE_ADJUDICATION_CONTROL_NAME.equals(info.getControlInputName());
+    }
+
+    public boolean isImmutableCommand(ICommandData command) {
+        return command != null && isImmutableCommandStream(command.getCommandStreamID());
+    }
+
+    public boolean isImmutableCommandId(BigId commandId) {
+        if (commandId == null) {
+            return false;
+        }
+        return isImmutableCommand(this.get(commandId));
     }
     @Override
     public Stream<Entry<BigId, ICommandData>> selectEntries(CommandFilter filter, Set<CommandField> fields) {
@@ -277,6 +363,10 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
         ICommandData oldCommand = this.get(key);
         if (oldCommand == null)
             throw new UnsupportedOperationException("put can only be used to update existing entries");
+        if (isImmutableCommand(oldCommand) || isImmutableCommand(value)) {
+            throw new UnsupportedOperationException(
+                    "Adjudication command records are immutable and cannot be modified; append a new adjudication record instead");
+        }
 
         try (Connection connection = this.connectionManager.getConnection()) {
             try (PreparedStatement preparedStatement = connection.prepareStatement(queryBuilder.updateByIdQuery())) {
@@ -324,6 +414,10 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
         }
         BigId key = (BigId) o;
         ICommandData data = this.get(o);
+        if (isImmutableCommand(data)) {
+            throw new UnsupportedOperationException(
+                    "Adjudication command records are immutable and cannot be deleted");
+        }
         try (Connection connection = this.connectionManager.getConnection()) {
             try (PreparedStatement preparedStatement = connection.prepareStatement(queryBuilder.removeByIdQuery())) {
                 preparedStatement.setLong(1, key.getIdAsLong());
@@ -333,6 +427,17 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
             throw new RuntimeException(e);
         }
         return data;
+    }
+
+    @Override
+    public long removeEntries(CommandFilter filter) {
+        try (Stream<Entry<BigId, ICommandData>> matching = selectEntries(filter, Set.of(COMMANDSTREAM_ID))) {
+            if (matching.anyMatch(entry -> isImmutableCommand(entry.getValue()))) {
+                throw new UnsupportedOperationException(
+                        "Adjudication command records are immutable and cannot be deleted");
+            }
+        }
+        return ICommandStore.super.removeEntries(filter);
     }
 
     @Override

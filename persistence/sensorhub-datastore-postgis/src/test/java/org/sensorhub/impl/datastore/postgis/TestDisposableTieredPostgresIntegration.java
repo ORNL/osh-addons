@@ -462,24 +462,34 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         for (String required : List.of(
                 TABLE + "_pkey",
                 TABLE + "_unique_constraint_v2",
-                TABLE + "_datastream_idx",
-                TABLE + "_phenomenon_time_idx",
-                TABLE + "_datastream_id_phenomenon_time_idx",
                 TABLE + "_result_time_idx",
-                TABLE + "_datastream_id_result_time_idx",
+                TABLE + "_datastream_result_time_id_idx",
+                TABLE + "_phenomenon_time_id_nulls_first_idx",
+                TABLE + "_phenomenon_time_desc_id_nulls_first_idx",
+                TABLE + "_datastream_phenomenon_time_id_nulls_first_idx",
+                TABLE + "_datastream_phenomenon_time_desc_id_nulls_first_idx",
                 TABLE + "_foi_idx",
-                TABLE + "_unarchived_time_idx",
                 TABLE + "_unadjudicated_alarm_idx",
                 TABLE + "_result_path_ops_idx",
                 TABLE + "_result_occupancy_count_idx",
                 TABLE + "_result_max_gamma_idx",
                 TABLE + "_result_max_neutron_idx",
                 TABLE + "_non_alarm_ptime_desc_idx")) {
-            assertTrue("Missing required PARQUET_PRIMARY index " + required,
-                    indexes.contains(required));
+            String pgName = required.length() > 63 ? required.substring(0, 63) : required;
+            assertTrue("Missing required PARQUET_PRIMARY index " + pgName,
+                    indexes.contains(pgName));
         }
-        assertFalse("Fresh Parquet-primary metadata must not index an always-null marker",
-                indexes.contains(TABLE + "_archive_generation_idx"));
+        for (String redundant : List.of(
+                TABLE + "_datastream_idx",
+                TABLE + "_phenomenon_time_idx",
+                TABLE + "_datastream_id_phenomenon_time_idx",
+                TABLE + "_datastream_id_result_time_idx",
+                TABLE + "_unarchived_time_idx",
+                TABLE + "_archive_generation_idx")) {
+            String pgName = redundant.length() > 63 ? redundant.substring(0, 63) : redundant;
+            assertFalse("PARQUET_PRIMARY must omit redundant/unused index " + pgName,
+                    indexes.contains(pgName));
+        }
         assertTrue(indexDefinition(TABLE + "_result_path_ops_idx")
                 .toLowerCase().contains("using gin (result jsonb_path_ops)"));
         for (String numeric : List.of("occupancy_count", "max_gamma", "max_neutron")) {
@@ -614,7 +624,7 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                         assertFalse(definition.contains("using gin"));
                         assertFalse(definition.contains("jsonb_path_ops"));
                     }
-                    assertEquals("The raw stage must retain only its eight bounded indexes", 8, count);
+                    assertEquals("The raw stage must retain only its seven bounded indexes", 7, count);
                 }
             }
         }

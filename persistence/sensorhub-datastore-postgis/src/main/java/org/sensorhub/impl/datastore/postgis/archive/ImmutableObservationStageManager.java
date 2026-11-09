@@ -151,9 +151,10 @@ public final class ImmutableObservationStageManager {
                     statement.execute("CREATE TRIGGER " + triggerName + " BEFORE INSERT ON " +
                             observationTable + " FOR EACH ROW EXECUTE FUNCTION " + triggerFunction + "()");
                 }
+                boolean existingParquetPrimary = upgradeAllowlistedImmutableRoutes(connection);
                 initializeMutableStreamCounts(connection);
                 reconcileCatalog(connection);
-                rejectLegacyRawRows(connection);
+                rejectLegacyRawRows(connection, existingParquetPrimary);
                 connection.commit();
             } catch (Exception error) {
                 connection.rollback();
@@ -207,7 +208,7 @@ public final class ImmutableObservationStageManager {
     public int retireVerifiedPartitions() {
         compactMutableStreamCountDeltas();
         List<PartitionState> candidates = listRetirementCandidates(
-                config.maximumStagePartitionsPerCycle);
+                Math.max(16, config.maximumStagePartitionsPerCycle));
         int retired = 0;
         for (PartitionState candidate : candidates) {
             if ("ATTACHED".equals(candidate.state())) {
@@ -324,8 +325,6 @@ public final class ImmutableObservationStageManager {
             ddl.execute("CREATE UNIQUE INDEX " + safeIdentifier(child + "_natural_uidx") +
                     " ON " + child + "(datastreamid,COALESCE(foiid,-1::bigint)," +
                     "phenomenontime,COALESCE(resulttime,'-infinity'::timestamp))");
-            ddl.execute("CREATE INDEX " + safeIdentifier(child + "_stream_time_idx") +
-                    " ON " + child + "(datastreamid,phenomenontime,id)");
             ddl.execute("CREATE INDEX " + safeIdentifier(child + "_stream_rtime_idx") +
                     " ON " + child + "(datastreamid,resulttime,id)");
             ddl.execute("CREATE INDEX " + safeIdentifier(child + "_time_id_asc_idx") +
@@ -644,6 +643,8 @@ public final class ImmutableObservationStageManager {
                         throw new SQLException("Cataloged detached staging partition has inconsistent DDL state: " + child);
                     if ("ATTACHED".equals(state)) {
                         try (Statement indexDdl = connection.createStatement()) {
+                            indexDdl.execute("DROP INDEX IF EXISTS " +
+                                    safeIdentifier(child + "_stream_time_idx"));
                             indexDdl.execute("CREATE INDEX IF NOT EXISTS " +
                                     safeIdentifier(child + "_stream_rtime_idx") +
                                     " ON " + child + "(datastreamid,resulttime,id)");
@@ -680,7 +681,40 @@ public final class ImmutableObservationStageManager {
         }
     }
 
-    private void rejectLegacyRawRows(Connection connection) throws SQLException {
+    private boolean upgradeAllowlistedImmutableRoutes(Connection connection) throws SQLException {
+        boolean existingParquetPrimary;
+        try (PreparedStatement check = connection.prepareStatement(
+                "SELECT EXISTS (SELECT 1 FROM " + ROUTE_TABLE +
+                        " WHERE store_key=? AND id_scope=? AND immutable=true)")) {
+            check.setString(1, storeKey);
+            check.setInt(2, idScope);
+            try (ResultSet rs = check.executeQuery()) {
+                existingParquetPrimary = rs.next() && rs.getBoolean(1);
+            }
+        }
+        if (!existingParquetPrimary || config.outputNames == null || config.outputNames.isEmpty())
+            return false;
+
+        Array allowed = connection.createArrayOf("text", config.outputNames.toArray());
+        try (PreparedStatement upgrade = connection.prepareStatement(
+                "UPDATE " + ROUTE_TABLE + " route SET immutable=true, updated_at=now() " +
+                        "FROM " + dataStreamTable + " ds " +
+                        "WHERE route.store_key=? AND route.id_scope=? " +
+                        "AND route.datastream_id=ds.id AND route.immutable=false " +
+                        "AND ds.data->>'outputName'=ANY (?)")) {
+            upgrade.setString(1, storeKey);
+            upgrade.setInt(2, idScope);
+            upgrade.setArray(3, allowed);
+            upgrade.executeUpdate();
+        } finally {
+            allowed.free();
+        }
+        return true;
+    }
+
+    private void rejectLegacyRawRows(Connection connection, boolean existingParquetPrimary) throws SQLException {
+        if (existingParquetPrimary)
+            return;
         String sql = "SELECT 1 FROM ONLY " + observationTable + " observation JOIN " +
                 dataStreamTable + " datastream ON datastream.id=observation.datastreamid " +
                 "WHERE datastream.data->>'outputName'=ANY (?) LIMIT 1";
@@ -692,6 +726,130 @@ public final class ImmutableObservationStageManager {
                             "allowlisted immutable rows already exist in the mutable observation table");
             }
         }
+    }
+
+    /**
+     * Drains pre-upgrade rows of newly-allowlisted immutable datastreams from
+     * {@code ONLY <observationTable>} into their corresponding UTC-aligned
+     * {@code osg_*} child partitions in bounded batches so they are exported to
+     * ZSTD Parquet, verified for parity, and dropped via {@code DROP TABLE}.
+     */
+    public boolean stageLegacyAllowlistedRowsBatch() {
+        final int batchLimit = 100_000;
+        final int maxWindowsPerCycle = Math.max(
+                16,
+                Math.max(config.maximumGenerationsPerCycle, config.maximumStagePartitionsPerCycle));
+        boolean movedAny = false;
+        for (int windowPass = 0; windowPass < maxWindowsPerCycle; windowPass++) {
+            try (Connection connection = connections.open()) {
+                boolean oldAutoCommit = connection.getAutoCommit();
+                connection.setAutoCommit(false);
+                try {
+                    int attachedCount;
+                    try (PreparedStatement countStmt = connection.prepareStatement(
+                            "SELECT count(*)::integer FROM " + PARTITION_TABLE +
+                                    " WHERE store_key=? AND id_scope=? AND state='ATTACHED'")) {
+                        countStmt.setString(1, storeKey);
+                        countStmt.setInt(2, idScope);
+                        try (ResultSet rs = countStmt.executeQuery()) {
+                            attachedCount = rs.next() ? rs.getInt(1) : 0;
+                        }
+                    }
+
+                    List<Long> immutableStreamIds = new ArrayList<>();
+                    try (PreparedStatement streams = connection.prepareStatement(
+                            "SELECT datastream_id FROM " + ROUTE_TABLE +
+                                    " WHERE store_key=? AND id_scope=? AND immutable=true")) {
+                        streams.setString(1, storeKey);
+                        streams.setInt(2, idScope);
+                        try (ResultSet rs = streams.executeQuery()) {
+                            while (rs.next())
+                                immutableStreamIds.add(rs.getLong(1));
+                        }
+                    }
+                    if (immutableStreamIds.isEmpty()) {
+                        connection.rollback();
+                        return movedAny;
+                    }
+
+                    Instant oldestPhenomenonTime = null;
+                    Array streamArray = connection.createArrayOf("bigint", immutableStreamIds.toArray());
+                    try (PreparedStatement findOldest = connection.prepareStatement(
+                            "SELECT min(sub.min_pt) FROM unnest(?::bigint[]) AS ds_id " +
+                                    "CROSS JOIN LATERAL (" +
+                                    "  SELECT o.phenomenontime AS min_pt FROM ONLY " + observationTable + " o " +
+                                    "  WHERE o.datastreamid=ds_id AND o.phenomenontime IS NOT NULL " +
+                                    "  ORDER BY o.phenomenontime ASC, o.id ASC LIMIT 1" +
+                                    ") sub")) {
+                        findOldest.setArray(1, streamArray);
+                        try (ResultSet rs = findOldest.executeQuery()) {
+                            if (rs.next())
+                                oldestPhenomenonTime = UtcJdbcTime.getInstant(rs, 1);
+                        }
+                    }
+                    if (oldestPhenomenonTime == null) {
+                        streamArray.free();
+                        connection.rollback();
+                        return movedAny;
+                    }
+
+                    Instant windowStart = TieredArchiveConfig.utcWindowStart(
+                            oldestPhenomenonTime, config.immutableStageWindowMinutes);
+                    Instant windowEnd = windowStart.plusSeconds(
+                            Math.multiplyExact((long) config.immutableStageWindowMinutes, 60L));
+                    boolean alreadyAttached = attachedPartition(connection, windowStart, windowEnd) != null;
+                    if (!alreadyAttached && attachedCount >= Math.max(16, config.maximumStagePartitionsPerCycle)) {
+                        streamArray.free();
+                        connection.rollback();
+                        return movedAny;
+                    }
+                    ensurePartition(connection, windowStart, windowEnd);
+                    String child = attachedPartition(connection, windowStart, windowEnd);
+                    if (child == null) {
+                        streamArray.free();
+                        connection.rollback();
+                        return movedAny;
+                    }
+                    String safeChild = safeIdentifier(child);
+                    String startSql = sqlTimestamp(windowStart);
+                    String endSql = sqlTimestamp(windowEnd);
+                    String moveSql = "WITH moved AS (" +
+                            "  DELETE FROM ONLY " + observationTable + " o " +
+                            "  WHERE o.ctid IN (" +
+                            "    SELECT o2.ctid FROM ONLY " + observationTable + " o2 " +
+                            "    WHERE o2.datastreamid=ANY (?::bigint[]) " +
+                            "      AND o2.phenomenontime >= TIMESTAMP '" + startSql + "' " +
+                            "      AND o2.phenomenontime < TIMESTAMP '" + endSql + "' " +
+                            "    LIMIT ?" +
+                            "  ) " +
+                            "  RETURNING o.id,o.datastreamid,o.foiid,o.phenomenontime,o.resulttime,o.result,o.archivegenerationid" +
+                            ") INSERT INTO " + safeChild +
+                            " (id,datastreamid,foiid,phenomenontime,resulttime,result,archivegenerationid) " +
+                            "SELECT id,datastreamid,foiid,phenomenontime,resulttime,result,archivegenerationid FROM moved " +
+                            "ON CONFLICT (datastreamid,COALESCE(foiid,-1::bigint),phenomenontime,COALESCE(resulttime,'-infinity'::timestamp)) DO NOTHING";
+                    int moved;
+                    try (PreparedStatement moveStmt = connection.prepareStatement(moveSql)) {
+                        moveStmt.setArray(1, streamArray);
+                        moveStmt.setInt(2, batchLimit);
+                        moved = moveStmt.executeUpdate();
+                    } finally {
+                        streamArray.free();
+                    }
+                    connection.commit();
+                    if (moved == 0)
+                        return movedAny;
+                    movedAny = true;
+                } catch (SQLException error) {
+                    connection.rollback();
+                    throw error;
+                } finally {
+                    connection.setAutoCommit(oldAutoCommit);
+                }
+            } catch (SQLException ignored) {
+                return movedAny;
+            }
+        }
+        return movedAny;
     }
 
     private boolean relationExists(Connection connection, String relation) throws SQLException {
@@ -954,6 +1112,17 @@ public final class ImmutableObservationStageManager {
                 mark.executeUpdate();
             }
         } else {
+            for (String countTable : List.of(MUTABLE_COUNTS_DELTA_TABLE, MUTABLE_COUNTS_TABLE)) {
+                try (PreparedStatement purgeImmutable = connection.prepareStatement(
+                        "DELETE FROM " + countTable + " c USING " + ROUTE_TABLE + " r " +
+                                "WHERE c.store_key=? AND c.id_scope=? " +
+                                "AND r.store_key=c.store_key AND r.id_scope=c.id_scope " +
+                                "AND r.datastream_id=c.datastream_id AND r.immutable=true")) {
+                    purgeImmutable.setString(1, storeKey);
+                    purgeImmutable.setInt(2, idScope);
+                    purgeImmutable.executeUpdate();
+                }
+            }
             compactMutableStreamCountDeltasInTx(connection, MUTABLE_COUNTS_DELTA_COMPACT_BATCH);
         }
     }

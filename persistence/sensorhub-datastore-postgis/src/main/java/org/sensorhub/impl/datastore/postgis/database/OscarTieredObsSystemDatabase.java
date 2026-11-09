@@ -69,54 +69,71 @@ public class OscarTieredObsSystemDatabase extends PostgisObsSystemDatabase {
         OscarTieredObsStore store = (OscarTieredObsStore) obsStore;
         TieredArchiveConfig archive = archiveConfig();
         Instant cutoff = archive.archiveCutoff(Instant.now());
-        store.maintainArchiveLifecycle();
-        Instant deadline = Instant.now().plus(archive.maximumCycleMinutes, ChronoUnit.MINUTES);
-        int activated = 0;
-        while (activated < archive.maximumGenerationsPerCycle && Instant.now().isBefore(deadline)) {
-            // Recover the exact shape of a failed/stale legacy job first.
-            // Older builds could create sub-hour bisection windows; replacing
-            // them immediately with a full-hour job would strand their FAILED
-            // catalog row even when all of its observations later archived.
-            var retryable = store.nextRetryableArchiveWindow(cutoff, "RAW_GATED").orElse(null);
-            Instant start;
-            Instant end;
-            if (retryable != null) {
-                start = retryable.start();
-                end = retryable.end();
-            } else {
-                // PARQUET_PRIMARY uses its short immutable UTC staging windows;
-                // HOT_RETENTION preserves the established UTC-hour windows.
-                // Both choices bound snapshots and make restart/idempotency
-                // behaviour independent of local DST.
-                Instant oldest = store.nextArchiveWindowStart(cutoff, "RAW_GATED").orElse(null);
-                if (oldest == null)
-                    break;
-                int windowMinutes = archive.isParquetPrimary()
-                        ? archive.immutableStageWindowMinutes
-                        : 60;
-                start = utcWindowStart(oldest, windowMinutes);
-                end = start.plus(windowMinutes, ChronoUnit.MINUTES);
-                if (end.isAfter(cutoff))
-                    end = cutoff;
-            }
-            if (!start.isBefore(end))
-                break;
-            Optional<org.sensorhub.impl.datastore.postgis.archive.ArchiveGeneration> generation =
-                    store.archiveWindow(start, end, "RAW_GATED");
-            if (generation.isEmpty())
-                break; // another owner has the window; avoid a tight retry loop
-            activated++;
-            getLogger().info("Activated archive generation {} with {} rows for [{}, {})",
-                    generation.get().id(), generation.get().rowCount(), start, end);
-        }
-        if (activated > 0)
-            getLogger().info("OSCAR archive cycle completed {} generation(s); remaining backlog will continue next cycle",
-                    activated);
-        // In Parquet-primary mode, a successful export should be eligible for
-        // verification and staging retirement without waiting for the next
-        // scheduler tick. HOT_RETENTION keeps its historical one-pass cycle.
-        if (activated > 0 && archive.isParquetPrimary())
+        Instant deadline = Instant.now().plus(Math.max(15, archive.maximumCycleMinutes), ChronoUnit.MINUTES);
+        boolean drainedLegacyAny = false;
+        for (int pass = 0; pass < 128 && Instant.now().isBefore(deadline); pass++) {
             store.maintainArchiveLifecycle();
+            boolean stagedLegacy = store.stageLegacyAllowlistedRowsBatch();
+            drainedLegacyAny |= stagedLegacy;
+            boolean hasBacklogPartitions = archive.isParquetPrimary()
+                    && store.getImmutableStagePartitions().size() > 2;
+            int generationBudget = (stagedLegacy || hasBacklogPartitions)
+                    ? Math.max(16, Math.max(archive.maximumGenerationsPerCycle, archive.maximumStagePartitionsPerCycle))
+                    : archive.maximumGenerationsPerCycle;
+            int activated = 0;
+            while (activated < generationBudget
+                    && (stagedLegacy || hasBacklogPartitions || Instant.now().isBefore(deadline))) {
+                // Recover the exact shape of a failed/stale legacy job first.
+                // Older builds could create sub-hour bisection windows; replacing
+                // them immediately with a full-hour job would strand their FAILED
+                // catalog row even when all of its observations later archived.
+                var retryable = store.nextRetryableArchiveWindow(cutoff, "RAW_GATED").orElse(null);
+                Instant start;
+                Instant end;
+                if (retryable != null) {
+                    start = retryable.start();
+                    end = retryable.end();
+                } else {
+                    // PARQUET_PRIMARY uses its short immutable UTC staging windows;
+                    // HOT_RETENTION preserves the established UTC-hour windows.
+                    // Both choices bound snapshots and make restart/idempotency
+                    // behaviour independent of local DST.
+                    Instant oldest = store.nextArchiveWindowStart(cutoff, "RAW_GATED").orElse(null);
+                    if (oldest == null)
+                        break;
+                    int windowMinutes = archive.isParquetPrimary()
+                            ? archive.immutableStageWindowMinutes
+                            : 60;
+                    start = utcWindowStart(oldest, windowMinutes);
+                    end = start.plus(windowMinutes, ChronoUnit.MINUTES);
+                    if (end.isAfter(cutoff))
+                        end = cutoff;
+                }
+                if (!start.isBefore(end))
+                    break;
+                Optional<org.sensorhub.impl.datastore.postgis.archive.ArchiveGeneration> generation =
+                        store.archiveWindow(start, end, "RAW_GATED");
+                if (generation.isEmpty())
+                    break; // another owner has the window; avoid a tight retry loop
+                activated++;
+                getLogger().info("Activated archive generation {} with {} rows for [{}, {})",
+                        generation.get().id(), generation.get().rowCount(), start, end);
+            }
+            if (activated > 0)
+                getLogger().info("OSCAR archive cycle completed {} generation(s); remaining backlog will continue next cycle",
+                        activated);
+            // In Parquet-primary mode, a successful export should be eligible for
+            // verification and staging retirement without waiting for the next
+            // scheduler tick. HOT_RETENTION keeps its historical one-pass cycle.
+            if (activated > 0 && archive.isParquetPrimary()) {
+                store.maintainArchiveLifecycle();
+            }
+            if (!stagedLegacy && activated == 0)
+                break;
+        }
+        if (drainedLegacyAny && !store.stageLegacyAllowlistedRowsBatch()) {
+            store.reindexMutableHotTables();
+        }
         if (archive.isParquetPrimary()) {
             store.getOldestImmutableStageReceipt().ifPresent(oldest -> {
                 Duration residence = Duration.between(oldest, Instant.now());
