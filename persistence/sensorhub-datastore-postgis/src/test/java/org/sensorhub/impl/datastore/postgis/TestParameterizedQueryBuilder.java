@@ -332,7 +332,8 @@ public class TestParameterizedQueryBuilder {
         assertTrue(indexes.contains("_non_alarm_ptime_desc_idx"));
         assertTrue(indexes.contains("WHERE (result @> '{\"gammaAlarm\": false}'::jsonb AND result @> '{\"neutronAlarm\": false}'::jsonb)"));
         assertTrue(Arrays.stream(builder.createEventFilterIndexQueries())
-                .allMatch(query -> query.startsWith("CREATE INDEX IF NOT EXISTS")));
+                .allMatch(query -> query.startsWith("CREATE INDEX IF NOT EXISTS")
+                        || query.startsWith("DROP INDEX IF EXISTS")));
 
         String alarmIdx = builder.createTieredUnadjudicatedAlarmIndexQuery();
         assertTrue(alarmIdx.startsWith("CREATE INDEX IF NOT EXISTS obs_unadjudicated_alarm_idx ON obs"));
