@@ -197,4 +197,76 @@ public class TestPostgisCommandStore extends AbstractTestCommandStore<PostgisCom
     public void testSelectCommandsByDataStreamIDAndPredicates() throws Exception {
         super.testSelectCommandsByDataStreamIDAndPredicates();
     }
+
+    @Test
+    public void testAdjudicationRecordsAreImmutableAndAppendOnly() throws Exception {
+        SWEHelper fac = new SWEHelper();
+        var paramDesc = fac.createRecord()
+                .name("adjudicationControl")
+                .addField("feedback", fac.createText())
+                .build();
+        var resDesc = fac.createRecord()
+                .name("result")
+                .addField("username", fac.createText())
+                .addField("feedback", fac.createText())
+                .build();
+
+        var adjStream = new CommandStreamInfo.Builder()
+                .withName("adjudicationControl")
+                .withRecordDescription(paramDesc)
+                .withRecordEncoding(new TextEncodingImpl())
+                .withResultDescription(resDesc)
+                .withResultEncoding(new TextEncodingImpl())
+                .withSystem(new FeatureId(bigId(2), "urn:osh:system:lane:test-adj"))
+                .build();
+        var csKey = cmdStore.getCommandStreams().add(adjStream);
+
+        var firstParams = paramDesc.createDataBlock();
+        firstParams.setStringValue(0, "First immutable adjudication");
+        var firstCmd = new CommandData.Builder()
+                .withCommandStream(csKey.getInternalID())
+                .withSender("operator1")
+                .withIssueTime(Instant.parse("2026-11-09T12:00:00Z"))
+                .withParams(firstParams)
+                .build();
+        var firstCmdId = cmdStore.add(firstCmd);
+
+        var firstResBlock = resDesc.createDataBlock();
+        firstResBlock.setStringValue(0, "operator1");
+        firstResBlock.setStringValue(1, "First immutable adjudication");
+        var firstStatus = new CommandStatus.Builder()
+                .withCommand(firstCmdId)
+                .withReportTime(Instant.parse("2026-11-09T12:00:01Z"))
+                .withStatusCode(ICommandStatus.CommandStatusCode.COMPLETED)
+                .withResult(CommandResult.withData(firstResBlock))
+                .build();
+        var firstStatusId = cmdStore.getStatusReports().add(firstStatus);
+
+        // Appending a second adjudication record on the same stream succeeds
+        var secondParams = paramDesc.createDataBlock();
+        secondParams.setStringValue(0, "Second immutable adjudication");
+        var secondCmd = new CommandData.Builder()
+                .withCommandStream(csKey.getInternalID())
+                .withSender("operator2")
+                .withIssueTime(Instant.parse("2026-11-09T12:05:00Z"))
+                .withParams(secondParams)
+                .build();
+        var secondCmdId = cmdStore.add(secondCmd);
+        assertNotEquals(firstCmdId, secondCmdId);
+
+        // In-place modification or deletion of an existing adjudication command or status is rejected
+        assertThrows(UnsupportedOperationException.class, () -> cmdStore.put(firstCmdId, secondCmd));
+        assertThrows(UnsupportedOperationException.class, () -> cmdStore.remove(firstCmdId));
+        assertThrows(UnsupportedOperationException.class, () -> cmdStore.getStatusReports().put(firstStatusId, firstStatus));
+        assertThrows(UnsupportedOperationException.class, () -> cmdStore.getStatusReports().remove(firstStatusId));
+
+        // Original adjudication command and status remain intact
+        var storedFirstCmd = cmdStore.get(firstCmdId);
+        assertNotNull(storedFirstCmd);
+        assertEquals("First immutable adjudication", storedFirstCmd.getParams().getStringValue(0));
+        var storedFirstStatus = cmdStore.getStatusReports().get(firstStatusId);
+        assertNotNull(storedFirstStatus);
+        assertEquals("First immutable adjudication",
+                storedFirstStatus.getResult().getInlineRecords().iterator().next().getStringValue(1));
+    }
 }

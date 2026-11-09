@@ -190,7 +190,9 @@ public class TestTieredArchiveConfiguration {
         assertTrue(primaryEventIndexes.contains("jsonb_path_ops"));
         assertTrue(primaryEventIndexes.contains("occupancy_count_idx"));
         assertTrue(primaryInitialization.contains("obs_unique_constraint_v2"));
-        assertTrue(primaryInitialization.contains("obs_datastream_id_phenomenon_time_idx"));
+        assertTrue(primaryEventIndexes.contains("obs_datastream_phenomenon_time_id_nulls_first_idx"));
+        assertTrue(primaryInitialization.contains("DROP INDEX IF EXISTS obs_datastream_idx"));
+        assertFalse(primaryInitialization.contains("CREATE INDEX IF NOT EXISTS obs_datastream_idx"));
     }
 
     @Test

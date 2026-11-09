@@ -60,14 +60,31 @@ public class QueryBuilderObsStore extends QueryBuilder {
         queries.add(createTableQuery());
         if (genericPayloadIndexEnabled)
             queries.add(createDataIndexQuery());
-        queries.add(createDataStreamIndexQuery());
-        queries.add(createPhenomenonTimeIndexQuery());
-        queries.add(createPhenomenonTimeDataStreamIdIndexQuery());
+        for (String dropRedundant : dropRedundantSingleColumnAndPrefixIndexQueries()) {
+            queries.add(dropRedundant);
+        }
         queries.add(createResultTimeIndexQuery());
-        queries.add(createResultTimeDataStreamIdIndexQuery());
         queries.add(createFoiIndexQuery());
         queries.add(createUniqueConstraint());
         return queries.toArray(String[]::new);
+    }
+
+    /**
+     * Drops legacy single-column and 2-column B-tree indexes that are strict
+     * left-prefixes of the composite keyset pagination indexes created in
+     * {@link #createEventFilterIndexQueries()}.
+     */
+    public String[] dropRedundantSingleColumnAndPrefixIndexQueries() {
+        return new String[]{
+                "DROP INDEX IF EXISTS " + this.getStoreTableName() + "_datastream_idx",
+                "DROP INDEX IF EXISTS " + this.getStoreTableName() + "_phenomenon_time_idx",
+                "DROP INDEX IF EXISTS " + this.getStoreTableName() + "_datastream_id_phenomenon_time_idx",
+                "DROP INDEX IF EXISTS " + this.getStoreTableName() + "_datastream_id_result_time_idx"
+        };
+    }
+
+    public String dropUnarchivedTimeIndexQuery() {
+        return "DROP INDEX IF EXISTS " + getStoreTableName() + "_unarchived_time_idx";
     }
 
     public String createTableQuery() {
@@ -136,18 +153,21 @@ public class QueryBuilderObsStore extends QueryBuilder {
     }
 
     public String[] createEventFilterIndexQueries() {
-        return new String[]{
-                createResultPathOpsIndexQuery(),
-                createOccupancyCountIndexQuery(),
-                createMaxGammaIndexQuery(),
-                createMaxNeutronIndexQuery(),
-                createKeysetPhenomenonTimeAscIndexQuery(),
-                createKeysetPhenomenonTimeDescIndexQuery(),
-                createKeysetDataStreamPhenomenonTimeAscIndexQuery(),
-                createKeysetDataStreamPhenomenonTimeDescIndexQuery(),
-                createKeysetDataStreamResultTimeIndexQuery(),
-                createNonAlarmKeysetPhenomenonTimeDescIndexQuery()
-        };
+        List<String> queries = new ArrayList<>();
+        for (String dropRedundant : dropRedundantSingleColumnAndPrefixIndexQueries()) {
+            queries.add(dropRedundant);
+        }
+        queries.add(createResultPathOpsIndexQuery());
+        queries.add(createOccupancyCountIndexQuery());
+        queries.add(createMaxGammaIndexQuery());
+        queries.add(createMaxNeutronIndexQuery());
+        queries.add(createKeysetPhenomenonTimeAscIndexQuery());
+        queries.add(createKeysetPhenomenonTimeDescIndexQuery());
+        queries.add(createKeysetDataStreamPhenomenonTimeAscIndexQuery());
+        queries.add(createKeysetDataStreamPhenomenonTimeDescIndexQuery());
+        queries.add(createKeysetDataStreamResultTimeIndexQuery());
+        queries.add(createNonAlarmKeysetPhenomenonTimeDescIndexQuery());
+        return queries.toArray(String[]::new);
     }
 
     /**

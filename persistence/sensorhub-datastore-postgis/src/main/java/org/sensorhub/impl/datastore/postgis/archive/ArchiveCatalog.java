@@ -252,6 +252,7 @@ public final class ArchiveCatalog {
     public void migrate() {
         try (Connection connection = connections.open()) {
             boolean oldAutoCommit = connection.getAutoCommit();
+            int migratedSchemaRows = 0;
             connection.setAutoCommit(false);
             try (Statement statement = connection.createStatement()) {
                 statement.execute("SELECT pg_advisory_xact_lock(" + MIGRATION_LOCK + ")");
@@ -318,11 +319,25 @@ public final class ArchiveCatalog {
                         "generation_id uuid NOT NULL REFERENCES oscar_archive_generation(id) ON DELETE CASCADE, " +
                         "min_id bigint NOT NULL, max_id bigint NOT NULL, PRIMARY KEY(generation_id, min_id))");
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_archive_id_lookup_idx ON oscar_archive_id_block (min_id, max_id)");
+                statement.execute("CREATE TABLE IF NOT EXISTS oscar_archive_schema_blob (" +
+                        "schema_sha256 text PRIMARY KEY, schema_json jsonb NOT NULL)");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_archive_schema (" +
                         "generation_id uuid NOT NULL REFERENCES oscar_archive_generation(id) ON DELETE CASCADE, " +
-                        "datastream_id bigint NOT NULL, schema_json jsonb NOT NULL, PRIMARY KEY(generation_id, datastream_id))");
+                        "datastream_id bigint NOT NULL, schema_json jsonb, " +
+                        "schema_sha256 text REFERENCES oscar_archive_schema_blob(schema_sha256), " +
+                        "PRIMARY KEY(generation_id, datastream_id))");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS " +
+                        "schema_sha256 text REFERENCES oscar_archive_schema_blob(schema_sha256)");
+                statement.execute("ALTER TABLE oscar_archive_schema ALTER COLUMN schema_json DROP NOT NULL");
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_archive_schema_datastream_idx " +
                         "ON oscar_archive_schema (datastream_id, generation_id)");
+                statement.execute("INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
+                        "SELECT DISTINCT encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), schema_json " +
+                        "FROM oscar_archive_schema WHERE schema_json IS NOT NULL " +
+                        "ON CONFLICT (schema_sha256) DO NOTHING");
+                migratedSchemaRows = statement.executeUpdate("UPDATE oscar_archive_schema " +
+                        "SET schema_sha256=encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), " +
+                        "schema_json=NULL WHERE schema_json IS NOT NULL");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_event_locator (" +
                         "store_key text NOT NULL, id_scope integer NOT NULL, public_id text NOT NULL, " +
                         "observation_id bigint NOT NULL, generation_id uuid REFERENCES oscar_archive_generation(id), " +
@@ -350,8 +365,11 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_obs_overlay ADD COLUMN IF NOT EXISTS generation_id uuid " +
                         "REFERENCES oscar_archive_generation(id)");
                 statement.execute("ALTER TABLE oscar_obs_overlay ADD COLUMN IF NOT EXISTS schema_json jsonb");
-                statement.execute("UPDATE oscar_obs_overlay overlay_row SET schema_json=schema_row.schema_json " +
-                        "FROM oscar_archive_schema schema_row WHERE overlay_row.schema_json IS NULL " +
+                statement.execute("UPDATE oscar_obs_overlay overlay_row " +
+                        "SET schema_json=COALESCE(schema_row.schema_json, blob.schema_json) " +
+                        "FROM oscar_archive_schema schema_row " +
+                        "LEFT JOIN oscar_archive_schema_blob blob ON blob.schema_sha256=schema_row.schema_sha256 " +
+                        "WHERE overlay_row.schema_json IS NULL " +
                         "AND overlay_row.generation_id=schema_row.generation_id " +
                         "AND overlay_row.datastream_id=schema_row.datastream_id");
                 // A pre-v4 overlay has no exact generation owner. Coarse ID
@@ -556,6 +574,15 @@ public final class ArchiveCatalog {
                 throw e;
             } finally {
                 connection.setAutoCommit(oldAutoCommit);
+            }
+            if (migratedSchemaRows > 0) {
+                boolean wasAutoCommit = connection.getAutoCommit();
+                connection.setAutoCommit(true);
+                try (Statement vacuum = connection.createStatement()) {
+                    vacuum.execute("VACUUM FULL oscar_archive_schema");
+                } finally {
+                    connection.setAutoCommit(wasAutoCommit);
+                }
             }
         } catch (Exception e) {
             throw new IllegalStateException("Cannot migrate OSCAR archive catalog", e);
@@ -947,14 +974,25 @@ public final class ArchiveCatalog {
                     statement.setLong(3, generation.maximumId());
                     statement.executeUpdate();
                 }
-                try (PreparedStatement statement = connection.prepareStatement(
-                        "INSERT INTO oscar_archive_schema(generation_id, datastream_id, schema_json) VALUES (?, ?, ?::jsonb)")) {
+                try (PreparedStatement blobStatement = connection.prepareStatement(
+                        "INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
+                                "VALUES (?, ?::jsonb) ON CONFLICT (schema_sha256) DO NOTHING");
+                     PreparedStatement statement = connection.prepareStatement(
+                        "INSERT INTO oscar_archive_schema(generation_id, datastream_id, schema_sha256) VALUES (?, ?, ?)")) {
+                    Set<String> insertedBlobs = new HashSet<>();
                     for (SchemaSnapshot schema : schemas) {
+                        String schemaHash = sha256Hex(schema.json());
+                        if (insertedBlobs.add(schemaHash)) {
+                            blobStatement.setString(1, schemaHash);
+                            blobStatement.setString(2, schema.json());
+                            blobStatement.addBatch();
+                        }
                         statement.setObject(1, generation.id());
                         statement.setLong(2, schema.dataStreamId());
-                        statement.setString(3, schema.json());
+                        statement.setString(3, schemaHash);
                         statement.addBatch();
                     }
+                    blobStatement.executeBatch();
                     statement.executeBatch();
                 }
                 try (PreparedStatement statement = connection.prepareStatement(
@@ -1077,10 +1115,6 @@ public final class ArchiveCatalog {
                     "phenomenon_time timestamp, result_time timestamp, result_json jsonb) ON COMMIT DROP");
         }
 
-        String parquet = parquetPath.toAbsolutePath().normalize().toString().replace("'", "''");
-        String select = "SELECT id_scope, id_value, datastream_scope, datastream_id, foi_scope, foi_id, " +
-                "phenomenon_time, result_time, result_json, archive_version, profile " +
-                "FROM read_parquet('" + parquet + "')";
         String insert = "INSERT INTO oscar_archive_activation_row(" +
                 "observation_id,datastream_id,foi_id,phenomenon_time,result_time,result_json) " +
                 "VALUES (?,?,?,?::timestamp,?::timestamp,?::jsonb)";
@@ -1089,57 +1123,64 @@ public final class ArchiveCatalog {
         long maximumId = Long.MIN_VALUE;
         Instant maxResultTime = generation.maxResultTime();
         try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(
-                resourceConfig, "activation-stage");
-             Statement read = duckSession.connection().createStatement();
-             ResultSet rows = read.executeQuery(select);
-             PreparedStatement stage = postgres.prepareStatement(insert)) {
-            while (rows.next()) {
-                int exportedIdScope = rows.getInt(1);
-                long observationId = rows.getLong(2);
-                int exportedDataStreamScope = rows.getInt(3);
-                long dataStreamId = rows.getLong(4);
-                Integer foiScope = rows.getObject(5, Integer.class);
-                Long foiId = rows.getObject(6, Long.class);
-                int archiveVersion = rows.getInt(10);
-                String profile = rows.getString(11);
-                if (exportedIdScope != idScope || exportedDataStreamScope != idScope ||
-                        (foiId == null ? foiScope != null : foiScope == null || foiScope != idScope) ||
-                        archiveVersion != 1 || !generation.profile().equals(profile))
-                    throw new IllegalStateException("Archive activation ledger metadata does not match its generation");
+                resourceConfig, "activation-stage")) {
+            Path localParquet = ArchiveExporter.stageToLocalDirectory(
+                    parquetPath, duckSession.operationDirectory(), "activation-stage.parquet");
+            String parquet = localParquet.toAbsolutePath().normalize().toString().replace("'", "''");
+            String select = "SELECT id_scope, id_value, datastream_scope, datastream_id, foi_scope, foi_id, " +
+                    "phenomenon_time, result_time, result_json, archive_version, profile " +
+                    "FROM read_parquet('" + parquet + "')";
+            try (Statement read = duckSession.connection().createStatement();
+                 ResultSet rows = read.executeQuery(select);
+                 PreparedStatement stage = postgres.prepareStatement(insert)) {
+                while (rows.next()) {
+                    int exportedIdScope = rows.getInt(1);
+                    long observationId = rows.getLong(2);
+                    int exportedDataStreamScope = rows.getInt(3);
+                    long dataStreamId = rows.getLong(4);
+                    Integer foiScope = rows.getObject(5, Integer.class);
+                    Long foiId = rows.getObject(6, Long.class);
+                    int archiveVersion = rows.getInt(10);
+                    String profile = rows.getString(11);
+                    if (exportedIdScope != idScope || exportedDataStreamScope != idScope ||
+                            (foiId == null ? foiScope != null : foiScope == null || foiScope != idScope) ||
+                            archiveVersion != 1 || !generation.profile().equals(profile))
+                        throw new IllegalStateException("Archive activation ledger metadata does not match its generation");
 
-                stage.setLong(1, observationId);
-                stage.setLong(2, dataStreamId);
-                if (foiId == null)
-                    stage.setNull(3, Types.BIGINT);
-                else
-                    stage.setLong(3, foiId);
-                var phenomenonTime = UtcJdbcTime.getDuckDbInstant(rows, 7);
-                if (phenomenonTime == null)
-                    stage.setNull(4, Types.TIMESTAMP);
-                else
-                    UtcJdbcTime.setInstant(stage, 4, phenomenonTime);
-                var resultTime = UtcJdbcTime.getDuckDbInstant(rows, 8);
-                if (resultTime == null)
-                    stage.setNull(5, Types.TIMESTAMP);
-                else
-                    UtcJdbcTime.setInstant(stage, 5, resultTime);
-                Instant candidateResultTime = resultTime != null ? resultTime : phenomenonTime;
-                if (candidateResultTime != null && (maxResultTime == null || candidateResultTime.isAfter(maxResultTime)))
-                    maxResultTime = candidateResultTime;
-                String resultJson = rows.getString(9);
-                if (resultJson == null)
-                    stage.setNull(6, Types.VARCHAR);
-                else
-                    stage.setString(6, resultJson);
-                stage.addBatch();
+                    stage.setLong(1, observationId);
+                    stage.setLong(2, dataStreamId);
+                    if (foiId == null)
+                        stage.setNull(3, Types.BIGINT);
+                    else
+                        stage.setLong(3, foiId);
+                    var phenomenonTime = UtcJdbcTime.getDuckDbInstant(rows, 7);
+                    if (phenomenonTime == null)
+                        stage.setNull(4, Types.TIMESTAMP);
+                    else
+                        UtcJdbcTime.setInstant(stage, 4, phenomenonTime);
+                    var resultTime = UtcJdbcTime.getDuckDbInstant(rows, 8);
+                    if (resultTime == null)
+                        stage.setNull(5, Types.TIMESTAMP);
+                    else
+                        UtcJdbcTime.setInstant(stage, 5, resultTime);
+                    Instant candidateResultTime = resultTime != null ? resultTime : phenomenonTime;
+                    if (candidateResultTime != null && (maxResultTime == null || candidateResultTime.isAfter(maxResultTime)))
+                        maxResultTime = candidateResultTime;
+                    String resultJson = rows.getString(9);
+                    if (resultJson == null)
+                        stage.setNull(6, Types.VARCHAR);
+                    else
+                        stage.setString(6, resultJson);
+                    stage.addBatch();
 
-                count++;
-                minimumId = Math.min(minimumId, observationId);
-                maximumId = Math.max(maximumId, observationId);
-                if (count % 5_000 == 0)
-                    stage.executeBatch();
+                    count++;
+                    minimumId = Math.min(minimumId, observationId);
+                    maximumId = Math.max(maximumId, observationId);
+                    if (count % 5_000 == 0)
+                        stage.executeBatch();
+                }
+                stage.executeBatch();
             }
-            stage.executeBatch();
         }
         if (count != generation.rowCount() || minimumId != generation.minimumId() ||
                 maximumId != generation.maximumId())
@@ -1291,25 +1332,37 @@ public final class ArchiveCatalog {
         java.sql.Array streamArray = filterDataStreams
                 ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                 : null;
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
-            int parameter = 1;
-            statement.setString(parameter++, storeKey);
-            statement.setInt(parameter++, idScope);
-            UtcJdbcTime.setInstant(statement, parameter++, end);
-            UtcJdbcTime.setInstant(statement, parameter++, start);
-            if (minResultTime != null)
-                UtcJdbcTime.setInstant(statement, parameter++, minResultTime);
-            if (observationId != null)
-                statement.setLong(parameter++, observationId);
-            if (filterIdRange) {
-                statement.setLong(parameter++, minObservationId);
-                statement.setLong(parameter++, maxObservationId);
+        try {
+            if (streamArray != null) {
+                try (PreparedStatement hasAny = connection.prepareStatement(
+                        "SELECT 1 FROM oscar_archive_schema WHERE datastream_id=ANY (?::bigint[]) LIMIT 1")) {
+                    hasAny.setArray(1, streamArray);
+                    try (ResultSet rs = hasAny.executeQuery()) {
+                        if (!rs.next())
+                            return generations;
+                    }
+                }
             }
-            if (streamArray != null)
-                statement.setArray(parameter, streamArray);
-            try (ResultSet result = statement.executeQuery()) {
-                while (result.next()) {
-                    generations.add(readGeneration(result));
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                int parameter = 1;
+                statement.setString(parameter++, storeKey);
+                statement.setInt(parameter++, idScope);
+                UtcJdbcTime.setInstant(statement, parameter++, end);
+                UtcJdbcTime.setInstant(statement, parameter++, start);
+                if (minResultTime != null)
+                    UtcJdbcTime.setInstant(statement, parameter++, minResultTime);
+                if (observationId != null)
+                    statement.setLong(parameter++, observationId);
+                if (filterIdRange) {
+                    statement.setLong(parameter++, minObservationId);
+                    statement.setLong(parameter++, maxObservationId);
+                }
+                if (streamArray != null)
+                    statement.setArray(parameter, streamArray);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next()) {
+                        generations.add(readGeneration(result));
+                    }
                 }
             }
         } finally {
@@ -1394,20 +1447,32 @@ public final class ArchiveCatalog {
             java.sql.Array streamArray = filterDataStreams
                     ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                     : null;
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                int parameter = 1;
-                statement.setString(parameter++, storeKey);
-                statement.setInt(parameter++, idScope);
-                UtcJdbcTime.setInstant(statement, parameter++, end);
-                UtcJdbcTime.setInstant(statement, parameter++, start);
-                if (minResultTime != null)
-                    UtcJdbcTime.setInstant(statement, parameter++, minResultTime);
-                if (streamArray != null)
-                    statement.setArray(parameter++, streamArray);
-                statement.setInt(parameter, Math.addExact(batchLimit, 1));
-                try (ResultSet result = statement.executeQuery()) {
-                    while (result.next())
-                        fetched.add(readGeneration(result));
+            try {
+                if (streamArray != null) {
+                    try (PreparedStatement hasAny = connection.prepareStatement(
+                            "SELECT 1 FROM oscar_archive_schema WHERE datastream_id=ANY (?::bigint[]) LIMIT 1")) {
+                        hasAny.setArray(1, streamArray);
+                        try (ResultSet rs = hasAny.executeQuery()) {
+                            if (!rs.next())
+                                return new InitialCandidateBatch(List.of(), true);
+                        }
+                    }
+                }
+                try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                    int parameter = 1;
+                    statement.setString(parameter++, storeKey);
+                    statement.setInt(parameter++, idScope);
+                    UtcJdbcTime.setInstant(statement, parameter++, end);
+                    UtcJdbcTime.setInstant(statement, parameter++, start);
+                    if (minResultTime != null)
+                        UtcJdbcTime.setInstant(statement, parameter++, minResultTime);
+                    if (streamArray != null)
+                        statement.setArray(parameter++, streamArray);
+                    statement.setInt(parameter, Math.addExact(batchLimit, 1));
+                    try (ResultSet result = statement.executeQuery()) {
+                        while (result.next())
+                            fetched.add(readGeneration(result));
+                    }
                 }
             } finally {
                 if (streamArray != null)
@@ -1467,8 +1532,11 @@ public final class ArchiveCatalog {
             if (!oldAutoCommit)
                 connection.setAutoCommit(true);
             try (Statement statement = connection.createStatement()) {
-                if (resourceConfig.isParquetPrimary())
+                if (resourceConfig.isParquetPrimary()) {
                     statement.execute("REINDEX TABLE CONCURRENTLY " + observations);
+                    statement.execute("REINDEX TABLE CONCURRENTLY oscar_obs_stage_owner");
+                }
+                statement.execute("REINDEX TABLE CONCURRENTLY oscar_archive_schema");
                 statement.execute("REINDEX TABLE CONCURRENTLY " + dataStreams);
             } finally {
                 if (!oldAutoCommit)
@@ -1761,7 +1829,8 @@ public final class ArchiveCatalog {
     public Optional<String> schemaJson(Connection connection, UUID generationId, long dataStreamId)
             throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(
-                "SELECT schema.schema_json::text FROM oscar_archive_schema schema " +
+                "SELECT COALESCE(schema.schema_json, blob.schema_json)::text FROM oscar_archive_schema schema " +
+                        "LEFT JOIN oscar_archive_schema_blob blob ON blob.schema_sha256=schema.schema_sha256 " +
                         "JOIN oscar_archive_generation generation ON generation.id=schema.generation_id " +
                         "WHERE schema.generation_id=? AND schema.datastream_id=? " +
                         "AND generation.store_key=? AND generation.id_scope=?")) {
@@ -1770,8 +1839,18 @@ public final class ArchiveCatalog {
             statement.setString(3, storeKey);
             statement.setInt(4, idScope);
             try (ResultSet result = statement.executeQuery()) {
-                return result.next() ? Optional.of(result.getString(1)) : Optional.empty();
+                return result.next() ? Optional.ofNullable(result.getString(1)) : Optional.empty();
             }
+        }
+    }
+
+    private static String sha256Hex(String value) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest);
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
         }
     }
 

@@ -45,8 +45,10 @@ public final class ArchiveLifecycleManager {
     }
 
     public void maintain() {
-        for (ArchiveGeneration generation : catalog.unverifiedGenerations(
-                config.maximumVerificationsPerCycle))
+        int verifyLimit = config.isParquetPrimary()
+                ? Math.max(16, Math.max(config.maximumVerificationsPerCycle, config.maximumStagePartitionsPerCycle))
+                : config.maximumVerificationsPerCycle;
+        for (ArchiveGeneration generation : catalog.unverifiedGenerations(verifyLimit))
             verifyHotColdParity(generation);
 
         // PARQUET_PRIMARY uses verified whole-partition retirement. Row-wise
@@ -68,22 +70,25 @@ public final class ArchiveLifecycleManager {
 
             MessageDigest archiveDigest = MessageDigest.getInstance("SHA-256");
             MessageDigest hotDigest = MessageDigest.getInstance("SHA-256");
-            try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "parity-verify");
-                 PreparedStatement archived = duckSession.connection().prepareStatement(
-                         "SELECT id_value, datastream_id, foi_id, phenomenon_time, result_time, result_json " +
-                                 "FROM read_parquet('" + sqlLiteral(parquet.toString()) + "') ORDER BY id_value");
-                 ResultSet rows = archived.executeQuery()) {
-                List<RowFingerprint> batch = new ArrayList<>(VERIFY_BATCH);
-                while (rows.next()) {
-                    batch.add(fromResult(rows));
-                    actualRows++;
-                    if (batch.size() == VERIFY_BATCH) {
-                        compareBatch(batch, archiveDigest, hotDigest);
-                        batch.clear();
+            try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "parity-verify")) {
+                Path localParquet = ArchiveExporter.stageToLocalDirectory(
+                        parquet, duckSession.operationDirectory(), "parity-verify.parquet");
+                try (PreparedStatement archived = duckSession.connection().prepareStatement(
+                        "SELECT id_value, datastream_id, foi_id, phenomenon_time, result_time, result_json " +
+                                "FROM read_parquet('" + sqlLiteral(localParquet.toString()) + "') ORDER BY id_value");
+                     ResultSet rows = archived.executeQuery()) {
+                    List<RowFingerprint> batch = new ArrayList<>(VERIFY_BATCH);
+                    while (rows.next()) {
+                        batch.add(fromResult(rows));
+                        actualRows++;
+                        if (batch.size() == VERIFY_BATCH) {
+                            compareBatch(batch, archiveDigest, hotDigest);
+                            batch.clear();
+                        }
                     }
+                    if (!batch.isEmpty())
+                        compareBatch(batch, archiveDigest, hotDigest);
                 }
-                if (!batch.isEmpty())
-                    compareBatch(batch, archiveDigest, hotDigest);
             }
             boolean success = actualRows == generation.rowCount() &&
                     MessageDigest.isEqual(archiveDigest.digest(), hotDigest.digest());
@@ -101,14 +106,23 @@ public final class ArchiveLifecycleManager {
                               MessageDigest hotDigest) throws Exception {
         List<Long> ids = archivedRows.stream().map(RowFingerprint::id).toList();
         Map<Long, RowFingerprint> hotById = new HashMap<>();
-        String sql = "SELECT id, datastreamid, foiid, phenomenontime, resulttime, result::text FROM " +
-                observationTable + " WHERE id = ANY (?) ORDER BY id";
-        try (Connection connection = postgres.open(); PreparedStatement statement = connection.prepareStatement(sql)) {
-            statement.setArray(1, connection.createArrayOf("bigint", ids.toArray()));
-            try (ResultSet result = statement.executeQuery()) {
-                while (result.next()) {
-                    RowFingerprint row = fromResult(result);
-                    hotById.put(row.id(), row);
+        try (Connection connection = postgres.open()) {
+            List<String> attachedChildren = config.isParquetPrimary()
+                    ? ArchiveCatalog.attachedStageChildTables(connection, catalog.storeKey(), catalog.idScope())
+                    : List.of();
+            String fromClause = (config.isParquetPrimary() && !attachedChildren.isEmpty())
+                    ? ArchiveCatalog.stageChildrenFromClause(
+                    attachedChildren, "id, datastreamid, foiid, phenomenontime, resulttime, result")
+                    : observationTable + " o";
+            String sql = "SELECT o.id, o.datastreamid, o.foiid, o.phenomenontime, o.resulttime, o.result::text FROM " +
+                    fromClause + " WHERE o.id = ANY (?) ORDER BY o.id";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setArray(1, connection.createArrayOf("bigint", ids.toArray()));
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next()) {
+                        RowFingerprint row = fromResult(result);
+                        hotById.put(row.id(), row);
+                    }
                 }
             }
         }
@@ -134,24 +148,27 @@ public final class ArchiveLifecycleManager {
         }
         long deleted = 0;
         long deferredHolds = 0;
-        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "hot-delete");
-             PreparedStatement archived = duckSession.connection().prepareStatement(
-                     "SELECT id_value FROM read_parquet('" + sqlLiteral(parquet.toString()) + "') ORDER BY id_value");
-             ResultSet rows = archived.executeQuery()) {
-            List<Long> batch = new ArrayList<>(config.deleteBatchSize);
-            while (rows.next()) {
-                batch.add(rows.getLong(1));
-                if (batch.size() == config.deleteBatchSize) {
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "hot-delete")) {
+            Path localParquet = ArchiveExporter.stageToLocalDirectory(
+                    parquet, duckSession.operationDirectory(), "hot-delete.parquet");
+            try (PreparedStatement archived = duckSession.connection().prepareStatement(
+                    "SELECT id_value FROM read_parquet('" + sqlLiteral(localParquet.toString()) + "') ORDER BY id_value");
+                 ResultSet rows = archived.executeQuery()) {
+                List<Long> batch = new ArrayList<>(config.deleteBatchSize);
+                while (rows.next()) {
+                    batch.add(rows.getLong(1));
+                    if (batch.size() == config.deleteBatchSize) {
+                        DeletionBatchResult result = deleteBatch(generation.id(), batch);
+                        deleted += result.deleted();
+                        deferredHolds += result.held();
+                        batch.clear();
+                    }
+                }
+                if (!batch.isEmpty()) {
                     DeletionBatchResult result = deleteBatch(generation.id(), batch);
                     deleted += result.deleted();
                     deferredHolds += result.held();
-                    batch.clear();
                 }
-            }
-            if (!batch.isEmpty()) {
-                DeletionBatchResult result = deleteBatch(generation.id(), batch);
-                deleted += result.deleted();
-                deferredHolds += result.held();
             }
         } catch (Exception e) {
             catalog.recordVerification(generation.id(), "HOT_DELETE", false,

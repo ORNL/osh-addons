@@ -34,7 +34,7 @@ import java.util.zip.GZIPOutputStream;
 public final class ArchiveExporter {
     private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create();
     private static final int FETCH_SIZE = 5_000;
-    private static final int DUCKDB_INSERT_BATCH_SIZE = 500;
+    private static final int DUCKDB_INSERT_BATCH_SIZE = 250;
     public static final long ESTIMATED_FIXED_BYTES_PER_ROW = 128L;
 
     private final SqlConnectionProvider postgres;
@@ -222,8 +222,8 @@ public final class ArchiveExporter {
                     "AND d.data->>'outputName' = ANY (?) " +
                     "ORDER BY o.phenomenontime, o.id LIMIT ?";
             try (PreparedStatement read = source.prepareStatement(query);
-                 PreparedStatement insert = duck.prepareStatement(
-                         "INSERT INTO archive_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+                 PreparedStatement fullBatchInsert = duck.prepareStatement(
+                         multiRowInsertSql(DUCKDB_INSERT_BATCH_SIZE))) {
                 read.setFetchSize(FETCH_SIZE);
                 int parameter = 1;
                 if (config.isParquetPrimary()) {
@@ -241,6 +241,7 @@ public final class ArchiveExporter {
                 // the next cycle creates a normal same-window revision for
                 // the remaining unowned rows.
                 read.setInt(parameter, config.maximumRowsPerGeneration);
+                List<StagedArchiveRow> batch = new ArrayList<>(DUCKDB_INSERT_BATCH_SIZE);
                 try (ResultSet rows = read.executeQuery()) {
                     while (rows.next()) {
                         long id = rows.getLong(1);
@@ -256,47 +257,25 @@ public final class ArchiveExporter {
                         }
                         uncompressedBytes += rowBytes;
                         count++;
-                        insert.setInt(1, idScope);
-                        insert.setLong(2, id);
-                        insert.setInt(3, idScope);
-                        insert.setLong(4, dataStreamId);
-                        if (foiId == null) {
-                            insert.setNull(5, java.sql.Types.INTEGER);
-                            insert.setNull(6, java.sql.Types.BIGINT);
-                        } else {
-                            insert.setInt(5, idScope);
-                            insert.setLong(6, foiId);
-                        }
                         Instant phenomenonTime = UtcJdbcTime.getInstant(rows, 4);
                         Instant resultTime = UtcJdbcTime.getInstant(rows, 5);
-                        if (phenomenonTime == null)
-                            insert.setNull(7, java.sql.Types.TIMESTAMP);
-                        else
-                            UtcJdbcTime.setDuckDbInstant(insert, 7, phenomenonTime);
-                        if (resultTime == null)
-                            insert.setNull(8, java.sql.Types.TIMESTAMP);
-                        else
-                            UtcJdbcTime.setDuckDbInstant(insert, 8, resultTime);
-                        insert.setString(9, resultJson);
-                        insert.setInt(10, 1);
-                        insert.setString(11, profile);
-                        insert.addBatch();
+                        batch.add(new StagedArchiveRow(
+                                id, dataStreamId, foiId, phenomenonTime, resultTime, resultJson));
                         minId = Math.min(minId, id);
                         maxId = Math.max(maxId, id);
                         schemaIds.put(dataStreamId, Boolean.TRUE);
-                        if (count % DUCKDB_INSERT_BATCH_SIZE == 0) {
-                            executeInsertBatch(insert, count);
-                            // JDBC does not require executeBatch() to discard
-                            // the submitted commands.  DuckDB retains them,
-                            // so an explicit clear prevents quadratic replay
-                            // and native-memory growth across flushes.
-                            insert.clearBatch();
+                        if (batch.size() == DUCKDB_INSERT_BATCH_SIZE) {
+                            executeMultiRowInsert(fullBatchInsert, batch, profile, count);
+                            batch.clear();
                         }
                     }
                 }
-                if (count % DUCKDB_INSERT_BATCH_SIZE != 0) {
-                    executeInsertBatch(insert, count);
-                    insert.clearBatch();
+                if (!batch.isEmpty()) {
+                    try (PreparedStatement remainderInsert = duck.prepareStatement(
+                            multiRowInsertSql(batch.size()))) {
+                        executeMultiRowInsert(remainderInsert, batch, profile, count);
+                    }
+                    batch.clear();
                 }
                 schemas = loadSchemas(source, new ArrayList<>(schemaIds.keySet()));
             } finally {
@@ -304,24 +283,67 @@ public final class ArchiveExporter {
             }
 
             if (count > 0) {
-                String path = sqlLiteral(target.toString());
+                Path stagedParquet = duckSession.operationDirectory().resolve("export.parquet");
+                String path = sqlLiteral(stagedParquet.toString());
                 try (java.sql.Statement copy = duck.createStatement()) {
                     copy.execute("COPY (SELECT * FROM archive_rows ORDER BY datastream_id, phenomenon_time, result_time, id_value) " +
                             "TO '" + path + "' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL " +
                             config.zstdCompressionLevel + ", ROW_GROUP_SIZE 122880)");
                 }
+                copyBounded(stagedParquet, target);
             }
         }
         return new ExportStats(count, minId, maxId, schemas);
     }
 
-    private static void executeInsertBatch(PreparedStatement insert, long rowCount)
+    private record StagedArchiveRow(long id, long dataStreamId, Long foiId,
+                                    Instant phenomenonTime, Instant resultTime,
+                                    String resultJson) {}
+
+    private static String multiRowInsertSql(int rowCount) {
+        StringBuilder sb = new StringBuilder(32 + rowCount * 36);
+        sb.append("INSERT INTO archive_rows VALUES ");
+        for (int i = 0; i < rowCount; i++) {
+            if (i > 0)
+                sb.append(',');
+            sb.append("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        }
+        return sb.toString();
+    }
+
+    private void executeMultiRowInsert(PreparedStatement insert, List<StagedArchiveRow> batch,
+                                       String profile, long totalRowCount)
             throws java.sql.SQLException {
         try {
-            insert.executeBatch();
+            int p = 1;
+            for (StagedArchiveRow row : batch) {
+                insert.setInt(p++, idScope);
+                insert.setLong(p++, row.id());
+                insert.setInt(p++, idScope);
+                insert.setLong(p++, row.dataStreamId());
+                if (row.foiId() == null) {
+                    insert.setNull(p++, java.sql.Types.INTEGER);
+                    insert.setNull(p++, java.sql.Types.BIGINT);
+                } else {
+                    insert.setInt(p++, idScope);
+                    insert.setLong(p++, row.foiId());
+                }
+                if (row.phenomenonTime() == null)
+                    insert.setNull(p++, java.sql.Types.TIMESTAMP);
+                else
+                    UtcJdbcTime.setDuckDbInstant(insert, p++, row.phenomenonTime());
+                if (row.resultTime() == null)
+                    insert.setNull(p++, java.sql.Types.TIMESTAMP);
+                else
+                    UtcJdbcTime.setDuckDbInstant(insert, p++, row.resultTime());
+                insert.setString(p++, row.resultJson());
+                insert.setInt(p++, 1);
+                insert.setString(p++, profile);
+            }
+            insert.executeUpdate();
         } catch (java.sql.SQLException error) {
             throw new java.sql.SQLException(
-                    "DuckDB archive staging failed after " + rowCount + " source rows: " +
+                    "DuckDB archive staging failed after " + totalRowCount + " source rows: " +
                             error.getMessage(), error.getSQLState(), error.getErrorCode(), error);
         }
     }
@@ -337,13 +359,15 @@ public final class ArchiveExporter {
     }
 
     private void verifyParquet(Path parquet, ExportStats expected) throws Exception {
-        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "export-verify");
-             java.sql.Statement statement = duckSession.connection().createStatement();
-             ResultSet result = statement.executeQuery("SELECT count(*), min(id_value), max(id_value) FROM read_parquet('" +
-                     sqlLiteral(parquet.toString()) + "')")) {
-            if (!result.next() || result.getLong(1) != expected.rowCount ||
-                    result.getLong(2) != expected.minimumId || result.getLong(3) != expected.maximumId)
-                throw new IOException("Parquet verification count/range mismatch");
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "export-verify")) {
+            Path localParquet = stageToLocalDirectory(parquet, duckSession.operationDirectory(), "verify.parquet");
+            try (java.sql.Statement statement = duckSession.connection().createStatement();
+                 ResultSet result = statement.executeQuery("SELECT count(*), min(id_value), max(id_value) FROM read_parquet('" +
+                         sqlLiteral(localParquet.toString()) + "')")) {
+                if (!result.next() || result.getLong(1) != expected.rowCount ||
+                        result.getLong(2) != expected.minimumId || result.getLong(3) != expected.maximumId)
+                    throw new IOException("Parquet verification count/range mismatch");
+            }
         }
     }
 
@@ -433,6 +457,46 @@ public final class ArchiveExporter {
                 while ((read = input.read(buffer)) >= 0)
                     if (read > 0) digest.update(buffer, 0, read);
                 return HexFormat.of().formatHex(digest.digest());
+            } catch (IOException error) {
+                if (attempt >= SHA256_TRANSIENT_ALLOCATION_RETRIES ||
+                        !isTransientAllocationIoError(error)) {
+                    throw error;
+                }
+                Thread.sleep(20L * attempt);
+            }
+        }
+    }
+
+    /**
+     * Copies a Parquet object into or out of a session-private local directory
+     * using {@link #SHA256_READ_BUFFER_BYTES} (16 KiB) syscalls so DuckDB native
+     * C++ {@code pread}/{@code write} operations never issue 64 KiB+ order-4 page
+     * allocations across a Windows WSL 2 {@code 9p}/{@code drvfs} bind mount.
+     */
+    static Path stageToLocalDirectory(Path source, Path operationDirectory, String fileName) throws Exception {
+        Path staged = operationDirectory.resolve(fileName).normalize();
+        if (!staged.getParent().equals(operationDirectory.normalize()))
+            throw new IllegalArgumentException("Staged Parquet filename escaped operation directory");
+        copyBounded(source, staged);
+        return staged;
+    }
+
+    static void copyBounded(Path source, Path target) throws Exception {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                Files.deleteIfExists(target);
+                try (var input = Files.newInputStream(source);
+                     var output = Files.newOutputStream(target,
+                             StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                    byte[] buffer = new byte[SHA256_READ_BUFFER_BYTES];
+                    int read;
+                    while ((read = input.read(buffer)) >= 0) {
+                        if (read > 0)
+                            output.write(buffer, 0, read);
+                    }
+                    output.flush();
+                }
+                return;
             } catch (IOException error) {
                 if (attempt >= SHA256_TRANSIENT_ALLOCATION_RETRIES ||
                         !isTransientAllocationIoError(error)) {

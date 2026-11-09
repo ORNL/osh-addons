@@ -172,9 +172,16 @@ public class TieredArchiveConfig {
     @DisplayInfo(label = "ZSTD compression level")
     public int zstdCompressionLevel = 6;
 
+    private static final List<String> LEGACY_DEFAULT_OUTPUT_NAMES = List.of(
+            "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron");
+
+    private static final List<String> DEFAULT_OUTPUT_NAMES = List.of(
+            "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
+            "speed", "backgroundReport", "foregroundReport", "status",
+            "emlContextual", "emlScanContextual", "emlAnalysis");
+
     @DisplayInfo(label = "Archive output names", desc = "Only high-volume raw/rollup streams are cold-tiered by default")
-    public List<String> outputNames = new ArrayList<>(Arrays.asList(
-            "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron"));
+    public List<String> outputNames = new ArrayList<>(DEFAULT_OUTPUT_NAMES);
 
     /**
      * Returns the actual source-payload budget for one Parquet generation.
@@ -266,6 +273,8 @@ public class TieredArchiveConfig {
             throw new IllegalArgumentException(
                     "PARQUET_PRIMARY requires maximumVerificationsPerCycle to be at least " +
                             "maximumGenerationsPerCycle so parity backlog cannot grow by configuration");
+        if (outputNames != null && outputNames.equals(LEGACY_DEFAULT_OUTPUT_NAMES))
+            outputNames = new ArrayList<>(DEFAULT_OUTPUT_NAMES);
         if (isParquetPrimary() && (outputNames == null || outputNames.isEmpty()))
             throw new IllegalArgumentException("At least one immutable archive output name is required");
         if (isParquetPrimary() && outputNames.stream().anyMatch(name -> name == null || name.isBlank()))
