@@ -231,6 +231,9 @@ public class TestArchiveLifecycleInvariants {
         ResultSet emptyResult = (ResultSet) Proxy.newProxyInstance(getClass().getClassLoader(),
                 new Class<?>[]{ResultSet.class}, (proxy, method, arguments) ->
                         method.getName().equals("next") ? false : defaultValue(method.getReturnType()));
+        ResultSet schemaExistsResult = (ResultSet) Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{ResultSet.class}, (proxy, method, arguments) ->
+                        method.getName().equals("next") ? true : defaultValue(method.getReturnType()));
         SqlConnectionProvider provider = () -> (Connection) Proxy.newProxyInstance(
                 getClass().getClassLoader(),
                 new Class<?>[]{Connection.class}, (proxy, method, arguments) -> switch (method.getName()) {
@@ -239,9 +242,14 @@ public class TestArchiveLifecycleInvariants {
                         yield array;
                     }
                     case "prepareStatement" -> {
-                        capturedSql.add((String) arguments[0]);
+                        String sqlText = (String) arguments[0];
+                        boolean isSchemaPrecheck = sqlText.startsWith(
+                                "SELECT 1 FROM oscar_archive_schema WHERE datastream_id=ANY");
                         List<Object> binds = new ArrayList<>();
-                        capturedBinds.add(binds);
+                        if (!isSchemaPrecheck) {
+                            capturedSql.add(sqlText);
+                            capturedBinds.add(binds);
+                        }
                         yield Proxy.newProxyInstance(getClass().getClassLoader(),
                                 new Class<?>[]{PreparedStatement.class},
                                 (stmtProxy, stmtMethod, stmtArgs) -> switch (stmtMethod.getName()) {
@@ -252,7 +260,7 @@ public class TestArchiveLifecycleInvariants {
                                         binds.set(index - 1, stmtArgs[1]);
                                         yield null;
                                     }
-                                    case "executeQuery" -> emptyResult;
+                                    case "executeQuery" -> isSchemaPrecheck ? schemaExistsResult : emptyResult;
                                     default -> defaultValue(stmtMethod.getReturnType());
                                 });
                     }
