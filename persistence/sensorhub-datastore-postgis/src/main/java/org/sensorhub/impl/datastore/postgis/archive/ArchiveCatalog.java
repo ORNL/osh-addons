@@ -282,7 +282,8 @@ public final class ArchiveCatalog {
                         "window_start timestamptz NOT NULL, window_end timestamptz NOT NULL, state text NOT NULL, " +
                         "object_path text NOT NULL, manifest_path text NOT NULL, sha256 text NOT NULL, row_count bigint NOT NULL, " +
                         "min_id bigint NOT NULL, max_id bigint NOT NULL, parity_verified boolean NOT NULL DEFAULT false, " +
-                        "activated_at timestamptz NOT NULL DEFAULT now(), sealed_at timestamptz, max_result_time timestamptz)");
+                        "activated_at timestamptz NOT NULL DEFAULT now(), sealed_at timestamptz, " +
+                        "max_result_time timestamptz, min_result_time timestamptz)");
                 statement.execute("ALTER TABLE oscar_archive_job ADD COLUMN IF NOT EXISTS revision integer NOT NULL DEFAULT 1");
                 statement.execute("ALTER TABLE oscar_archive_job ADD COLUMN IF NOT EXISTS store_key text NOT NULL DEFAULT 'legacy'");
                 statement.execute("ALTER TABLE oscar_archive_job ADD COLUMN IF NOT EXISTS id_scope integer NOT NULL DEFAULT -1");
@@ -291,6 +292,9 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_archive_generation ADD COLUMN IF NOT EXISTS store_key text NOT NULL DEFAULT 'legacy'");
                 statement.execute("ALTER TABLE oscar_archive_generation ADD COLUMN IF NOT EXISTS id_scope integer NOT NULL DEFAULT -1");
                 statement.execute("ALTER TABLE oscar_archive_generation ADD COLUMN IF NOT EXISTS max_result_time timestamptz");
+                statement.execute("ALTER TABLE oscar_archive_generation ADD COLUMN IF NOT EXISTS min_result_time timestamptz");
+                statement.execute("UPDATE oscar_archive_generation SET min_result_time = LEAST(window_start, max_result_time) " +
+                        "WHERE min_result_time IS NULL AND max_result_time IS NOT NULL");
                 statement.execute("ALTER TABLE oscar_archive_generation ALTER COLUMN store_key DROP DEFAULT");
                 statement.execute("ALTER TABLE oscar_archive_generation ALTER COLUMN id_scope DROP DEFAULT");
                 statement.execute("ALTER TABLE oscar_archive_job DROP CONSTRAINT IF EXISTS oscar_archive_job_profile_window_start_window_end_key");
@@ -306,6 +310,8 @@ public final class ArchiveCatalog {
                         "(store_key, id_scope, window_start, window_end) WHERE state IN ('ACTIVE','SEALED')");
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_archive_generation_result_time_idx ON oscar_archive_generation " +
                         "(store_key, id_scope, max_result_time) WHERE state IN ('ACTIVE','SEALED')");
+                statement.execute("CREATE INDEX IF NOT EXISTS oscar_archive_generation_min_result_time_idx ON oscar_archive_generation " +
+                        "(store_key, id_scope, min_result_time) WHERE state IN ('ACTIVE','SEALED')");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_archive_object (" +
                         "generation_id uuid NOT NULL REFERENCES oscar_archive_generation(id) ON DELETE CASCADE, " +
                         "relative_path text NOT NULL, kind text NOT NULL, sha256 text NOT NULL, bytes bigint NOT NULL, " +
@@ -971,7 +977,9 @@ public final class ArchiveCatalog {
             try {
                 String observations = safeIdentifier(observationTable);
                 String dataStreams = safeIdentifier(dataStreamTable);
-                Instant maxResultTime = stageExportedRows(connection, parquetPath, generation);
+                ResultTimeBounds resultTimeBounds = stageExportedRows(connection, parquetPath, generation);
+                Instant maxResultTime = resultTimeBounds.maxResultTime();
+                Instant minResultTime = resultTimeBounds.minResultTime();
                 // Staging does not touch mutable PostgreSQL rows.  Acquire the
                 // exclusive store lock only for the activation transaction's
                 // critical section so ordinary ingestion is not blocked by
@@ -1006,8 +1014,8 @@ public final class ArchiveCatalog {
                             generation.rowCount() + " exact rows but marked " + marked);
                 try (PreparedStatement statement = connection.prepareStatement(
                         "INSERT INTO oscar_archive_generation(id, job_id, store_key, id_scope, profile, window_start, window_end, state, " +
-                                "object_path, manifest_path, sha256, row_count, min_id, max_id, max_result_time) " +
-                                "VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?)")) {
+                                "object_path, manifest_path, sha256, row_count, min_id, max_id, max_result_time, min_result_time) " +
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?)")) {
                     statement.setObject(1, generation.id());
                     statement.setObject(2, jobId);
                     statement.setString(3, storeKey);
@@ -1025,6 +1033,10 @@ public final class ArchiveCatalog {
                         statement.setNull(14, Types.TIMESTAMP_WITH_TIMEZONE);
                     else
                         UtcJdbcTime.setInstant(statement, 14, maxResultTime);
+                    if (minResultTime == null)
+                        statement.setNull(15, Types.TIMESTAMP_WITH_TIMEZONE);
+                    else
+                        UtcJdbcTime.setInstant(statement, 15, minResultTime);
                     statement.executeUpdate();
                 }
                 try (PreparedStatement statement = connection.prepareStatement(
@@ -1182,6 +1194,8 @@ public final class ArchiveCatalog {
         return union.append(") o").toString();
     }
 
+    private record ResultTimeBounds(Instant minResultTime, Instant maxResultTime) {}
+
     /**
      * Streams the immutable export back into a transaction-local relation.
      * Activation can then compare every mutable source value instead of
@@ -1189,8 +1203,8 @@ public final class ArchiveCatalog {
      * Keeping the ledger in PostgreSQL also lets the final UPDATE lock and
      * recheck each live tuple atomically under normal READ COMMITTED rules.
      */
-    private Instant stageExportedRows(Connection postgres, Path parquetPath,
-                                      ArchiveGeneration generation) throws Exception {
+    private ResultTimeBounds stageExportedRows(Connection postgres, Path parquetPath,
+                                               ArchiveGeneration generation) throws Exception {
         try (Statement create = postgres.createStatement()) {
             create.execute("CREATE TEMP TABLE oscar_archive_activation_row (" +
                     "observation_id bigint PRIMARY KEY, datastream_id bigint NOT NULL, foi_id bigint, " +
@@ -1204,6 +1218,7 @@ public final class ArchiveCatalog {
         long minimumId = Long.MAX_VALUE;
         long maximumId = Long.MIN_VALUE;
         Instant maxResultTime = generation.maxResultTime();
+        Instant minResultTime = generation.minResultTime();
         try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(
                 resourceConfig, "activation-stage")) {
             Path localParquet = ArchiveExporter.stageToLocalDirectory(
@@ -1246,8 +1261,12 @@ public final class ArchiveCatalog {
                     else
                         UtcJdbcTime.setInstant(stage, 5, resultTime);
                     Instant candidateResultTime = resultTime != null ? resultTime : phenomenonTime;
-                    if (candidateResultTime != null && (maxResultTime == null || candidateResultTime.isAfter(maxResultTime)))
-                        maxResultTime = candidateResultTime;
+                    if (candidateResultTime != null) {
+                        if (maxResultTime == null || candidateResultTime.isAfter(maxResultTime))
+                            maxResultTime = candidateResultTime;
+                        if (minResultTime == null || candidateResultTime.isBefore(minResultTime))
+                            minResultTime = candidateResultTime;
+                    }
                     String resultJson = rows.getString(9);
                     if (resultJson == null)
                         stage.setNull(6, Types.VARCHAR);
@@ -1270,7 +1289,7 @@ public final class ArchiveCatalog {
         try (Statement analyze = postgres.createStatement()) {
             analyze.execute("ANALYZE oscar_archive_activation_row");
         }
-        return maxResultTime;
+        return new ResultTimeBounds(minResultTime, maxResultTime);
     }
 
     private void populateGenerationSummariesAndLatest(
@@ -1473,17 +1492,24 @@ public final class ArchiveCatalog {
     public List<ArchiveGeneration> candidates(Instant start, Instant end, Long observationId,
                                               Long minObservationId, Long maxObservationId,
                                               Set<Long> dataStreams) {
-        return candidates(start, end, observationId, minObservationId, maxObservationId, dataStreams, null);
+        return candidates(start, end, observationId, minObservationId, maxObservationId, dataStreams, null, null);
     }
 
     public List<ArchiveGeneration> candidates(Instant start, Instant end, Long observationId,
                                               Long minObservationId, Long maxObservationId,
                                               Set<Long> dataStreams, Instant minResultTime) {
+        return candidates(start, end, observationId, minObservationId, maxObservationId, dataStreams, minResultTime, null);
+    }
+
+    public List<ArchiveGeneration> candidates(Instant start, Instant end, Long observationId,
+                                              Long minObservationId, Long maxObservationId,
+                                              Set<Long> dataStreams, Instant minResultTime,
+                                              Instant maxResultTime) {
         if (dataStreams != null && dataStreams.isEmpty())
             return List.of();
         try (Connection connection = connections.open()) {
             return candidates(connection, start, end, observationId,
-                    minObservationId, maxObservationId, dataStreams, minResultTime);
+                    minObservationId, maxObservationId, dataStreams, minResultTime, maxResultTime);
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot plan archive query", e);
         }
@@ -1497,7 +1523,7 @@ public final class ArchiveCatalog {
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
                                                Instant end, Long observationId)
             throws SQLException {
-        return candidates(connection, start, end, observationId, null, null, null, null);
+        return candidates(connection, start, end, observationId, null, null, null, null, null);
     }
 
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
@@ -1506,13 +1532,23 @@ public final class ArchiveCatalog {
                                                Set<Long> dataStreams)
             throws SQLException {
         return candidates(connection, start, end, observationId,
-                minObservationId, maxObservationId, dataStreams, null);
+                minObservationId, maxObservationId, dataStreams, null, null);
     }
 
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
                                                Instant end, Long observationId,
                                                Long minObservationId, Long maxObservationId,
                                                Set<Long> dataStreams, Instant minResultTime)
+            throws SQLException {
+        return candidates(connection, start, end, observationId,
+                minObservationId, maxObservationId, dataStreams, minResultTime, null);
+    }
+
+    public List<ArchiveGeneration> candidates(Connection connection, Instant start,
+                                               Instant end, Long observationId,
+                                               Long minObservationId, Long maxObservationId,
+                                               Set<Long> dataStreams, Instant minResultTime,
+                                               Instant maxResultTime)
             throws SQLException {
         if (dataStreams != null && dataStreams.isEmpty())
             return List.of();
@@ -1521,7 +1557,7 @@ public final class ArchiveCatalog {
         boolean filterDataStreams = dataStreams != null;
         String sql = (observationId != null ? "SELECT DISTINCT " : "SELECT ") +
                 "g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
-                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
                 "FROM oscar_archive_generation g ";
         if (observationId != null)
             sql += "JOIN oscar_archive_id_block b ON b.generation_id=g.id ";
@@ -1529,6 +1565,8 @@ public final class ArchiveCatalog {
                 "AND g.window_start < ? AND g.window_end > ? ";
         if (minResultTime != null)
             sql += "AND (g.max_result_time IS NULL OR g.max_result_time >= ?) ";
+        if (maxResultTime != null)
+            sql += "AND (g.min_result_time IS NULL OR g.min_result_time <= ?) ";
         if (observationId != null)
             sql += "AND ? BETWEEN b.min_id AND b.max_id ";
         if (filterIdRange)
@@ -1561,6 +1599,8 @@ public final class ArchiveCatalog {
                 UtcJdbcTime.setInstant(statement, parameter++, start);
                 if (minResultTime != null)
                     UtcJdbcTime.setInstant(statement, parameter++, minResultTime);
+                if (maxResultTime != null)
+                    UtcJdbcTime.setInstant(statement, parameter++, maxResultTime);
                 if (observationId != null)
                     statement.setLong(parameter++, observationId);
                 if (filterIdRange) {
@@ -1590,7 +1630,7 @@ public final class ArchiveCatalog {
      */
     public List<ArchiveGeneration> candidatesPotentiallyNewerThanResultTime(
             Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime) {
-        return candidates(start, end, null, null, null, dataStreams, minResultTime);
+        return candidates(start, end, null, null, null, dataStreams, minResultTime, null);
     }
 
     /**
@@ -1602,12 +1642,14 @@ public final class ArchiveCatalog {
             return;
         try (Connection connection = connections.open();
              PreparedStatement statement = connection.prepareStatement(
-                     "UPDATE oscar_archive_generation SET max_result_time=? " +
+                     "UPDATE oscar_archive_generation SET max_result_time=?, " +
+                             "min_result_time=COALESCE(min_result_time, LEAST(window_start, ?)) " +
                              "WHERE id=? AND store_key=? AND id_scope=? AND max_result_time IS NULL")) {
             UtcJdbcTime.setInstant(statement, 1, maxResultTime);
-            statement.setObject(2, generationId);
-            statement.setString(3, storeKey);
-            statement.setInt(4, idScope);
+            UtcJdbcTime.setInstant(statement, 2, maxResultTime);
+            statement.setObject(3, generationId);
+            statement.setString(4, storeKey);
+            statement.setInt(5, idScope);
             statement.executeUpdate();
         } catch (SQLException ignored) {
             // Best-effort metadata cache persistence; in-memory SHA-256 cache remains authoritative.
@@ -1626,12 +1668,18 @@ public final class ArchiveCatalog {
     public InitialCandidateBatch candidatesInitialClusters(
             Instant start, Instant end, Set<Long> dataStreams,
             boolean descending, int batchLimit) {
-        return candidatesInitialClusters(start, end, dataStreams, null, descending, batchLimit);
+        return candidatesInitialClusters(start, end, dataStreams, null, null, descending, batchLimit);
     }
 
     public InitialCandidateBatch candidatesInitialClusters(
             Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime,
             boolean descending, int batchLimit) {
+        return candidatesInitialClusters(start, end, dataStreams, minResultTime, null, descending, batchLimit);
+    }
+
+    public InitialCandidateBatch candidatesInitialClusters(
+            Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime,
+            Instant maxResultTime, boolean descending, int batchLimit) {
         if (batchLimit < 2)
             throw new IllegalArgumentException("Candidate batch limit must be at least 2");
         if (dataStreams != null && dataStreams.isEmpty())
@@ -1641,12 +1689,14 @@ public final class ArchiveCatalog {
                 ? "ORDER BY g.window_end DESC, g.window_start DESC, g.id ASC LIMIT ?"
                 : "ORDER BY g.window_start ASC, g.window_end ASC, g.id ASC LIMIT ?";
         String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
-                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
                 "FROM oscar_archive_generation g " +
                 "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
                 "AND g.window_start < ? AND g.window_end > ? ";
         if (minResultTime != null)
             sql += "AND (g.max_result_time IS NULL OR g.max_result_time >= ?) ";
+        if (maxResultTime != null)
+            sql += "AND (g.min_result_time IS NULL OR g.min_result_time <= ?) ";
         if (filterDataStreams)
             sql += "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
                     "WHERE s.generation_id=g.id AND s.datastream_id=ANY (?::bigint[])) ";
@@ -1676,6 +1726,8 @@ public final class ArchiveCatalog {
                     UtcJdbcTime.setInstant(statement, parameter++, start);
                     if (minResultTime != null)
                         UtcJdbcTime.setInstant(statement, parameter++, minResultTime);
+                    if (maxResultTime != null)
+                        UtcJdbcTime.setInstant(statement, parameter++, maxResultTime);
                     if (streamArray != null)
                         statement.setArray(parameter++, streamArray);
                     statement.setInt(parameter, Math.addExact(batchLimit, 1));
@@ -1715,7 +1767,7 @@ public final class ArchiveCatalog {
         }
         if (clusters.size() < 2) {
             List<ArchiveGeneration> all = candidates(
-                    start, end, null, null, null, dataStreams, minResultTime);
+                    start, end, null, null, null, dataStreams, minResultTime, maxResultTime);
             return new InitialCandidateBatch(all, true);
         }
         List<List<ArchiveGeneration>> completeClusters = descending
@@ -1838,7 +1890,7 @@ public final class ArchiveCatalog {
         }
         List<ArchiveGeneration> pending = new ArrayList<>();
         String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
-                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
                 "FROM oscar_archive_generation g " +
                 "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
                 "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
@@ -1866,7 +1918,21 @@ public final class ArchiveCatalog {
                     Path parquetPath = normalizedRoot.resolve(generation.objectPath()).normalize();
                     if (!parquetPath.startsWith(normalizedRoot))
                         throw new IllegalStateException("Archive object path escapes root");
-                    stageExportedRows(connection, parquetPath, generation);
+                    ResultTimeBounds bounds = stageExportedRows(connection, parquetPath, generation);
+                    if (bounds.minResultTime() != null || bounds.maxResultTime() != null) {
+                        try (PreparedStatement updateBounds = connection.prepareStatement(
+                                "UPDATE oscar_archive_generation " +
+                                        "SET min_result_time = COALESCE(min_result_time, ?), " +
+                                        "max_result_time = COALESCE(max_result_time, ?) " +
+                                        "WHERE id=? AND store_key=? AND id_scope=?")) {
+                            UtcJdbcTime.setInstant(updateBounds, 1, bounds.minResultTime());
+                            UtcJdbcTime.setInstant(updateBounds, 2, bounds.maxResultTime());
+                            updateBounds.setObject(3, generation.id());
+                            updateBounds.setString(4, storeKey);
+                            updateBounds.setInt(5, idScope);
+                            updateBounds.executeUpdate();
+                        }
+                    }
                     populateGenerationSummariesAndLatest(connection, generation);
                     connection.commit();
                     backfilled++;
@@ -1932,7 +1998,8 @@ public final class ArchiveCatalog {
                 result.getLong(9),
                 result.getString(10),
                 result.getBoolean(11),
-                UtcJdbcTime.getInstant(result, 12));
+                UtcJdbcTime.getInstant(result, 12),
+                UtcJdbcTime.getInstant(result, 13));
     }
 
     public Optional<Instant> latestWindowEnd(long dataStreamId) {
@@ -2065,7 +2132,7 @@ public final class ArchiveCatalog {
             throw new IllegalArgumentException("Hot-deletion generation limit must be positive");
         List<ArchiveGeneration> generations = new ArrayList<>();
         String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
-                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
                 "FROM oscar_archive_generation g WHERE g.store_key=? AND g.id_scope=? " +
                 "AND g.state='ACTIVE' AND g.parity_verified=true " +
                 "AND g.activated_at <= ? AND NOT EXISTS (SELECT 1 FROM oscar_retention_hold h " +
@@ -2090,7 +2157,7 @@ public final class ArchiveCatalog {
 
     public List<ArchiveGeneration> unverifiedGenerations(int limit) {
         List<ArchiveGeneration> generations = new ArrayList<>();
-        String sql = "SELECT id, profile, window_start, window_end, object_path, sha256, row_count, min_id, max_id, state, parity_verified, max_result_time " +
+        String sql = "SELECT id, profile, window_start, window_end, object_path, sha256, row_count, min_id, max_id, state, parity_verified, max_result_time, min_result_time " +
                 "FROM oscar_archive_generation WHERE store_key=? AND id_scope=? " +
                         "AND state='ACTIVE' AND parity_verified=false ORDER BY activated_at LIMIT ?";
         try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(sql)) {
@@ -2917,8 +2984,14 @@ public final class ArchiveCatalog {
         if (filter.isLatestTime() || filter.isCurrentTime())
             return false;
         Instant min = filter.getMin();
-        if (min != null && !Instant.MIN.equals(min))
-            return false;
+        if (min != null && !Instant.MIN.equals(min)) {
+            Instant minResult = generation.minResultTime();
+            if (minResult == null)
+                return false;
+            boolean lowerClosed = filter.getRange().lowerBoundType() == BoundType.CLOSED;
+            if (lowerClosed ? minResult.isBefore(min) : !minResult.isAfter(min))
+                return false;
+        }
         Instant max = filter.getMax();
         if (max != null && !Instant.MAX.equals(max)) {
             Instant maxResult = generation.maxResultTime();

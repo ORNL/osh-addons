@@ -4360,6 +4360,13 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertEquals(List.of(newerGen.id()),
                 catalog.candidatesInitialClusters(firstWindow, thirdWindow, streamSet, secondWindow, false, 8)
                         .generations().stream().map(ArchiveGeneration::id).toList());
+        // Upper-bound resultTime pruning (min_result_time <= maxResultTime) must exclude newerGen.
+        assertEquals(List.of(olderGen.id()),
+                catalog.candidates(firstWindow, thirdWindow, null, null, null, streamSet, firstWindow, secondWindow.minusSeconds(1))
+                        .stream().map(ArchiveGeneration::id).toList());
+        assertEquals(List.of(olderGen.id()),
+                catalog.candidatesInitialClusters(firstWindow, thirdWindow, streamSet, firstWindow, secondWindow.minusSeconds(1), false, 8)
+                        .generations().stream().map(ArchiveGeneration::id).toList());
 
         // Simulate a pre-3.11.0 upgraded generation row with NULL max_result_time.
         try (Connection connection = open();
