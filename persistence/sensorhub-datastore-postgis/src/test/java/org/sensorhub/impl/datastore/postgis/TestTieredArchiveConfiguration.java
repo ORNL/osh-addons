@@ -46,7 +46,12 @@ public class TestTieredArchiveConfiguration {
         assertTrue(config.duckDbSessionAcquireTimeoutSeconds > 0);
         assertFalse(config.duckDbTemporaryDirectory.isBlank());
         assertTrue(config.outputNames.contains("gammaCounts"));
-        assertFalse(config.outputNames.contains("occupancy"));
+        assertTrue(config.outputNames.contains("occupancy"));
+        assertTrue(config.outputNames.contains("adjudication"));
+        assertTrue(config.outputNames.contains("report"));
+        assertTrue(config.outputNames.contains("connectionStatus"));
+        assertTrue(config.outputNames.contains("occupancyStatus"));
+        assertFalse(config.outputNames.contains("sensorLocation"));
     }
 
     @Test

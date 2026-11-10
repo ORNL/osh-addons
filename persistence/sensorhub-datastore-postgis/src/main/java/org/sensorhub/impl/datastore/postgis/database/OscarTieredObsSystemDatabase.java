@@ -132,7 +132,15 @@ public class OscarTieredObsSystemDatabase extends PostgisObsSystemDatabase {
                 break;
         }
         if (drainedLegacyAny && !store.stageLegacyAllowlistedRowsBatch()) {
+            store.compactDrainedMutableHotTables();
             store.reindexMutableHotTables();
+        }
+        if (commandStore != null) {
+            int prunedCommands = commandStore.purgeCompletedTransientCommandsBefore(
+                    Instant.now().minus(24, ChronoUnit.HOURS));
+            if (prunedCommands > 0) {
+                getLogger().info("Pruned {} completed transient command(s) older than 24 hours", prunedCommands);
+            }
         }
         if (archive.isParquetPrimary()) {
             store.getOldestImmutableStageReceipt().ifPresent(oldest -> {

@@ -9,14 +9,21 @@ fresh OSCAR databases. Ordinary PostGIS stores and the default
 - PostgreSQL provides a short-lived, crash-recoverable landing tier. A write becomes durable
   when the normal OSH store `commit()` completes; `add()` alone is not a
   durability boundary because the batch store intentionally buffers writes.
-- Only output names in `archive.outputNames` are eligible. In primary mode this
-  list must contain only streams that are immutable once committed. Mutable or
-  open occupancy, alarm, and adjudication workflow state must remain in
-  PostgreSQL. The storage class is recorded when a datastream first receives a
+- Only output names in `archive.outputNames` are eligible (by default all 21
+  operational and evidentiary streams: `gammaCounts`, `gammaThreshold`,
+  `neutronCounts`, `setupGamma`, `setupNeutron`, `speed`, `backgroundReport`,
+  `foregroundReport`, `status`, `emlContextual`, `emlScanContextual`,
+  `emlAnalysis`, `dailyFile`, `connectionStatus`, `occupancyStatus`, `tamper`,
+  `occupancy`, `adjudication`, `report`, `siteStatistics`, `nationalSummary`).
+  Static singleton configuration streams (`sensorLocation`, `adjudicationCodes`,
+  `siteInfo`) remain in `ONLY oscar.obs`. Mutations to archived observations
+  (such as appending an adjudication ID onto an archived `occupancy` row) are
+  recorded in `oscar_obs_overlay` and synchronized with `oscar_obs_latest`.
+  The storage class is recorded when a datastream first receives a
   row; changing that datastream ID between mutable and immutable classes is
-  rejected. Use a new datastream version/ID for such a schema change. Export
-  selects physical stage membership rather than re-reading a mutable output
-  name, so a later label edit cannot strand already accepted raw rows.
+  rejected. Export selects physical stage membership rather than re-reading a
+  mutable output name, so a later label edit cannot strand already accepted
+  rows.
 - Allowlisted rows are routed at receipt into LOGGED, UTC-aligned physical
   staging children keyed by detector phenomenon time. PostgreSQL records a
   separate server-side `received_at` timestamp, so a late historical sample is
@@ -55,6 +62,19 @@ fresh OSCAR databases. Ordinary PostGIS stores and the default
   short lock timeout rather than blocking ingestion.
 - Mixed hot/cold queries, mutation overlays, tombstones, stable observation
   IDs, and late-arrival revisions continue to use the existing tiered reader.
+  `oscar_obs_latest` maintains the newest observation per datastream in
+  PostgreSQL so `resultTime=latest` / `phenomenonTime=latest` lookups return in
+  `< 1 ms` even when a sparse stream has no row in the active 30-minute stage
+  window. `oscar_archive_schema` stores 16 per-generation, per-datastream
+  summary counters (`row_count`, `gamma_alarm_count`, `neutron_alarm_count`,
+  `gamma_neutron_alarm_count`, `any_alarm_count`, `non_alarm_count`,
+  `unadjudicated_alarm_count`, `eml_non_threat_count`,
+  `extended_occupancy_gamma_count`, `fault_gamma_high_count`,
+  `fault_gamma_low_count`, `fault_neutron_high_count`, `fault_tamper_count`,
+  `fault_extended_occupancy_count`, `tamper_true_count`, `summary_populated`)
+  and `oscar_event_locator` indexes `event_id` so `StatisticsOutput`, Dashboard
+  alarm badges, and Event Log counts sum interior unmutated generations in SQL
+  and prune zero-match generations without scanning Parquet files.
   A single-ID lookup first prunes the catalog through
   `oscar_archive_id_block`, then applies Parquet predicate pushdown; it does not
   scan every generation.
@@ -136,7 +156,23 @@ does not provide.
       "gammaThreshold",
       "neutronCounts",
       "setupGamma",
-      "setupNeutron"
+      "setupNeutron",
+      "speed",
+      "backgroundReport",
+      "foregroundReport",
+      "status",
+      "emlContextual",
+      "emlScanContextual",
+      "emlAnalysis",
+      "dailyFile",
+      "connectionStatus",
+      "occupancyStatus",
+      "tamper",
+      "occupancy",
+      "adjudication",
+      "report",
+      "siteStatistics",
+      "nationalSummary"
     ]
   }
 }

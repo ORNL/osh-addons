@@ -180,6 +180,10 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         return archiveConfig;
     }
 
+    public boolean isParquetPrimary() {
+        return archiveConfig.enabled && archiveConfig.isParquetPrimary();
+    }
+
     /**
      * Pins metadata already loaded by a coordinated datastream removal. Hot
      * observation decoding can then proceed while that metadata store's sole
@@ -224,6 +228,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         archiveLifecycle.maintain();
         if (immutableStage != null)
             immutableStage.retireVerifiedPartitions();
+        archiveCatalog.backfillGenerationSummariesBatch(Path.of(archiveConfig.rootDirectory), 25);
         long now = System.currentTimeMillis();
         long previous = lastMutableReindexEpochMillis.get();
         if (now - previous >= MUTABLE_INDEX_REINDEX_INTERVAL.toMillis() &&
@@ -242,6 +247,10 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
     public void reindexMutableHotTables() {
         archiveCatalog.reindexMutableTables(getDatastoreName(), getDataStreams().getDatastoreName());
+    }
+
+    public void compactDrainedMutableHotTables() {
+        archiveCatalog.compactDrainedParentTable(getDatastoreName(), getDataStreams().getDatastoreName());
     }
 
     /** Physical short-lived stage state exposed for health and regression probes. */
@@ -844,21 +853,22 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         Set<Long> dataStreams = related.dataStreams();
         Set<Long> fois = related.fois();
         ObsFilter resolvedFilter = related.filter();
+        long mutationCount = hasMutations ? archiveCatalog.countObservationMutations(dataStreams) : 0L;
+        boolean effectiveHasMutations = mutationCount > 0L;
         boolean parentTableOnly = isAllMutableOnlyDataStreams(dataStreams);
         boolean latest = hasLatestSelection(filter);
-        boolean pushDownLatest = latest && !hasMutations &&
+        boolean pushDownLatest = latest && !effectiveHasMutations &&
                 queryBuilder.supportsLatestResultPerDataStreamQuery(resolvedFilter);
 
         // The top N of a union can only contain rows from the top N of either
         // ordered tier. Both PostgreSQL and Parquet evaluate CQL predicates
         // before applying the tier limit, so CQL queries remain eligible for a
-        // bounded merge in the common mutation-free case. Fall back to an
-        // unbounded merge only when a Java value/spatial predicate, overlay,
-        // tombstone, or latest-per-stream reduction can invalidate a pre-limit
-        // row, while still starting keyset/mutation pages at an adaptive size.
+        // bounded merge in the common mutation-free case. When sparse mutations
+        // exist, at most mutationCount rows can be suppressed by excludeMutated,
+        // so saturateAdd(limit, mutationCount) preserves the bounded merge.
         boolean boundedMerge = !latest && filter.getLimit() != Long.MAX_VALUE &&
                 filter.getValuePredicate() == null &&
-                filter.getPhenomenonLocation() == null && !hasMutations;
+                filter.getPhenomenonLocation() == null;
         // Do not push the caller's final LIMIT into latest-per-stream tiers.
         // The PostgreSQL and Parquet plans already reduce to one row per
         // explicitly selected stream, but they order those rows differently
@@ -866,7 +876,9 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         // tier could discard a different stream that belongs in the union's
         // final top row. Leaving this small, stream-bounded candidate set
         // unbounded preserves the public ordering/limit contract.
-        long tierLimit = boundedMerge ? filter.getLimit() : Long.MAX_VALUE;
+        long tierLimit = boundedMerge
+                ? saturateAdd(filter.getLimit(), mutationCount)
+                : Long.MAX_VALUE;
         ObsFilter tierFilter = latest && !pushDownLatest ? withoutLatestSelection(resolvedFilter, tierLimit) :
                 ObsFilter.Builder.from(resolvedFilter).withLimit(tierLimit).build();
         Comparator<Entry<BigId, IObsData>> comparator = entryComparator(filter);
@@ -886,7 +898,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         if (parentTableOnly) {
             hot = super.selectEntries(tierFilter, (Set<ObsField>) null,
                     true, initialHotPageSize);
-            if (hasMutations)
+            if (effectiveHasMutations)
                 hot = excludeMutated(hot, entry -> entry.getKey().getIdAsLong(), mutationBatchSize);
             cold = Stream.empty();
         } else if (pushDownLatest && dataStreams != null && !dataStreams.isEmpty()) {
@@ -902,14 +914,14 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         } else {
             hot = super.selectEntries(tierFilter, (Set<ObsField>) null,
                     false, initialHotPageSize);
-            if (hasMutations)
+            if (effectiveHasMutations)
                 hot = excludeMutated(hot, entry -> entry.getKey().getIdAsLong(), mutationBatchSize);
             cold = streamColdBases(tierFilter, tierLimit,
-                    dataStreams, fois, hasMutations, mutationBatchSize);
+                    dataStreams, fois, effectiveHasMutations, mutationBatchSize);
         }
         Stream<Entry<BigId, IObsData>> overlays = parentTableOnly
                 ? Stream.empty()
-                : streamOverlays(tierFilter, dataStreams, fois, hasMutations);
+                : streamOverlays(tierFilter, dataStreams, fois, effectiveHasMutations);
 
         // Each source is already ordered by phenomenon time and ID. Merge it
         // lazily so cold payloads are never accumulated in a JVM collection.
@@ -1046,24 +1058,47 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             }
         }
 
+        List<Entry<BigId, IObsData>> cachedColdEntries = new ArrayList<>();
         if (!missingHotStreams.isEmpty()) {
             Set<Long> archivedMissingStreams = archiveCatalog.filterPresentDataStreams(
                     bounds.start(), bounds.end(), missingHotStreams);
             if (!archivedMissingStreams.isEmpty()) {
-                List<ArchiveGeneration> missingCandidates = archiveCatalog.candidates(
-                        bounds.start(), bounds.end(), null, null, null, archivedMissingStreams, minResultTime);
-                if (!missingCandidates.isEmpty()) {
-                    coldDataStreams.addAll(archivedMissingStreams);
-                    for (ArchiveGeneration generation : missingCandidates) {
-                        candidateById.put(generation.id(), generation);
-                        neededGenerationIds.add(generation.id());
+                Set<Long> unresolvedMissingStreams = new HashSet<>(archivedMissingStreams);
+                if (fois == null && minResultTime == null &&
+                        bounds.start().equals(MIN_ARCHIVE_TIME) &&
+                        bounds.end().equals(MAX_ARCHIVE_TIME)) {
+                    Map<Long, ArchiveCatalog.ArchivedOverlay> indexedLatest =
+                            archiveCatalog.loadVerifiedColdLatestByDataStream(idScope, archivedMissingStreams);
+                    for (Map.Entry<Long, ArchiveCatalog.ArchivedOverlay> entry : indexedLatest.entrySet()) {
+                        ArchiveCatalog.ArchivedOverlay latestCold = entry.getValue();
+                        ArchivedObservation obs = latestCold.observation();
+                        IObsData decoded = toObservation(latestCold.generationId(), latestCold.schemaJson(), obs);
+                        if (matchesObservation(filter, archivedMissingStreams, fois, obs.id(), obs.resultJson(), decoded)) {
+                            cachedColdEntries.add(Map.entry(BigId.fromLong(idScope, obs.id()), decoded));
+                            unresolvedMissingStreams.remove(entry.getKey());
+                        }
+                    }
+                }
+                if (!unresolvedMissingStreams.isEmpty()) {
+                    List<ArchiveGeneration> missingCandidates = archiveCatalog.candidates(
+                            bounds.start(), bounds.end(), null, null, null, unresolvedMissingStreams, minResultTime);
+                    if (!missingCandidates.isEmpty()) {
+                        coldDataStreams.addAll(unresolvedMissingStreams);
+                        for (ArchiveGeneration generation : missingCandidates) {
+                            candidateById.put(generation.id(), generation);
+                            neededGenerationIds.add(generation.id());
+                        }
                     }
                 }
             }
         }
 
+        Comparator<Entry<BigId, IObsData>> comparator = entryComparator(filter);
+        if (!cachedColdEntries.isEmpty())
+            cachedColdEntries.sort(comparator);
+
         if (coldDataStreams.isEmpty() || neededGenerationIds.isEmpty())
-            return Stream.empty();
+            return cachedColdEntries.stream();
 
         List<ArchiveGeneration> filteredCandidates = candidateById.values().stream()
                 .filter(generation -> neededGenerationIds.contains(generation.id()))
@@ -1071,9 +1106,19 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         .thenComparing(ArchiveGeneration::end)
                         .thenComparing(ArchiveGeneration::id))
                 .toList();
-        return streamColdBasesFromCandidates(
+        Stream<Entry<BigId, IObsData>> scannedCold = streamColdBasesFromCandidates(
                 filteredCandidates, filter, readerLimit, coldDataStreams, fois, false,
                 MutationFilteringIterator.LOOKUP_BATCH_SIZE);
+        return cachedColdEntries.isEmpty()
+                ? scannedCold
+                : mergeSorted(cachedColdEntries.stream(), scannedCold, comparator);
+    }
+
+    private static long saturateAdd(long a, long b) {
+        if (a == Long.MAX_VALUE || b <= 0L)
+            return a;
+        long r = a + b;
+        return r < 0L ? Long.MAX_VALUE : r;
     }
 
     private Stream<Entry<BigId, IObsData>> streamColdBases(
@@ -1138,6 +1183,16 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             Set<Long> dataStreams, Set<Long> fois, boolean hasMutations, int mutationBatchSize) {
         List<ArchiveGeneration> effectiveCandidates = pruneAndBackfillLegacyResultTimeCandidates(
                 candidates, minResultTimeBound(filter));
+        if (!effectiveCandidates.isEmpty() && fois == null &&
+                (filter.getInternalIDs() == null || filter.getInternalIDs().isEmpty()) &&
+                !hasLatestSelection(filter) && filter.getCQLFilter() != null) {
+            String summaryExpr = JsonCqlEvaluator.summaryCounterExpression(filter.getCQLFilter()).orElse(null);
+            String exactEventId = JsonCqlEvaluator.extractExactEventIdFilter(filter.getCQLFilter()).orElse(null);
+            if (summaryExpr != null || exactEventId != null) {
+                effectiveCandidates = archiveCatalog.pruneZeroMatchSummaryCandidates(
+                        effectiveCandidates, dataStreams, summaryExpr, exactEventId);
+            }
+        }
         if (effectiveCandidates.isEmpty())
             return Stream.empty();
         Stream<ParquetArchiveReader.ArchivedRow> rows = archiveReader.stream(
@@ -3191,6 +3246,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         ObsFilter resolvedFilter = related.filter();
         Set<Long> dataStreams = related.dataStreams();
         Set<Long> fois = related.fois();
+        if (hasMutations)
+            hasMutations = archiveCatalog.countObservationMutations(dataStreams) > 0L;
         boolean parentTableOnly = isAllMutableOnlyDataStreams(dataStreams);
 
         if (!hasVisibleCold && !hasMutations) {
@@ -3235,21 +3292,41 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 Set<Long> allMutatedIds = mutatedByGen.isEmpty()
                         ? Set.of()
                         : mutatedByGen.values().stream().flatMap(Set::stream).collect(Collectors.toSet());
-                if (resolvedFilter.getCQLFilter() == null) {
-                    long rawCold = archiveReader.count(candidates, resolvedFilter, dataStreams, fois);
-                    long mutatedMatchingCold = 0L;
-                    if (!mutatedByGen.isEmpty() && rawCold > 0) {
-                        List<ArchiveGeneration> mutatedGens = candidates.stream()
-                                .filter(generation -> mutatedByGen.containsKey(generation.id()))
-                                .toList();
-                        mutatedMatchingCold = archiveReader.countMatchingIds(
-                                mutatedGens, idScope, allMutatedIds, resolvedFilter, dataStreams, fois);
+                List<ArchiveGeneration> parquetCandidates = candidates;
+                long summarizedColdCount = 0L;
+                if (fois == null && oneId == null && minId == null && maxId == null &&
+                        resolvedFilter.getResultTime() == null) {
+                    String summaryExpr = JsonCqlEvaluator.summaryCounterExpression(
+                            resolvedFilter.getCQLFilter()).orElse(null);
+                    if (summaryExpr != null) {
+                        ArchiveCatalog.ColdSummaryPlan summaryPlan = archiveCatalog.summarizeColdCandidates(
+                                candidates, resolvedFilter.getPhenomenonTime(),
+                                dataStreams, mutatedByGen.keySet(), summaryExpr);
+                        summarizedColdCount = summaryPlan.summarizedCount();
+                        parquetCandidates = summaryPlan.remainingCandidates();
                     }
-                    coldUnmutatedCount = Math.subtractExact(rawCold, mutatedMatchingCold);
-                } else {
-                    coldUnmutatedCount = archiveReader.countCql(
-                            candidates, resolvedFilter, dataStreams, fois, allMutatedIds);
                 }
+                long scannedColdCount = 0L;
+                if (!parquetCandidates.isEmpty()) {
+                    if (resolvedFilter.getCQLFilter() == null) {
+                        long rawCold = archiveReader.count(parquetCandidates, resolvedFilter, dataStreams, fois);
+                        long mutatedMatchingCold = 0L;
+                        if (!mutatedByGen.isEmpty() && rawCold > 0) {
+                            List<ArchiveGeneration> mutatedGens = parquetCandidates.stream()
+                                    .filter(generation -> mutatedByGen.containsKey(generation.id()))
+                                    .toList();
+                            if (!mutatedGens.isEmpty()) {
+                                mutatedMatchingCold = archiveReader.countMatchingIds(
+                                        mutatedGens, idScope, allMutatedIds, resolvedFilter, dataStreams, fois);
+                            }
+                        }
+                        scannedColdCount = Math.subtractExact(rawCold, mutatedMatchingCold);
+                    } else {
+                        scannedColdCount = archiveReader.countCql(
+                                parquetCandidates, resolvedFilter, dataStreams, fois, allMutatedIds);
+                    }
+                }
+                coldUnmutatedCount = Math.addExact(summarizedColdCount, scannedColdCount);
             }
         }
 
