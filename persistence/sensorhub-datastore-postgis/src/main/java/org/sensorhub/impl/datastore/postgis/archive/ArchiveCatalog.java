@@ -1672,6 +1672,7 @@ public final class ArchiveCatalog {
                 connection.setAutoCommit(true);
             try (Statement statement = connection.createStatement()) {
                 if (resourceConfig.isParquetPrimary()) {
+                    deduplicateSingletonParentRows(statement, observations, dataStreams);
                     statement.execute("REINDEX TABLE CONCURRENTLY " + observations);
                     statement.execute("REINDEX TABLE CONCURRENTLY oscar_obs_stage_owner");
                 }
@@ -1699,6 +1700,8 @@ public final class ArchiveCatalog {
             if (!oldAutoCommit)
                 connection.setAutoCommit(true);
             try (Statement statement = connection.createStatement()) {
+                if (resourceConfig.isParquetPrimary())
+                    deduplicateSingletonParentRows(statement, observations, dataStreams);
                 statement.execute("VACUUM (FULL, ANALYZE) ONLY " + observations);
                 statement.execute("REINDEX TABLE CONCURRENTLY " + dataStreams);
             } finally {
@@ -1710,6 +1713,24 @@ public final class ArchiveCatalog {
         }
     }
 
+    private void deduplicateSingletonParentRows(Statement statement,
+                                                String observations,
+                                                String dataStreams) throws SQLException {
+        statement.execute(
+                "DELETE FROM ONLY " + observations + " o USING (" +
+                "  SELECT o2.id FROM ONLY " + observations + " o2 " +
+                "  JOIN " + dataStreams + " d ON d.id = o2.datastreamid " +
+                "  WHERE COALESCE(d.data->>'outputName', d.data->'recordSchema'->>'name', '') " +
+                "        IN ('sensorLocation', 'adjudicationCodes', 'siteInfo') " +
+                "    AND EXISTS (" +
+                "      SELECT 1 FROM ONLY " + observations + " newer " +
+                "      WHERE newer.datastreamid = o2.datastreamid " +
+                "        AND (newer.phenomenontime > o2.phenomenontime " +
+                "             OR (newer.phenomenontime = o2.phenomenontime AND newer.id > o2.id))" +
+                "    )" +
+                ") dup WHERE o.id = dup.id");
+    }
+
     /**
      * Incrementally populates per-datastream summary counters, event locators,
      * and {@code oscar_obs_latest} for pre-upgrade archive generations.
@@ -1717,6 +1738,22 @@ public final class ArchiveCatalog {
     public int backfillGenerationSummariesBatch(Path archiveRoot, int maxGenerations) {
         if (archiveRoot == null || maxGenerations < 1)
             return 0;
+        try (Connection connection = connections.open();
+             PreparedStatement fastPath = connection.prepareStatement(
+                     "UPDATE oscar_archive_schema s SET summary_populated = TRUE " +
+                     "FROM " + safeIdentifier(storeKey + "_datastreams") + " d, oscar_obs_latest l " +
+                     "WHERE s.store_key=? AND s.id_scope=? AND NOT s.summary_populated " +
+                     "AND d.id = s.datastream_id " +
+                     "AND l.store_key = s.store_key AND l.id_scope = s.id_scope AND l.datastream_id = s.datastream_id " +
+                     "AND (s.max_phenomenon_time IS NULL OR l.phenomenon_time >= s.max_phenomenon_time) " +
+                     "AND COALESCE(d.data->>'outputName', d.data->'recordSchema'->>'name', '') " +
+                     "    NOT IN ('occupancy', 'tamper', 'connectionStatus', 'occupancyStatus', 'adjudication', 'report')")) {
+            fastPath.setString(1, storeKey);
+            fastPath.setInt(2, idScope);
+            fastPath.executeUpdate();
+        } catch (Exception ignored) {
+            // Optional fast-path when datastream table is accessible.
+        }
         List<ArchiveGeneration> pending = new ArrayList<>();
         String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
                 "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time " +
