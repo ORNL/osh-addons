@@ -3551,7 +3551,8 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             }
             for (String mutableCountTable : List.of("oscar_mutable_stream_counts",
                     "oscar_mutable_stream_counts_delta",
-                    "oscar_mutable_stream_counts_state")) {
+                    "oscar_mutable_stream_counts_state",
+                    "oscar_obs_latest")) {
                 try (PreparedStatement counts = connection.prepareStatement(
                         "DELETE FROM " + mutableCountTable + " WHERE store_key=?")) {
                     counts.setString(1, observationTable);
@@ -4280,7 +4281,7 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
         Instant start = Instant.parse("2026-01-08T00:00:00Z");
         BigId archivedStream = addSimpleDataStream(bigId(901), "gammaCounts");
-        BigId nonArchivedStream = addSimpleDataStream(bigId(902), "connectionStatus");
+        BigId nonArchivedStream = addSimpleDataStream(bigId(902), "sensorLocation");
 
         addSimpleObsWithoutResultTime(archivedStream, BigId.NONE, start, 3, 60_000L);
         addSimpleObsWithoutResultTime(nonArchivedStream, BigId.NONE, start, 3, 60_000L);
@@ -4982,6 +4983,118 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         }
 
         assertEquals(6L, tiered.countMatchingEntries(unadjudicatedAlarmFilter));
+    }
+
+    @Test
+    public void parquetPrimaryFullOperationalStreamsUseLatestCacheSummaryCountersAndScopedOverlays() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.immutableStageWindowMinutes = 30;
+        primaryConfig.maximumGenerationsPerCycle = 2;
+        primaryConfig.maximumVerificationsPerCycle = 2;
+        primaryConfig.maximumDeletionsPerCycle = 2;
+        primaryConfig.deleteHotAfterArchive = true;
+        primaryConfig.validate();
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        Instant base = Instant.parse("2026-09-06T00:00:00Z");
+        BigId occStream = addAlarmDataStream(bigId(981), "occupancy");
+        BigId statusStream = addSimpleDataStream(bigId(982), "connectionStatus");
+        BigId staticStream = addSimpleDataStream(bigId(983), "sensorLocation");
+
+        BigId occ1 = tiered.add(alarmObs(occStream, base.plusSeconds(10), base.plusSeconds(10), false, false, 10.0));
+        BigId occ2 = tiered.add(alarmObs(occStream, base.plusSeconds(20), base.plusSeconds(20), true, false, 99.0));
+        BigId status1 = addSimpleObsWithoutResultTime(statusStream, BigId.NONE, base.plusSeconds(15), 1, 0)
+                .keySet().iterator().next();
+        BigId static1 = addSimpleObsWithoutResultTime(staticStream, BigId.NONE, base.plusSeconds(5), 1, 0)
+                .keySet().iterator().next();
+        forceReadBackFromStorage();
+
+        try (Connection conn = open()) {
+            assertEquals("Only static config streams belong in ONLY " + TABLE,
+                    1L, queryLong(conn, "SELECT count(*) FROM ONLY " + TABLE));
+            assertEquals(3L, queryLong(conn, "SELECT count(*) FROM " + TABLE + " WHERE id <> " + static1.getIdAsLong()));
+        }
+
+        ArchiveGeneration gen = tiered.archiveWindow(
+                base, base.plus(30, ChronoUnit.MINUTES), "RAW_GATED").orElseThrow();
+        assertEquals(3L, gen.rowCount());
+        tiered.maintainArchiveLifecycle();
+        ageGeneration(gen.id());
+        tiered.maintainArchiveLifecycle();
+
+        try (Connection conn = open()) {
+            assertEquals("Stage partition must be dropped after verification, leaving only static row in PG",
+                    1L, queryLong(conn, "SELECT count(*) FROM " + TABLE));
+            assertEquals(2L, queryLong(conn,
+                    "SELECT count(*) FROM oscar_obs_latest WHERE store_key='" + TABLE + "'"));
+            assertEquals(1L, queryLong(conn,
+                    "SELECT COALESCE(sum(gamma_alarm_count),0) FROM oscar_archive_schema " +
+                            "WHERE generation_id='" + gen.id() + "' AND datastream_id=" + occStream.getIdAsLong()));
+        }
+
+        // Fast-path latest lookup served from oscar_obs_latest after stage partition is dropped
+        ObsFilter latestOcc = new ObsFilter.Builder()
+                .withDataStreams(occStream)
+                .withLatestResult()
+                .withLimit(1)
+                .build();
+        try (var rows = tiered.selectEntries(latestOcc)) {
+            var selected = rows.toList();
+            assertEquals(1, selected.size());
+            assertEquals(occ2, selected.get(0).getKey());
+            assertTrue(selected.get(0).getValue().getResult().getBooleanValue(0));
+        }
+
+        // Summary-counter fast path for CQL alarm counts
+        ObsFilter gammaAlarmFilter = new ObsFilter.Builder()
+                .withDataStreams(occStream)
+                .withCQLFilter("gammaAlarm = true")
+                .build();
+        assertEquals(1L, tiered.countMatchingEntries(gammaAlarmFilter));
+
+        ObsFilter neutronAlarmFilter = new ObsFilter.Builder()
+                .withDataStreams(occStream)
+                .withCQLFilter("neutronAlarm = true")
+                .build();
+        assertEquals(0L, tiered.countMatchingEntries(neutronAlarmFilter));
+        assertEquals(0L, selectCount(tiered, neutronAlarmFilter));
+
+        // Update archived occupancy row via put() -> oscar_obs_overlay + oscar_obs_latest sync
+        tiered.put(occ2, alarmObs(occStream, base.plusSeconds(20), base.plusSeconds(20), false, true, 120.0));
+        assertEquals("Mutation count must be scoped to the mutated datastream",
+                1L, tiered.getArchiveCatalog().countObservationMutations(Set.of(occStream.getIdAsLong())));
+        assertEquals("Unmutated datastreams must see zero mutations",
+                0L, tiered.getArchiveCatalog().countObservationMutations(Set.of(statusStream.getIdAsLong())));
+
+        try (var rows = tiered.selectEntries(latestOcc)) {
+            var selected = rows.toList();
+            assertEquals(1, selected.size());
+            assertEquals(occ2, selected.get(0).getKey());
+            assertFalse("oscar_obs_latest must reflect overlay update",
+                    selected.get(0).getValue().getResult().getBooleanValue(0));
+            assertTrue(selected.get(0).getValue().getResult().getBooleanValue(1));
+        }
+        assertEquals(0L, tiered.countMatchingEntries(gammaAlarmFilter));
+        assertEquals(1L, tiered.countMatchingEntries(neutronAlarmFilter));
+        assertNotNull(tiered.get(occ1));
+        assertNotNull(tiered.get(status1));
+        assertNotNull(tiered.get(static1));
     }
 
     private static String toPostgresPositionalSql(String jdbcSql) {

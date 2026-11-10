@@ -175,10 +175,17 @@ public class TieredArchiveConfig {
     private static final List<String> LEGACY_DEFAULT_OUTPUT_NAMES = List.of(
             "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron");
 
-    private static final List<String> DEFAULT_OUTPUT_NAMES = List.of(
+    private static final List<String> PREVIOUS_DEFAULT_OUTPUT_NAMES = List.of(
             "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
             "speed", "backgroundReport", "foregroundReport", "status",
             "emlContextual", "emlScanContextual", "emlAnalysis");
+
+    private static final List<String> DEFAULT_OUTPUT_NAMES = List.of(
+            "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
+            "speed", "backgroundReport", "foregroundReport", "status",
+            "emlContextual", "emlScanContextual", "emlAnalysis",
+            "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
+            "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary");
 
     @DisplayInfo(label = "Archive output names", desc = "Only high-volume raw/rollup streams are cold-tiered by default")
     public List<String> outputNames = new ArrayList<>(DEFAULT_OUTPUT_NAMES);
@@ -273,7 +280,8 @@ public class TieredArchiveConfig {
             throw new IllegalArgumentException(
                     "PARQUET_PRIMARY requires maximumVerificationsPerCycle to be at least " +
                             "maximumGenerationsPerCycle so parity backlog cannot grow by configuration");
-        if (outputNames != null && outputNames.equals(LEGACY_DEFAULT_OUTPUT_NAMES))
+        if (outputNames != null && (outputNames.equals(LEGACY_DEFAULT_OUTPUT_NAMES) ||
+                outputNames.equals(PREVIOUS_DEFAULT_OUTPUT_NAMES)))
             outputNames = new ArrayList<>(DEFAULT_OUTPUT_NAMES);
         if (isParquetPrimary() && (outputNames == null || outputNames.isEmpty()))
             throw new IllegalArgumentException("At least one immutable archive output name is required");

@@ -440,6 +440,67 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
         return ICommandStore.super.removeEntries(filter);
     }
 
+    /**
+     * Prunes transient non-adjudication command and status records (such as
+     * bulk {@code fileControl} N42 uploads and {@code hlsControl} camera stream
+     * toggles) older than {@code cutoff} while preserving all immutable
+     * {@code adjudicationControl} audit records.
+     */
+    public int purgeCompletedTransientCommandsBefore(java.time.Instant cutoff) {
+        if (cutoff == null || commandStreamStore == null || commandStatusStore == null) {
+            return 0;
+        }
+        String commandTable = queryBuilder.getStoreTableName();
+        String streamTable = commandStreamStore.getDatastoreName();
+        String statusTable = commandStatusStore.getDatastoreName();
+        String deleteStatusSql = "DELETE FROM " + statusTable + " s "
+                + "USING " + commandTable + " c "
+                + "LEFT JOIN " + streamTable + " cs ON cs.id = c." + COMMANDSTREAM_ID + " "
+                + "WHERE s." + ICommandStatusStore.CommandStatusField.COMMAND_ID + " = c.id "
+                + "AND c." + ISSUE_TIME + " < ? "
+                + "AND COALESCE(cs.data->>'controlInputName', '') <> '" + IMMUTABLE_ADJUDICATION_CONTROL_NAME + "' "
+                + "AND COALESCE(s." + ICommandStatusStore.CommandStatusField.STATUS_CODE + ", '') NOT IN ('PENDING', 'ACCEPTED', 'EXECUTING')";
+        String deleteCommandSql = "DELETE FROM " + commandTable + " c "
+                + "USING " + streamTable + " cs "
+                + "WHERE cs.id = c." + COMMANDSTREAM_ID + " "
+                + "AND c." + ISSUE_TIME + " < ? "
+                + "AND COALESCE(cs.data->>'controlInputName', '') <> '" + IMMUTABLE_ADJUDICATION_CONTROL_NAME + "' "
+                + "AND NOT EXISTS ("
+                + "SELECT 1 FROM " + statusTable + " s "
+                + "WHERE s." + ICommandStatusStore.CommandStatusField.COMMAND_ID + " = c.id "
+                + "AND COALESCE(s." + ICommandStatusStore.CommandStatusField.STATUS_CODE + ", '') IN ('PENDING', 'ACCEPTED', 'EXECUTING')"
+                + ")";
+        int deletedCommands = 0;
+        try (Connection connection = this.connectionManager.getConnection()) {
+            Timestamp cutoffTs = Timestamp.from(cutoff);
+            try (PreparedStatement statusStmt = connection.prepareStatement(deleteStatusSql)) {
+                statusStmt.setTimestamp(1, cutoffTs, UTC_LOCAL);
+                statusStmt.executeUpdate();
+            }
+            try (PreparedStatement cmdStmt = connection.prepareStatement(deleteCommandSql)) {
+                cmdStmt.setTimestamp(1, cutoffTs, UTC_LOCAL);
+                deletedCommands = cmdStmt.executeUpdate();
+            }
+            if (deletedCommands >= 50) {
+                boolean oldAutoCommit = connection.getAutoCommit();
+                if (!oldAutoCommit) {
+                    connection.setAutoCommit(true);
+                }
+                try (Statement vacuum = connection.createStatement()) {
+                    vacuum.execute("VACUUM (FULL, ANALYZE) " + statusTable);
+                    vacuum.execute("VACUUM (FULL, ANALYZE) " + commandTable);
+                } finally {
+                    if (!oldAutoCommit) {
+                        connection.setAutoCommit(false);
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            logger.warn("Failed to purge transient commands older than {}", cutoff, e);
+        }
+        return deletedCommands;
+    }
+
     @Override
     public void commit() throws DataStoreException {
 

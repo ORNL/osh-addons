@@ -24,8 +24,11 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
+import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.StreamSupport;
 
@@ -74,6 +77,162 @@ public final class JsonCqlEvaluator {
     public static boolean hasSelectiveDuckDbPrefilter(Filter filter) {
         PrefilterClause clause = buildDuckDbPrefilter(filter, "result_json");
         return clause != null && clause.selective();
+    }
+
+    /**
+     * Maps a CQL filter (or {@code null}/{@link Filter#INCLUDE}) to an exact SQL
+     * counter expression over {@code oscar_archive_schema} alias {@code s} when
+     * the predicate is covered by per-generation summary counters.
+     */
+    public static Optional<String> summaryCounterExpression(Filter filter) {
+        if (filter == null || filter == Filter.INCLUDE)
+            return Optional.of("COALESCE(s.row_count, 0)");
+        if (filter == Filter.EXCLUDE)
+            return Optional.of("0::bigint");
+        if (filter instanceof PropertyIsEqualTo eq) {
+            return singleEqualitySummaryCounter(eq);
+        }
+        if (filter instanceof PropertyIsLike like) {
+            if (!like.isMatchingCase() ||
+                    !"%".equals(like.getWildCard()) ||
+                    !"_".equals(like.getSingleChar()) ||
+                    !"\\".equals(like.getEscape()) ||
+                    !(like.getExpression() instanceof PropertyName prop))
+                return Optional.empty();
+            if ("derivedData.alarmCategory".equals(prop.getPropertyName())) {
+                if ("%Gamma%".equals(like.getLiteral()))
+                    return Optional.of("COALESCE(s.rs350_gamma_alarm_count, 0)");
+                if ("%Neutron%".equals(like.getLiteral()))
+                    return Optional.of("COALESCE(s.rs350_neutron_alarm_count, 0)");
+            }
+            return Optional.empty();
+        }
+        if (filter instanceof And and) {
+            if (and.getChildren().size() == 2) {
+                Boolean gamma = null;
+                Boolean neutron = null;
+                for (Filter child : and.getChildren()) {
+                    if (!(child instanceof PropertyIsEqualTo eq) ||
+                            !(eq.getExpression1() instanceof PropertyName prop) ||
+                            !(eq.getExpression2() instanceof Literal lit) ||
+                            !(lit.getValue() instanceof Boolean boolVal))
+                        return Optional.empty();
+                    if ("gammaAlarm".equals(prop.getPropertyName()) && gamma == null)
+                        gamma = boolVal;
+                    else if ("neutronAlarm".equals(prop.getPropertyName()) && neutron == null)
+                        neutron = boolVal;
+                    else
+                        return Optional.empty();
+                }
+                if (gamma != null && neutron != null) {
+                    if (gamma && !neutron)
+                        return Optional.of("COALESCE(s.gamma_alarm_count, 0)");
+                    if (!gamma && neutron)
+                        return Optional.of("COALESCE(s.neutron_alarm_count, 0)");
+                    if (gamma)
+                        return Optional.of("COALESCE(s.gamma_neutron_alarm_count, 0)");
+                    return Optional.of("COALESCE(s.non_alarm_occupancy_count, 0)");
+                }
+            }
+            return Optional.empty();
+        }
+        if (filter instanceof Or or) {
+            if (or.getChildren().size() == 2) {
+                boolean hasGammaTrue = false;
+                boolean hasNeutronTrue = false;
+                for (Filter child : or.getChildren()) {
+                    if (child instanceof PropertyIsEqualTo eq &&
+                            eq.getExpression1() instanceof PropertyName prop &&
+                            eq.getExpression2() instanceof Literal lit &&
+                            Boolean.TRUE.equals(lit.getValue())) {
+                        if ("gammaAlarm".equals(prop.getPropertyName()))
+                            hasGammaTrue = true;
+                        else if ("neutronAlarm".equals(prop.getPropertyName()))
+                            hasNeutronTrue = true;
+                    }
+                }
+                if (hasGammaTrue && hasNeutronTrue)
+                    return Optional.of("COALESCE(s.any_alarm_count, 0)");
+            }
+            Set<String> faultColumns = new LinkedHashSet<>();
+            for (Filter child : or.getChildren()) {
+                if (!(child instanceof PropertyIsEqualTo eq)) {
+                    faultColumns.clear();
+                    break;
+                }
+                Optional<String> col = singleFaultSummaryColumn(eq);
+                if (col.isEmpty()) {
+                    faultColumns.clear();
+                    break;
+                }
+                faultColumns.add(col.get());
+            }
+            if (!faultColumns.isEmpty()) {
+                return Optional.of("(" + String.join(" + ", faultColumns) + ")");
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<String> singleEqualitySummaryCounter(PropertyIsEqualTo eq) {
+        if (!(eq.getExpression1() instanceof PropertyName prop) ||
+                !(eq.getExpression2() instanceof Literal lit) ||
+                lit.getValue() == null)
+            return Optional.empty();
+        String name = prop.getPropertyName();
+        Object val = lit.getValue();
+        if (val instanceof Boolean boolVal) {
+            if ("gammaAlarm".equals(name) && boolVal)
+                return Optional.of("COALESCE(s.gamma_true_count, 0)");
+            if ("neutronAlarm".equals(name) && boolVal)
+                return Optional.of("COALESCE(s.neutron_true_count, 0)");
+            if ("tamperStatus".equals(name) && boolVal)
+                return Optional.of("COALESCE(s.tamper_true_count, 0)");
+            return Optional.empty();
+        }
+        return singleFaultSummaryColumn(eq);
+    }
+
+    private static Optional<String> singleFaultSummaryColumn(PropertyIsEqualTo eq) {
+        if (!eq.isMatchingCase() ||
+                !(eq.getExpression1() instanceof PropertyName prop) ||
+                !(eq.getExpression2() instanceof Literal lit) ||
+                !(lit.getValue() instanceof String text))
+            return Optional.empty();
+        if (!"alarmState".equals(prop.getPropertyName()))
+            return Optional.empty();
+        return switch (text) {
+            case "Fault - Gamma High" -> Optional.of("COALESCE(s.gamma_high_fault_count, 0)");
+            case "Fault - Gamma Low" -> Optional.of("COALESCE(s.gamma_low_fault_count, 0)");
+            case "Fault - Neutron" -> Optional.of("COALESCE(s.neutron_fault_count, 0)");
+            case "Fault - Extended Occupancy" -> Optional.of("COALESCE(s.extended_occupancy_fault_count, 0)");
+            default -> Optional.empty();
+        };
+    }
+
+    /**
+     * Extracts an exact {@code eventId = '<id>'} predicate when the CQL filter
+     * is an exact case-sensitive equality on {@code eventId} (or an {@code And}
+     * containing one).
+     */
+    public static Optional<String> extractExactEventIdFilter(Filter filter) {
+        if (filter instanceof PropertyIsEqualTo eq &&
+                eq.isMatchingCase() &&
+                eq.getExpression1() instanceof PropertyName prop &&
+                "eventId".equals(prop.getPropertyName()) &&
+                eq.getExpression2() instanceof Literal lit &&
+                lit.getValue() instanceof String text &&
+                !text.isEmpty() && text.length() <= 256) {
+            return Optional.of(text);
+        }
+        if (filter instanceof And and) {
+            for (Filter child : and.getChildren()) {
+                Optional<String> found = extractExactEventIdFilter(child);
+                if (found.isPresent())
+                    return found;
+            }
+        }
+        return Optional.empty();
     }
 
     private record PrefilterClause(String sql, List<Object> parameters, boolean selective) {}
