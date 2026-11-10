@@ -1700,9 +1700,12 @@ public final class ArchiveCatalog {
             if (!oldAutoCommit)
                 connection.setAutoCommit(true);
             try (Statement statement = connection.createStatement()) {
-                if (resourceConfig.isParquetPrimary())
+                if (resourceConfig.isParquetPrimary()) {
                     deduplicateSingletonParentRows(statement, observations, dataStreams);
-                statement.execute("VACUUM (FULL, ANALYZE) ONLY " + observations);
+                    statement.execute("VACUUM (FULL, ANALYZE) oscar_obs_stage_owner");
+                }
+                statement.execute("VACUUM (FULL, ANALYZE) " + observations);
+                statement.execute("VACUUM (FULL, ANALYZE) oscar_archive_schema");
                 statement.execute("REINDEX TABLE CONCURRENTLY " + dataStreams);
             } finally {
                 if (!oldAutoCommit)

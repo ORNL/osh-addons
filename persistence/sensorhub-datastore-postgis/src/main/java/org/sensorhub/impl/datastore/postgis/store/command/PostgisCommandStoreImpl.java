@@ -458,18 +458,12 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
                 + "LEFT JOIN " + streamTable + " cs ON cs.id = c." + COMMANDSTREAM_ID + " "
                 + "WHERE s." + ICommandStatusStore.CommandStatusField.COMMAND_ID + " = c.id "
                 + "AND c." + ISSUE_TIME + " < ? "
-                + "AND COALESCE(cs.data->>'controlInputName', '') <> '" + IMMUTABLE_ADJUDICATION_CONTROL_NAME + "' "
-                + "AND COALESCE(s." + ICommandStatusStore.CommandStatusField.STATUS_CODE + ", '') NOT IN ('PENDING', 'ACCEPTED', 'EXECUTING')";
+                + "AND COALESCE(cs.data->>'controlInputName', '') <> '" + IMMUTABLE_ADJUDICATION_CONTROL_NAME + "'";
         String deleteCommandSql = "DELETE FROM " + commandTable + " c "
                 + "USING " + streamTable + " cs "
                 + "WHERE cs.id = c." + COMMANDSTREAM_ID + " "
                 + "AND c." + ISSUE_TIME + " < ? "
-                + "AND COALESCE(cs.data->>'controlInputName', '') <> '" + IMMUTABLE_ADJUDICATION_CONTROL_NAME + "' "
-                + "AND NOT EXISTS ("
-                + "SELECT 1 FROM " + statusTable + " s "
-                + "WHERE s." + ICommandStatusStore.CommandStatusField.COMMAND_ID + " = c.id "
-                + "AND COALESCE(s." + ICommandStatusStore.CommandStatusField.STATUS_CODE + ", '') IN ('PENDING', 'ACCEPTED', 'EXECUTING')"
-                + ")";
+                + "AND COALESCE(cs.data->>'controlInputName', '') <> '" + IMMUTABLE_ADJUDICATION_CONTROL_NAME + "'";
         int deletedCommands = 0;
         try (Connection connection = this.connectionManager.getConnection()) {
             Timestamp cutoffTs = Timestamp.from(cutoff);
