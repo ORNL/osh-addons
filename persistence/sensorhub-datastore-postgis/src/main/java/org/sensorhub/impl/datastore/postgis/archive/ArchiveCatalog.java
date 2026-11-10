@@ -1581,7 +1581,7 @@ public final class ArchiveCatalog {
                 ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                 : null;
         try {
-            if (streamArray != null) {
+            if (streamArray != null && minResultTime == null && maxResultTime == null) {
                 try (PreparedStatement hasAny = connection.prepareStatement(
                         "SELECT 1 FROM oscar_archive_schema WHERE datastream_id=ANY (?::bigint[]) LIMIT 1")) {
                     hasAny.setArray(1, streamArray);
@@ -1957,21 +1957,23 @@ public final class ArchiveCatalog {
     public Set<Long> filterPresentDataStreams(Instant start, Instant end, Collection<Long> dataStreams) {
         if (dataStreams == null || dataStreams.isEmpty() || !start.isBefore(end))
             return Set.of();
-        String sql = "SELECT DISTINCT s.datastream_id " +
-                "FROM oscar_archive_schema s " +
+        String sql = "SELECT u.ds_id " +
+                "FROM unnest(?::bigint[]) AS u(ds_id) " +
+                "WHERE EXISTS (" +
+                "SELECT 1 FROM oscar_archive_schema s " +
                 "JOIN oscar_archive_generation g ON g.id = s.generation_id " +
-                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
-                "AND g.window_start < ? AND g.window_end > ? " +
-                "AND s.datastream_id = ANY (?::bigint[])";
+                "WHERE s.datastream_id = u.ds_id " +
+                "AND g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                "AND g.window_start < ? AND g.window_end > ?)";
         Set<Long> present = new HashSet<>();
         try (Connection connection = connections.open()) {
             java.sql.Array streamArray = connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new));
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                statement.setString(1, storeKey);
-                statement.setInt(2, idScope);
-                UtcJdbcTime.setInstant(statement, 3, end);
-                UtcJdbcTime.setInstant(statement, 4, start);
-                statement.setArray(5, streamArray);
+                statement.setArray(1, streamArray);
+                statement.setString(2, storeKey);
+                statement.setInt(3, idScope);
+                UtcJdbcTime.setInstant(statement, 4, end);
+                UtcJdbcTime.setInstant(statement, 5, start);
                 try (ResultSet result = statement.executeQuery()) {
                     while (result.next())
                         present.add(result.getLong(1));

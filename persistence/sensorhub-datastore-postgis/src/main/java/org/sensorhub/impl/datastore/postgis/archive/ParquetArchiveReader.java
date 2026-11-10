@@ -178,6 +178,8 @@ public final class ParquetArchiveReader {
         if (limit == Long.MAX_VALUE && filter.getCQLFilter() != null && clusters.size() > 1 &&
                 JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(filter.getCQLFilter())) {
             clusters = batchOrderedClusters(clusters, MAX_CQL_PAYLOAD_BATCH);
+        } else if (limit >= 2 && limit <= 64 && filter.getCQLFilter() == null && clusters.size() > 8) {
+            clusters = batchOrderedClusters(clusters, 16);
         }
         WindowClusterCursor cursor = new WindowClusterCursor(
                 clusters.iterator(), filter, allowedDataStreams, allowedFois, limit);

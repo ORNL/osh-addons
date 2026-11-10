@@ -999,9 +999,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             ObsFilter filter, long readerLimit, Set<Long> dataStreams, Set<Long> fois,
             List<Entry<BigId, IObsData>> hotEntries, boolean hasMutations) {
         ArchiveBounds bounds = archiveBounds(filter);
-        Set<Long> archivedStreams = archiveCatalog.filterPresentDataStreams(
-                bounds.start(), bounds.end(), dataStreams);
-        if (archivedStreams.isEmpty())
+        if (!bounds.start().isBefore(bounds.end()))
             return Stream.empty();
 
         boolean latestResult = filter.getResultTime() != null && filter.getResultTime().isLatestTime();
@@ -1009,7 +1007,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         Map<Long, Instant> hotTimeByStream = new HashMap<>();
         for (Entry<BigId, IObsData> entry : hotEntries) {
             long streamId = entry.getValue().getDataStreamID().getIdAsLong();
-            if (!archivedStreams.contains(streamId))
+            if (!dataStreams.contains(streamId))
                 continue;
             Instant time = latestResult
                     ? entry.getValue().getResultTime()
@@ -1020,7 +1018,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         }
 
         Set<Long> hotStreams = hotTimeByStream.keySet();
-        Set<Long> missingHotStreams = archivedStreams.stream()
+        Set<Long> missingHotStreams = dataStreams.stream()
                 .filter(id -> !hotTimeByStream.containsKey(id))
                 .collect(Collectors.toSet());
 
@@ -1033,44 +1031,57 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     .min(Comparator.naturalOrder())
                     .orElse(null);
             List<ArchiveGeneration> hotCandidates;
+            Set<Long> archivedHotStreams = hotStreams;
             if (latestResult && minHotTime != null) {
                 hotCandidates = archiveCatalog.candidatesPotentiallyNewerThanResultTime(
                         bounds.start(), bounds.end(), hotStreams, minHotTime);
+                if (!hotCandidates.isEmpty() && hotStreams.size() > 1) {
+                    archivedHotStreams = archiveCatalog.filterPresentDataStreams(
+                            bounds.start(), bounds.end(), hotStreams);
+                }
             } else if (!latestResult && minHotTime != null) {
+                archivedHotStreams = archiveCatalog.filterPresentDataStreams(
+                        bounds.start(), bounds.end(), hotStreams);
                 Instant effectiveStart = minHotTime.isAfter(bounds.start()) ? minHotTime : bounds.start();
-                hotCandidates = effectiveStart.isBefore(bounds.end())
+                hotCandidates = !archivedHotStreams.isEmpty() && effectiveStart.isBefore(bounds.end())
                         ? archiveCatalog.candidates(
-                                effectiveStart, bounds.end(), null, null, null, hotStreams, minResultTime)
+                                effectiveStart, bounds.end(), null, null, null, archivedHotStreams, minResultTime)
                         : List.of();
             } else {
-                hotCandidates = archiveCatalog.candidates(
-                        bounds.start(), bounds.end(), null, null, null, hotStreams, minResultTime);
+                archivedHotStreams = archiveCatalog.filterPresentDataStreams(
+                        bounds.start(), bounds.end(), hotStreams);
+                hotCandidates = !archivedHotStreams.isEmpty()
+                        ? archiveCatalog.candidates(
+                                bounds.start(), bounds.end(), null, null, null, archivedHotStreams, minResultTime)
+                        : List.of();
             }
             for (ArchiveGeneration generation : hotCandidates)
                 candidateById.put(generation.id(), generation);
 
             boolean inspectedResultTimes = false;
-            for (Long streamId : hotStreams) {
-                Instant hotTime = hotTimeByStream.get(streamId);
-                if (latestResult) {
-                    inspectedResultTimes = true;
-                    List<ArchiveGeneration> newer = archiveReader.generationsPotentiallyNewerThanResultTime(
-                            hotCandidates, hotTime);
-                    if (!newer.isEmpty()) {
-                        coldDataStreams.add(streamId);
-                        for (ArchiveGeneration generation : newer)
-                            neededGenerationIds.add(generation.id());
-                    }
-                } else {
-                    boolean anyNewer = false;
-                    for (ArchiveGeneration generation : hotCandidates) {
-                        if (generation.end().isAfter(hotTime)) {
-                            anyNewer = true;
-                            neededGenerationIds.add(generation.id());
+            if (!hotCandidates.isEmpty()) {
+                for (Long streamId : archivedHotStreams) {
+                    Instant hotTime = hotTimeByStream.get(streamId);
+                    if (latestResult) {
+                        inspectedResultTimes = true;
+                        List<ArchiveGeneration> newer = archiveReader.generationsPotentiallyNewerThanResultTime(
+                                hotCandidates, hotTime);
+                        if (!newer.isEmpty()) {
+                            coldDataStreams.add(streamId);
+                            for (ArchiveGeneration generation : newer)
+                                neededGenerationIds.add(generation.id());
                         }
+                    } else {
+                        boolean anyNewer = false;
+                        for (ArchiveGeneration generation : hotCandidates) {
+                            if (generation.end().isAfter(hotTime)) {
+                                anyNewer = true;
+                                neededGenerationIds.add(generation.id());
+                            }
+                        }
+                        if (anyNewer)
+                            coldDataStreams.add(streamId);
                     }
-                    if (anyNewer)
-                        coldDataStreams.add(streamId);
                 }
             }
             if (inspectedResultTimes) {
@@ -1085,30 +1096,30 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
         List<Entry<BigId, IObsData>> cachedColdEntries = new ArrayList<>();
         if (!missingHotStreams.isEmpty()) {
-            Set<Long> archivedMissingStreams = archiveCatalog.filterPresentDataStreams(
-                    bounds.start(), bounds.end(), missingHotStreams);
-            if (!archivedMissingStreams.isEmpty()) {
-                Set<Long> unresolvedMissingStreams = new HashSet<>(archivedMissingStreams);
-                if (fois == null && minResultTime == null &&
-                        bounds.start().equals(MIN_ARCHIVE_TIME) &&
-                        bounds.end().equals(MAX_ARCHIVE_TIME)) {
-                    Map<Long, ArchiveCatalog.ArchivedOverlay> indexedLatest =
-                            archiveCatalog.loadVerifiedColdLatestByDataStream(idScope, archivedMissingStreams);
-                    for (Map.Entry<Long, ArchiveCatalog.ArchivedOverlay> entry : indexedLatest.entrySet()) {
-                        ArchiveCatalog.ArchivedOverlay latestCold = entry.getValue();
-                        ArchivedObservation obs = latestCold.observation();
-                        IObsData decoded = toObservation(latestCold.generationId(), latestCold.schemaJson(), obs);
-                        if (matchesObservation(filter, archivedMissingStreams, fois, obs.id(), obs.resultJson(), decoded)) {
-                            cachedColdEntries.add(Map.entry(BigId.fromLong(idScope, obs.id()), decoded));
-                            unresolvedMissingStreams.remove(entry.getKey());
-                        }
+            Set<Long> unresolvedMissingStreams = new HashSet<>(missingHotStreams);
+            if (fois == null && minResultTime == null &&
+                    bounds.start().equals(MIN_ARCHIVE_TIME) &&
+                    bounds.end().equals(MAX_ARCHIVE_TIME)) {
+                Map<Long, ArchiveCatalog.ArchivedOverlay> indexedLatest =
+                        archiveCatalog.loadVerifiedColdLatestByDataStream(idScope, missingHotStreams);
+                for (Map.Entry<Long, ArchiveCatalog.ArchivedOverlay> entry : indexedLatest.entrySet()) {
+                    ArchiveCatalog.ArchivedOverlay latestCold = entry.getValue();
+                    ArchivedObservation obs = latestCold.observation();
+                    IObsData decoded = toObservation(latestCold.generationId(), latestCold.schemaJson(), obs);
+                    if (matchesObservation(filter, missingHotStreams, fois, obs.id(), obs.resultJson(), decoded)) {
+                        cachedColdEntries.add(Map.entry(BigId.fromLong(idScope, obs.id()), decoded));
+                        unresolvedMissingStreams.remove(entry.getKey());
                     }
                 }
-                if (!unresolvedMissingStreams.isEmpty()) {
+            }
+            if (!unresolvedMissingStreams.isEmpty()) {
+                Set<Long> archivedUnresolvedStreams = archiveCatalog.filterPresentDataStreams(
+                        bounds.start(), bounds.end(), unresolvedMissingStreams);
+                if (!archivedUnresolvedStreams.isEmpty()) {
                     List<ArchiveGeneration> missingCandidates = archiveCatalog.candidates(
-                            bounds.start(), bounds.end(), null, null, null, unresolvedMissingStreams, minResultTime);
+                            bounds.start(), bounds.end(), null, null, null, archivedUnresolvedStreams, minResultTime);
                     if (!missingCandidates.isEmpty()) {
-                        coldDataStreams.addAll(unresolvedMissingStreams);
+                        coldDataStreams.addAll(archivedUnresolvedStreams);
                         for (ArchiveGeneration generation : missingCandidates) {
                             candidateById.put(generation.id(), generation);
                             neededGenerationIds.add(generation.id());
@@ -1216,10 +1227,13 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 return Stream.of(primarySupplier, overflowSupplier).flatMap(Supplier::get);
             }
 
+            int initialClusterLimit = readerLimit <= 64
+                    ? 16
+                    : INITIAL_CANDIDATE_CLUSTER_BATCH;
             ArchiveCatalog.InitialCandidateBatch initialBatch =
                     archiveCatalog.candidatesInitialClusters(
                             bounds.start(), bounds.end(), dataStreams, minResultTime, maxResultTime,
-                            descending, INITIAL_CANDIDATE_CLUSTER_BATCH);
+                            descending, initialClusterLimit);
             if (initialBatch.complete()) {
                 return streamColdBasesFromCandidates(
                         initialBatch.generations(), filter, readerLimit,
