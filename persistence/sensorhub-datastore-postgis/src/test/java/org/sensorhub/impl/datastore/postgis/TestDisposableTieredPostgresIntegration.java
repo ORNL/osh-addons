@@ -5082,13 +5082,20 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertEquals("Unmutated datastreams must see zero mutations",
                 0L, tiered.getArchiveCatalog().countObservationMutations(Set.of(statusStream.getIdAsLong())));
 
+        // Prove latestOcc uses pushDownLatest + oscar_obs_latest without opening the Parquet file
+        // even when oscar_obs_overlay has mutations for occStream.
+        Path parquetFile = Path.of(archiveRoot).resolve(gen.objectPath());
+        Path hiddenParquetFile = parquetFile.resolveSibling(parquetFile.getFileName() + ".hidden");
+        Files.move(parquetFile, hiddenParquetFile);
         try (var rows = tiered.selectEntries(latestOcc)) {
             var selected = rows.toList();
             assertEquals(1, selected.size());
             assertEquals(occ2, selected.get(0).getKey());
-            assertFalse("oscar_obs_latest must reflect overlay update",
+            assertFalse("oscar_obs_latest must reflect overlay update without scanning Parquet",
                     selected.get(0).getValue().getResult().getBooleanValue(0));
             assertTrue(selected.get(0).getValue().getResult().getBooleanValue(1));
+        } finally {
+            Files.move(hiddenParquetFile, parquetFile);
         }
         assertEquals(0L, tiered.countMatchingEntries(gammaAlarmFilter));
         assertEquals(1L, tiered.countMatchingEntries(neutronAlarmFilter));
@@ -5102,12 +5109,15 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertEquals(1L, tiered.getArchiveCatalog().countObservationMutations(Set.of(occStream.getIdAsLong())));
         assertEquals(1L, tiered.countMatchingEntries(gammaAlarmFilter));
         assertEquals(1L, tiered.countMatchingEntries(neutronAlarmFilter));
+        Files.move(parquetFile, hiddenParquetFile);
         try (var rows = tiered.selectEntries(latestOcc)) {
             var selected = rows.toList();
             assertEquals(1, selected.size());
             assertTrue(selected.get(0).getValue().getResult().getBooleanValue(0));
             assertTrue(selected.get(0).getValue().getResult().getBooleanValue(1));
             assertEquals(155.0, selected.get(0).getValue().getResult().getDoubleValue(2), 1e-6);
+        } finally {
+            Files.move(hiddenParquetFile, parquetFile);
         }
     }
 

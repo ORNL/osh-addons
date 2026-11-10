@@ -2369,13 +2369,29 @@ public final class ArchiveCatalog {
         }
     }
 
+    public record MutationCounts(long overlayCount, long tombstoneCount) {
+        public long total() {
+            if (overlayCount >= Long.MAX_VALUE - tombstoneCount)
+                return Long.MAX_VALUE;
+            return overlayCount + tombstoneCount;
+        }
+    }
+
     /**
      * Returns the number of active/sealed overlays and observation tombstones
      * affecting the requested {@code dataStreams} (or all streams when {@code null}).
      */
     public long countObservationMutations(Set<Long> dataStreams) {
+        return countObservationMutationBreakdown(dataStreams).total();
+    }
+
+    /**
+     * Returns separate active/sealed overlay and observation tombstone counts
+     * affecting the requested {@code dataStreams} (or all streams when {@code null}).
+     */
+    public MutationCounts countObservationMutationBreakdown(Set<Long> dataStreams) {
         if (dataStreams != null && dataStreams.isEmpty())
-            return 0L;
+            return new MutationCounts(0L, 0L);
         boolean filterStreams = dataStreams != null;
         String sql = "SELECT (" +
                 "SELECT count(*)::bigint FROM oscar_obs_overlay overlay_row " +
@@ -2384,7 +2400,7 @@ public final class ArchiveCatalog {
                 "AND generation.store_key=overlay_row.store_key AND generation.id_scope=overlay_row.id_scope " +
                 "AND generation.state IN ('ACTIVE','SEALED')" +
                 (filterStreams ? " AND overlay_row.datastream_id=ANY (?::bigint[])" : "") +
-                ") + (" +
+                "), (" +
                 "SELECT count(*)::bigint FROM oscar_tombstone tombstone " +
                 "WHERE tombstone.store_key=? AND tombstone.id_scope=? " +
                 "AND tombstone.subject_type='OBSERVATION' AND tombstone.generation_id IS NOT NULL " +
@@ -2411,7 +2427,9 @@ public final class ArchiveCatalog {
                 if (streamArray != null)
                     statement.setArray(p, streamArray);
                 try (ResultSet result = statement.executeQuery()) {
-                    return result.next() ? result.getLong(1) : 0L;
+                    return result.next()
+                            ? new MutationCounts(result.getLong(1), result.getLong(2))
+                            : new MutationCounts(0L, 0L);
                 }
             } finally {
                 if (streamArray != null)

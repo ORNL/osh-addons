@@ -856,11 +856,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         Set<Long> dataStreams = related.dataStreams();
         Set<Long> fois = related.fois();
         ObsFilter resolvedFilter = related.filter();
-        long mutationCount = hasMutations ? archiveCatalog.countObservationMutations(dataStreams) : 0L;
+        ArchiveCatalog.MutationCounts mutationCounts = hasMutations
+                ? archiveCatalog.countObservationMutationBreakdown(dataStreams)
+                : new ArchiveCatalog.MutationCounts(0L, 0L);
+        long mutationCount = mutationCounts.total();
         boolean effectiveHasMutations = mutationCount > 0L;
+        boolean hasTombstones = mutationCounts.tombstoneCount() > 0L;
         boolean parentTableOnly = isAllMutableOnlyDataStreams(dataStreams);
         boolean latest = hasLatestSelection(filter);
-        boolean pushDownLatest = latest && !effectiveHasMutations &&
+        boolean pushDownLatest = latest && !hasTombstones &&
                 queryBuilder.supportsLatestResultPerDataStreamQuery(resolvedFilter);
 
         // The top N of a union can only contain rows from the top N of either
@@ -911,9 +915,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                                  false, initialHotPageSize)) {
                 hotEntries = hotStream.toList();
             }
-            hot = hotEntries.stream();
+            hot = effectiveHasMutations
+                    ? excludeMutated(hotEntries.stream(), entry -> entry.getKey().getIdAsLong(), mutationBatchSize)
+                    : hotEntries.stream();
             cold = streamColdBasesForLatest(tierFilter, tierLimit,
-                    dataStreams, fois, hotEntries);
+                    dataStreams, fois, hotEntries, effectiveHasMutations);
         } else if (boundedMerge && tierLimit <= STREAM_FETCH_SIZE) {
             List<Entry<BigId, IObsData>> hotEntries;
             try (Stream<Entry<BigId, IObsData>> hotStream =
@@ -991,7 +997,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
     private Stream<Entry<BigId, IObsData>> streamColdBasesForLatest(
             ObsFilter filter, long readerLimit, Set<Long> dataStreams, Set<Long> fois,
-            List<Entry<BigId, IObsData>> hotEntries) {
+            List<Entry<BigId, IObsData>> hotEntries, boolean hasMutations) {
         ArchiveBounds bounds = archiveBounds(filter);
         Set<Long> archivedStreams = archiveCatalog.filterPresentDataStreams(
                 bounds.start(), bounds.end(), dataStreams);
@@ -1126,7 +1132,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         .thenComparing(ArchiveGeneration::id))
                 .toList();
         Stream<Entry<BigId, IObsData>> scannedCold = streamColdBasesFromCandidates(
-                filteredCandidates, filter, readerLimit, coldDataStreams, fois, false,
+                filteredCandidates, filter, readerLimit, coldDataStreams, fois, hasMutations,
                 MutationFilteringIterator.LOOKUP_BATCH_SIZE);
         return cachedColdEntries.isEmpty()
                 ? scannedCold
