@@ -340,6 +340,12 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS any_alarm_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS unadjudicated_alarm_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS adjudicated_alarm_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS unadjudicated_gamma_alarm_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS unadjudicated_neutron_alarm_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS unadjudicated_gamma_neutron_alarm_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS adjudicated_gamma_alarm_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS adjudicated_neutron_alarm_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS adjudicated_gamma_neutron_alarm_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS gamma_high_fault_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS gamma_low_fault_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS neutron_fault_count bigint");
@@ -347,6 +353,55 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS tamper_true_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS rs350_gamma_alarm_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS rs350_neutron_alarm_count bigint");
+                statement.execute("UPDATE oscar_archive_schema SET " +
+                        "unadjudicated_gamma_alarm_count = CASE " +
+                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                        "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
+                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 " +
+                        "  ELSE NULL END, " +
+                        "unadjudicated_neutron_alarm_count = CASE " +
+                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                        "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
+                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 " +
+                        "  ELSE NULL END, " +
+                        "unadjudicated_gamma_neutron_alarm_count = CASE " +
+                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                        "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
+                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                        "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 " +
+                        "  ELSE NULL END, " +
+                        "adjudicated_gamma_alarm_count = CASE " +
+                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                        "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
+                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 " +
+                        "  ELSE NULL END, " +
+                        "adjudicated_neutron_alarm_count = CASE " +
+                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                        "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
+                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 " +
+                        "  ELSE NULL END, " +
+                        "adjudicated_gamma_neutron_alarm_count = CASE " +
+                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                        "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
+                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                        "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 " +
+                        "  ELSE NULL END " +
+                        "WHERE summary_populated AND (" +
+                        "  COALESCE(any_alarm_count, 0) = 0 OR " +
+                        "  COALESCE(unadjudicated_alarm_count, 0) = 0 OR " +
+                        "  COALESCE(adjudicated_alarm_count, 0) = 0 OR " +
+                        "  (COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) OR " +
+                        "  (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) OR " +
+                        "  (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0)" +
+                        ") AND (" +
+                        "  unadjudicated_gamma_alarm_count IS NULL OR " +
+                        "  unadjudicated_neutron_alarm_count IS NULL OR " +
+                        "  unadjudicated_gamma_neutron_alarm_count IS NULL" +
+                        ")");
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_archive_schema_datastream_idx " +
                         "ON oscar_archive_schema (datastream_id, generation_id)");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_obs_latest (" +
@@ -1220,6 +1275,10 @@ public final class ArchiveCatalog {
 
     private void populateGenerationSummariesAndLatest(
             Connection connection, ArchiveGeneration generation) throws SQLException {
+        String isUnadjudicatedJson = "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0) " +
+                "OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') = '0'))";
+        String isAdjudicatedJson = "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0) " +
+                "OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') <> '0'))";
         String updateSummarySql = "UPDATE oscar_archive_schema s SET " +
                 "summary_populated = true, " +
                 "row_count = agg.row_count, " +
@@ -1232,6 +1291,12 @@ public final class ArchiveCatalog {
                 "any_alarm_count = agg.any_alarm_count, " +
                 "unadjudicated_alarm_count = agg.unadjudicated_alarm_count, " +
                 "adjudicated_alarm_count = agg.adjudicated_alarm_count, " +
+                "unadjudicated_gamma_alarm_count = agg.unadjudicated_gamma_alarm_count, " +
+                "unadjudicated_neutron_alarm_count = agg.unadjudicated_neutron_alarm_count, " +
+                "unadjudicated_gamma_neutron_alarm_count = agg.unadjudicated_gamma_neutron_alarm_count, " +
+                "adjudicated_gamma_alarm_count = agg.adjudicated_gamma_alarm_count, " +
+                "adjudicated_neutron_alarm_count = agg.adjudicated_neutron_alarm_count, " +
+                "adjudicated_gamma_neutron_alarm_count = agg.adjudicated_gamma_neutron_alarm_count, " +
                 "gamma_high_fault_count = agg.gamma_high_fault_count, " +
                 "gamma_low_fault_count = agg.gamma_low_fault_count, " +
                 "neutron_fault_count = agg.neutron_fault_count, " +
@@ -1249,8 +1314,14 @@ public final class ArchiveCatalog {
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb)::bigint AS gamma_true_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'neutronAlarm' = 'true'::jsonb)::bigint AS neutron_true_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb))::bigint AS any_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb) AND jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0)::bigint AS unadjudicated_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb) AND jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0)::bigint AS adjudicated_alarm_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb) AND " + isUnadjudicatedJson + ")::bigint AS unadjudicated_alarm_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb) AND " + isAdjudicatedJson + ")::bigint AS adjudicated_alarm_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb AND " + isUnadjudicatedJson + ")::bigint AS unadjudicated_gamma_alarm_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " + isUnadjudicatedJson + ")::bigint AS unadjudicated_neutron_alarm_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " + isUnadjudicatedJson + ")::bigint AS unadjudicated_gamma_neutron_alarm_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb AND " + isAdjudicatedJson + ")::bigint AS adjudicated_gamma_alarm_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " + isAdjudicatedJson + ")::bigint AS adjudicated_neutron_alarm_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " + isAdjudicatedJson + ")::bigint AS adjudicated_gamma_neutron_alarm_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma High\"'::jsonb)::bigint AS gamma_high_fault_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma Low\"'::jsonb)::bigint AS gamma_low_fault_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Neutron\"'::jsonb)::bigint AS neutron_fault_count, " +
@@ -1743,12 +1814,20 @@ public final class ArchiveCatalog {
             return 0;
         try (Connection connection = connections.open();
              PreparedStatement fastPath = connection.prepareStatement(
-                     "UPDATE oscar_archive_schema s SET summary_populated = TRUE " +
-                     "FROM " + safeIdentifier(storeKey + "_datastreams") + " d, oscar_obs_latest l " +
-                     "WHERE s.store_key=? AND s.id_scope=? AND NOT s.summary_populated " +
+                     "UPDATE oscar_archive_schema s SET " +
+                     "summary_populated = TRUE, " +
+                     "unadjudicated_gamma_alarm_count = COALESCE(s.unadjudicated_gamma_alarm_count, 0), " +
+                     "unadjudicated_neutron_alarm_count = COALESCE(s.unadjudicated_neutron_alarm_count, 0), " +
+                     "unadjudicated_gamma_neutron_alarm_count = COALESCE(s.unadjudicated_gamma_neutron_alarm_count, 0), " +
+                     "adjudicated_gamma_alarm_count = COALESCE(s.adjudicated_gamma_alarm_count, 0), " +
+                     "adjudicated_neutron_alarm_count = COALESCE(s.adjudicated_neutron_alarm_count, 0), " +
+                     "adjudicated_gamma_neutron_alarm_count = COALESCE(s.adjudicated_gamma_neutron_alarm_count, 0) " +
+                     "FROM oscar_archive_generation g, " + safeIdentifier(storeKey + "_datastreams") + " d, oscar_obs_latest l " +
+                     "WHERE g.id = s.generation_id AND g.store_key=? AND g.id_scope=? " +
+                     "AND (NOT s.summary_populated OR s.unadjudicated_gamma_alarm_count IS NULL) " +
                      "AND d.id = s.datastream_id " +
-                     "AND l.store_key = s.store_key AND l.id_scope = s.id_scope AND l.datastream_id = s.datastream_id " +
-                     "AND (s.max_phenomenon_time IS NULL OR l.phenomenon_time >= s.max_phenomenon_time) " +
+                     "AND l.store_key = g.store_key AND l.id_scope = g.id_scope AND l.datastream_id = s.datastream_id " +
+                     "AND l.phenomenon_time >= g.window_end " +
                      "AND COALESCE(d.data->>'outputName', d.data->'recordSchema'->>'name', '') " +
                      "    NOT IN ('occupancy', 'tamper', 'connectionStatus', 'occupancyStatus', 'adjudication', 'report')")) {
             fastPath.setString(1, storeKey);
@@ -1763,7 +1842,7 @@ public final class ArchiveCatalog {
                 "FROM oscar_archive_generation g " +
                 "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
                 "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
-                "WHERE s.generation_id=g.id AND NOT s.summary_populated) " +
+                "WHERE s.generation_id=g.id AND (NOT s.summary_populated OR s.unadjudicated_gamma_alarm_count IS NULL)) " +
                 "ORDER BY g.window_end DESC, g.id LIMIT ?";
         try (Connection connection = connections.open();
              PreparedStatement statement = connection.prepareStatement(sql)) {
@@ -2453,29 +2532,35 @@ public final class ArchiveCatalog {
             return working;
 
         boolean filterStreams = dataStreams != null;
-        String sql = "SELECT s.generation_id FROM oscar_archive_schema s " +
-                "WHERE s.generation_id=ANY (?::uuid[])" +
-                (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "") +
+        boolean omitGenFilter = filterStreams && working.size() > 64;
+        String sql = "SELECT s.generation_id FROM oscar_archive_schema s WHERE " +
+                (omitGenFilter
+                        ? "s.datastream_id=ANY (?::bigint[])"
+                        : "s.generation_id=ANY (?::uuid[])" +
+                          (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "")) +
                 " GROUP BY s.generation_id " +
                 "HAVING BOOL_AND(s.summary_populated) AND COALESCE(SUM(" + summaryExpr + "), 0) = 0";
         Set<UUID> prune = new HashSet<>();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
-            java.sql.Array genArray = connection.createArrayOf("uuid",
+            java.sql.Array genArray = omitGenFilter ? null : connection.createArrayOf("uuid",
                     working.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
             java.sql.Array streamArray = filterStreams
                     ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                     : null;
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                statement.setArray(1, genArray);
+                int param = 1;
+                if (genArray != null)
+                    statement.setArray(param++, genArray);
                 if (streamArray != null)
-                    statement.setArray(2, streamArray);
+                    statement.setArray(param, streamArray);
                 try (ResultSet result = statement.executeQuery()) {
                     while (result.next())
                         prune.add(result.getObject(1, UUID.class));
                 }
             } finally {
-                genArray.free();
+                if (genArray != null)
+                    genArray.free();
                 if (streamArray != null)
                     streamArray.free();
             }
@@ -2483,6 +2568,213 @@ public final class ArchiveCatalog {
             return working;
         }
         return prune.isEmpty() ? working : working.stream().filter(g -> !prune.contains(g.id())).toList();
+    }
+
+    public record CandidateSelectionPlan(
+            List<ArchiveGeneration> primaryCandidates,
+            List<ArchiveGeneration> overflowCandidates) {}
+
+    /**
+     * Prunes zero-match archive generations using {@code oscar_archive_schema}
+     * summary counters (or {@code oscar_event_locator} when {@code exactEventId}
+     * is present), and slices surviving clusters into a bounded {@code primaryCandidates}
+     * prefix that satisfies {@code readerLimit} plus a lazy {@code overflowCandidates}
+     * remainder.
+     */
+    public CandidateSelectionPlan selectSummaryMatchedCandidates(
+            List<ArchiveGeneration> candidates,
+            TemporalFilter phenomenonTimeFilter,
+            TemporalFilter resultTimeFilter,
+            Set<Long> dataStreams,
+            boolean descending,
+            long readerLimit,
+            boolean hasMutations,
+            JsonCqlEvaluator.SummaryCounterSpec summarySpec,
+            String exactEventId) {
+        if (candidates == null || candidates.isEmpty())
+            return new CandidateSelectionPlan(List.of(), List.of());
+
+        List<ArchiveGeneration> working = candidates;
+        if (exactEventId != null && !exactEventId.isEmpty()) {
+            String locatorSql = "SELECT generation_id FROM oscar_event_locator " +
+                    "WHERE store_key=? AND id_scope=? AND public_id=? AND state='ACTIVE' " +
+                    "AND generation_id IS NOT NULL";
+            try (Connection connection = connections.open();
+                 PreparedStatement statement = connection.prepareStatement(locatorSql)) {
+                statement.setString(1, storeKey);
+                statement.setInt(2, idScope);
+                statement.setString(3, exactEventId);
+                try (ResultSet result = statement.executeQuery()) {
+                    if (result.next()) {
+                        UUID targetGen = result.getObject(1, UUID.class);
+                        if (targetGen != null) {
+                            working = working.stream()
+                                    .filter(g -> targetGen.equals(g.id()))
+                                    .toList();
+                            if (working.isEmpty())
+                                return new CandidateSelectionPlan(List.of(), List.of());
+                        }
+                    }
+                }
+            } catch (SQLException ignored) {
+                // Fall back to full candidate list if locator lookup fails.
+            }
+        }
+
+        if (summarySpec == null)
+            return new CandidateSelectionPlan(working, List.of());
+
+        boolean filterStreams = dataStreams != null;
+        boolean omitGenFilter = filterStreams && working.size() > 64;
+        String sql = "SELECT s.generation_id, " +
+                "BOOL_AND(s.summary_populated), " +
+                "COALESCE(SUM(" + summarySpec.upperBoundExpr() + "), 0)::bigint, " +
+                "BOOL_AND(" + summarySpec.exactReadyExpr() + "), " +
+                "COALESCE(SUM(" + summarySpec.exactExpr() + "), 0)::bigint " +
+                "FROM oscar_archive_schema s WHERE " +
+                (omitGenFilter
+                        ? "s.datastream_id=ANY (?::bigint[])"
+                        : "s.generation_id=ANY (?::uuid[])" +
+                          (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "")) +
+                " GROUP BY s.generation_id";
+
+        Map<UUID, Boolean> populatedByGen = new HashMap<>();
+        Map<UUID, Long> upperByGen = new HashMap<>();
+        Map<UUID, Boolean> exactReadyByGen = new HashMap<>();
+        Map<UUID, Long> exactByGen = new HashMap<>();
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            java.sql.Array genArray = omitGenFilter ? null : connection.createArrayOf("uuid",
+                    working.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
+            java.sql.Array streamArray = filterStreams
+                    ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
+                    : null;
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                int param = 1;
+                if (genArray != null)
+                    statement.setArray(param++, genArray);
+                if (streamArray != null)
+                    statement.setArray(param, streamArray);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next()) {
+                        UUID genId = result.getObject(1, UUID.class);
+                        populatedByGen.put(genId, result.getBoolean(2));
+                        upperByGen.put(genId, result.getLong(3));
+                        exactReadyByGen.put(genId, result.getBoolean(4));
+                        exactByGen.put(genId, result.getLong(5));
+                    }
+                }
+            } finally {
+                if (genArray != null)
+                    genArray.free();
+                if (streamArray != null)
+                    streamArray.free();
+            }
+        } catch (SQLException e) {
+            return new CandidateSelectionPlan(working, List.of());
+        }
+
+        List<ArchiveGeneration> surviving = new ArrayList<>();
+        for (ArchiveGeneration generation : working) {
+            UUID genId = generation.id();
+            boolean populated = Boolean.TRUE.equals(populatedByGen.get(genId));
+            long upper = upperByGen.getOrDefault(genId, 0L);
+            if (populated && upper == 0L)
+                continue;
+            surviving.add(generation);
+        }
+        if (surviving.isEmpty() || readerLimit == Long.MAX_VALUE)
+            return new CandidateSelectionPlan(surviving, List.of());
+
+        List<List<ArchiveGeneration>> clusters = groupDisjointClusters(surviving);
+        if (descending)
+            java.util.Collections.reverse(clusters);
+        if (clusters.size() <= 1)
+            return new CandidateSelectionPlan(surviving, List.of());
+
+        Map<UUID, Set<Long>> mutatedByGen = hasMutations
+                ? mutatedObservationIdsByGeneration(
+                        surviving.stream().map(ArchiveGeneration::id).toList())
+                : Map.of();
+
+        List<ArchiveGeneration> primary = new ArrayList<>();
+        List<ArchiveGeneration> overflow = new ArrayList<>();
+        long guaranteedMatches = 0L;
+        long upperBoundMatches = 0L;
+        int primaryClusterCount = 0;
+        boolean fillOverflow = false;
+
+        for (List<ArchiveGeneration> cluster : clusters) {
+            if (fillOverflow) {
+                overflow.addAll(cluster);
+                continue;
+            }
+            primary.addAll(cluster);
+            primaryClusterCount++;
+            boolean clusterExact = true;
+            long clusterExactSum = 0L;
+            long clusterUpperSum = 0L;
+            for (ArchiveGeneration gen : cluster) {
+                UUID genId = gen.id();
+                boolean populated = Boolean.TRUE.equals(populatedByGen.get(genId));
+                long upper = populated ? upperByGen.getOrDefault(genId, 0L) : readerLimit;
+                clusterUpperSum = saturateAddLong(clusterUpperSum, upper);
+                if (clusterExact &&
+                        Boolean.TRUE.equals(exactReadyByGen.get(genId)) &&
+                        isGenerationWindowFullyContained(gen, phenomenonTimeFilter) &&
+                        isGenerationResultTimeFullyContained(gen, resultTimeFilter)) {
+                    long mutatedCount = mutatedByGen.getOrDefault(genId, Set.of()).size();
+                    long exactUnmutated = Math.max(0L, exactByGen.getOrDefault(genId, 0L) - mutatedCount);
+                    clusterExactSum = saturateAddLong(clusterExactSum, exactUnmutated);
+                } else {
+                    clusterExact = false;
+                }
+            }
+            upperBoundMatches = saturateAddLong(upperBoundMatches, clusterUpperSum);
+            if (clusterExact)
+                guaranteedMatches = saturateAddLong(guaranteedMatches, clusterExactSum);
+
+            if (guaranteedMatches >= readerLimit) {
+                break;
+            }
+            if (upperBoundMatches >= readerLimit && primaryClusterCount >= 4) {
+                fillOverflow = true;
+            }
+        }
+
+        primary.sort(java.util.Comparator.comparing(ArchiveGeneration::start)
+                .thenComparing(ArchiveGeneration::end)
+                .thenComparing(ArchiveGeneration::id));
+        overflow.sort(java.util.Comparator.comparing(ArchiveGeneration::start)
+                .thenComparing(ArchiveGeneration::end)
+                .thenComparing(ArchiveGeneration::id));
+        return new CandidateSelectionPlan(primary, overflow);
+    }
+
+    private static List<List<ArchiveGeneration>> groupDisjointClusters(List<ArchiveGeneration> generations) {
+        List<ArchiveGeneration> ordered = new ArrayList<>(generations);
+        ordered.sort(java.util.Comparator.comparing(ArchiveGeneration::start)
+                .thenComparing(ArchiveGeneration::end)
+                .thenComparing(ArchiveGeneration::id));
+        List<List<ArchiveGeneration>> clusters = new ArrayList<>();
+        Instant clusterEnd = null;
+        for (ArchiveGeneration generation : ordered) {
+            if (clusters.isEmpty() || !generation.start().isBefore(clusterEnd)) {
+                clusters.add(new ArrayList<>());
+                clusterEnd = generation.end();
+            } else if (generation.end().isAfter(clusterEnd)) {
+                clusterEnd = generation.end();
+            }
+            clusters.get(clusters.size() - 1).add(generation);
+        }
+        return clusters;
+    }
+
+    private static long saturateAddLong(long a, long b) {
+        if (a == Long.MAX_VALUE || b <= 0L)
+            return a;
+        long r = a + b;
+        return r < 0L ? Long.MAX_VALUE : r;
     }
 
     public record ColdSummaryPlan(long summarizedCount, List<ArchiveGeneration> remainingCandidates) {}
@@ -2494,37 +2786,61 @@ public final class ArchiveCatalog {
     public ColdSummaryPlan summarizeColdCandidates(
             List<ArchiveGeneration> candidates, TemporalFilter phenomenonTimeFilter,
             Set<Long> dataStreams, Set<UUID> mutatedGenerationIds, String summaryExpr) {
-        if (candidates == null || candidates.isEmpty() || summaryExpr == null)
+        if (summaryExpr == null)
+            return new ColdSummaryPlan(0L, candidates == null ? List.of() : candidates);
+        return summarizeColdCandidates(candidates, phenomenonTimeFilter, null,
+                dataStreams, mutatedGenerationIds,
+                new JsonCqlEvaluator.SummaryCounterSpec(summaryExpr, summaryExpr, "s.summary_populated"));
+    }
+
+    public ColdSummaryPlan summarizeColdCandidates(
+            List<ArchiveGeneration> candidates, TemporalFilter phenomenonTimeFilter,
+            TemporalFilter resultTimeFilter,
+            Set<Long> dataStreams, Set<UUID> mutatedGenerationIds,
+            JsonCqlEvaluator.SummaryCounterSpec summarySpec) {
+        if (candidates == null || candidates.isEmpty() || summarySpec == null)
             return new ColdSummaryPlan(0L, candidates == null ? List.of() : candidates);
         boolean filterStreams = dataStreams != null;
+        boolean omitGenFilter = filterStreams && candidates.size() > 64;
         String sql = "SELECT s.generation_id, BOOL_AND(s.summary_populated), " +
-                "COALESCE(SUM(" + summaryExpr + "), 0)::bigint " +
-                "FROM oscar_archive_schema s " +
-                "WHERE s.generation_id=ANY (?::uuid[])" +
-                (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "") +
+                "COALESCE(SUM(" + summarySpec.upperBoundExpr() + "), 0)::bigint, " +
+                "BOOL_AND(" + summarySpec.exactReadyExpr() + "), " +
+                "COALESCE(SUM(" + summarySpec.exactExpr() + "), 0)::bigint " +
+                "FROM oscar_archive_schema s WHERE " +
+                (omitGenFilter
+                        ? "s.datastream_id=ANY (?::bigint[])"
+                        : "s.generation_id=ANY (?::uuid[])" +
+                          (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "")) +
                 " GROUP BY s.generation_id";
         Map<UUID, Boolean> populatedByGen = new HashMap<>();
-        Map<UUID, Long> countByGen = new HashMap<>();
+        Map<UUID, Long> upperByGen = new HashMap<>();
+        Map<UUID, Boolean> exactReadyByGen = new HashMap<>();
+        Map<UUID, Long> exactByGen = new HashMap<>();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
-            java.sql.Array genArray = connection.createArrayOf("uuid",
+            java.sql.Array genArray = omitGenFilter ? null : connection.createArrayOf("uuid",
                     candidates.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
             java.sql.Array streamArray = filterStreams
                     ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                     : null;
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                statement.setArray(1, genArray);
+                int param = 1;
+                if (genArray != null)
+                    statement.setArray(param++, genArray);
                 if (streamArray != null)
-                    statement.setArray(2, streamArray);
+                    statement.setArray(param, streamArray);
                 try (ResultSet result = statement.executeQuery()) {
                     while (result.next()) {
                         UUID genId = result.getObject(1, UUID.class);
                         populatedByGen.put(genId, result.getBoolean(2));
-                        countByGen.put(genId, result.getLong(3));
+                        upperByGen.put(genId, result.getLong(3));
+                        exactReadyByGen.put(genId, result.getBoolean(4));
+                        exactByGen.put(genId, result.getLong(5));
                     }
                 }
             } finally {
-                genArray.free();
+                if (genArray != null)
+                    genArray.free();
                 if (streamArray != null)
                     streamArray.free();
             }
@@ -2537,16 +2853,18 @@ public final class ArchiveCatalog {
         for (ArchiveGeneration generation : candidates) {
             UUID genId = generation.id();
             boolean populated = Boolean.TRUE.equals(populatedByGen.get(genId));
-            long matched = countByGen.getOrDefault(genId, 0L);
+            long upper = upperByGen.getOrDefault(genId, 0L);
+            boolean exactReady = Boolean.TRUE.equals(exactReadyByGen.get(genId));
+            long exact = exactByGen.getOrDefault(genId, 0L);
             boolean mutated = mutatedGenerationIds != null && mutatedGenerationIds.contains(genId);
-            if (!mutated && populated) {
-                if (matched == 0L) {
-                    continue; // Zero matching base rows in this generation even at window boundaries.
-                }
-                if (isGenerationWindowFullyContained(generation, phenomenonTimeFilter)) {
-                    summarized = Math.addExact(summarized, matched);
-                    continue;
-                }
+            if (populated && upper == 0L) {
+                continue; // Zero matching base rows in this generation even at window boundaries.
+            }
+            if (!mutated && populated && exactReady &&
+                    isGenerationWindowFullyContained(generation, phenomenonTimeFilter) &&
+                    isGenerationResultTimeFullyContained(generation, resultTimeFilter)) {
+                summarized = Math.addExact(summarized, exact);
+                continue;
             }
             remaining.add(generation);
         }
@@ -2569,6 +2887,27 @@ public final class ArchiveCatalog {
         if (max != null && !Instant.MAX.equals(max)) {
             // Every row in generation satisfies phenomenon_time < generation.end().
             if (generation.end().isAfter(max))
+                return false;
+        }
+        return true;
+    }
+
+    private static boolean isGenerationResultTimeFullyContained(
+            ArchiveGeneration generation, TemporalFilter filter) {
+        if (filter == null)
+            return true;
+        if (filter.isLatestTime() || filter.isCurrentTime())
+            return false;
+        Instant min = filter.getMin();
+        if (min != null && !Instant.MIN.equals(min))
+            return false;
+        Instant max = filter.getMax();
+        if (max != null && !Instant.MAX.equals(max)) {
+            Instant maxResult = generation.maxResultTime();
+            if (maxResult == null)
+                return false;
+            boolean upperClosed = filter.getRange().upperBoundType() == BoundType.CLOSED;
+            if (upperClosed ? maxResult.isAfter(max) : !maxResult.isBefore(max))
                 return false;
         }
         return true;
@@ -3193,6 +3532,13 @@ public final class ArchiveCatalog {
             delete.setInt(2, idScope);
             delete.setLong(3, observationId);
             delete.executeUpdate();
+        }
+        try (PreparedStatement deleteLocator = connection.prepareStatement(
+                "DELETE FROM oscar_event_locator WHERE store_key=? AND id_scope=? AND observation_id=?")) {
+            deleteLocator.setString(1, storeKey);
+            deleteLocator.setInt(2, idScope);
+            deleteLocator.setLong(3, observationId);
+            deleteLocator.executeUpdate();
         }
     }
 

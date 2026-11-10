@@ -833,6 +833,106 @@ public class TestParquetArchiveReader {
                 List.of(first, second), escapedFilter, null, null, Set.of(2006L)));
     }
 
+    @Test
+    public void nestedDashboardAlarmCqlMapsToPerCategorySummarySpecsAndExtractsTimeBounds() throws Exception {
+        ObsFilter q0 = new ObsFilter.Builder()
+                .withCQLFilter("(gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0")
+                .build();
+        ObsFilter q1 = new ObsFilter.Builder()
+                .withCQLFilter("(((gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0)) AND (gammaAlarm = false AND neutronAlarm = true)")
+                .build();
+        ObsFilter q2 = new ObsFilter.Builder()
+                .withCQLFilter("(((gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0)) AND (gammaAlarm = true AND neutronAlarm = false)")
+                .build();
+        ObsFilter q3 = new ObsFilter.Builder()
+                .withCQLFilter("(((gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0)) AND (gammaAlarm = true AND neutronAlarm = true)")
+                .build();
+
+        assertEquals("COALESCE(s.unadjudicated_alarm_count, 0)",
+                JsonCqlEvaluator.summaryCounterSpec(q0.getCQLFilter()).orElseThrow().exactExpr());
+        assertEquals("COALESCE(s.unadjudicated_neutron_alarm_count, 0)",
+                JsonCqlEvaluator.summaryCounterSpec(q1.getCQLFilter()).orElseThrow().exactExpr());
+        assertEquals("COALESCE(s.unadjudicated_gamma_alarm_count, 0)",
+                JsonCqlEvaluator.summaryCounterSpec(q2.getCQLFilter()).orElseThrow().exactExpr());
+        assertEquals("COALESCE(s.unadjudicated_gamma_neutron_alarm_count, 0)",
+                JsonCqlEvaluator.summaryCounterSpec(q3.getCQLFilter()).orElseThrow().exactExpr());
+
+        assertTrue(JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(q1.getCQLFilter()));
+        assertTrue(JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(q2.getCQLFilter()));
+        assertTrue(JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(q3.getCQLFilter()));
+
+        assertTrue(JsonCqlEvaluator.matches(q2.getCQLFilter(),
+                "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIds\":[]}"));
+        assertTrue(!JsonCqlEvaluator.matches(q2.getCQLFilter(),
+                "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIds\":[\"eml:non-threat\",\"code:9\"]}"));
+
+        ObsFilter resolveEvent = new ObsFilter.Builder()
+                .withCQLFilter("startTime = '2026-11-10T01:00:00Z' AND endTime = '2026-11-10T01:00:05Z'")
+                .build();
+        JsonCqlEvaluator.CqlTimeBounds bounds =
+                JsonCqlEvaluator.extractCqlPhenomenonTimeBounds(resolveEvent.getCQLFilter()).orElseThrow();
+        assertEquals(Instant.parse("2026-11-10T00:00:00Z"), bounds.minPhenomenonTime());
+        assertEquals(Instant.parse("2026-11-10T02:00:05Z"), bounds.maxPhenomenonTime());
+
+        // Extra conjuncts in AND filters preserve upperBoundExpr for zero-match pruning while disabling exactReadyExpr.
+        ObsFilter bareAdjFilter = new ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount > 0")
+                .build();
+        assertEquals("COALESCE(s.adjudicated_alarm_count, 0)",
+                JsonCqlEvaluator.summaryCounterSpec(bareAdjFilter.getCQLFilter()).orElseThrow().exactExpr());
+
+        ObsFilter adjCodeFilter = new ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount > 0 AND adjudicatedIds = 'code:4'")
+                .build();
+        JsonCqlEvaluator.SummaryCounterSpec adjCodeSpec =
+                JsonCqlEvaluator.summaryCounterSpec(adjCodeFilter.getCQLFilter()).orElseThrow();
+        assertEquals("COALESCE(s.adjudicated_alarm_count, 0)", adjCodeSpec.upperBoundExpr());
+        assertEquals("0::bigint", adjCodeSpec.exactExpr());
+        assertEquals("false", adjCodeSpec.exactReadyExpr());
+
+        ObsFilter unadjWithTimeFilter = new ObsFilter.Builder()
+                .withCQLFilter("(((gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0)) AND startTime >= '2026-11-10T01:00:00Z'")
+                .build();
+        JsonCqlEvaluator.SummaryCounterSpec unadjTimeSpec =
+                JsonCqlEvaluator.summaryCounterSpec(unadjWithTimeFilter.getCQLFilter()).orElseThrow();
+        assertEquals("COALESCE(s.unadjudicated_alarm_count, 0)", unadjTimeSpec.upperBoundExpr());
+        assertEquals("0::bigint", unadjTimeSpec.exactExpr());
+        assertEquals("false", unadjTimeSpec.exactReadyExpr());
+
+        // Cold alarm initial adjudication + re-adjudication CQL matching transitions.
+        ObsFilter unadjFilter = new ObsFilter.Builder()
+                .withCQLFilter("(gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0")
+                .build();
+        ObsFilter adjFilter = new ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount > 0")
+                .build();
+        ObsFilter code6Filter = new ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount > 0 AND adjudicatedIds = 'code:6'")
+                .build();
+        ObsFilter code4Filter = new ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount > 0 AND adjudicatedIds = 'code:4'")
+                .build();
+
+        String coldUnadjudicatedJson = "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":0,\"adjudicatedIds\":[]}";
+        String coldFirstAdjudicatedJson = "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":2,\"adjudicatedIds\":[\"cmd-1\",\"code:6\"]}";
+        String coldReAdjudicatedJson = "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":3,\"adjudicatedIds\":[\"cmd-1\",\"cmd-2\",\"code:4\"]}";
+
+        assertTrue(JsonCqlEvaluator.matches(unadjFilter.getCQLFilter(), coldUnadjudicatedJson));
+        assertFalse(JsonCqlEvaluator.matches(adjFilter.getCQLFilter(), coldUnadjudicatedJson));
+
+        assertFalse(JsonCqlEvaluator.matches(unadjFilter.getCQLFilter(), coldFirstAdjudicatedJson));
+        assertTrue(JsonCqlEvaluator.matches(adjFilter.getCQLFilter(), coldFirstAdjudicatedJson));
+        assertTrue(JsonCqlEvaluator.matches(code6Filter.getCQLFilter(), coldFirstAdjudicatedJson));
+        assertFalse(JsonCqlEvaluator.matches(code4Filter.getCQLFilter(), coldFirstAdjudicatedJson));
+
+        assertFalse(JsonCqlEvaluator.matches(unadjFilter.getCQLFilter(), coldReAdjudicatedJson));
+        assertTrue(JsonCqlEvaluator.matches(adjFilter.getCQLFilter(), coldReAdjudicatedJson));
+        assertFalse("Prior code marker must no longer match after re-adjudication",
+                JsonCqlEvaluator.matches(code6Filter.getCQLFilter(), coldReAdjudicatedJson));
+        assertTrue("Updated code marker must match after re-adjudication",
+                JsonCqlEvaluator.matches(code4Filter.getCQLFilter(), coldReAdjudicatedJson));
+    }
+
     private record TestRow(long id, long dataStreamId, String time, String resultJson) {
         private TestRow(long id, long dataStreamId, String time) {
             this(id, dataStreamId, time, "{\"value\":" + id + "}");

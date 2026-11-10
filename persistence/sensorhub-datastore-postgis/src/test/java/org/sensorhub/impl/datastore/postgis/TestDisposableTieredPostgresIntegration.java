@@ -5095,6 +5095,20 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertNotNull(tiered.get(occ1));
         assertNotNull(tiered.get(status1));
         assertNotNull(tiered.get(static1));
+
+        // Second overlay mutation (re-adjudication / state update on an already-overlaid cold row)
+        // must replace the prior overlay in-place and update both oscar_obs_overlay and oscar_obs_latest.
+        tiered.put(occ2, alarmObs(occStream, base.plusSeconds(20), base.plusSeconds(20), true, true, 155.0));
+        assertEquals(1L, tiered.getArchiveCatalog().countObservationMutations(Set.of(occStream.getIdAsLong())));
+        assertEquals(1L, tiered.countMatchingEntries(gammaAlarmFilter));
+        assertEquals(1L, tiered.countMatchingEntries(neutronAlarmFilter));
+        try (var rows = tiered.selectEntries(latestOcc)) {
+            var selected = rows.toList();
+            assertEquals(1, selected.size());
+            assertTrue(selected.get(0).getValue().getResult().getBooleanValue(0));
+            assertTrue(selected.get(0).getValue().getResult().getBooleanValue(1));
+            assertEquals(155.0, selected.get(0).getValue().getResult().getDoubleValue(2), 1e-6);
+        }
     }
 
     private static String toPostgresPositionalSql(String jdbcSql) {

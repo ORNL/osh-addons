@@ -172,13 +172,13 @@ public final class ParquetArchiveReader {
     private Stream<ArchivedRow> streamWindowClusters(
             List<ArchiveGeneration> generations, ObsFilter filter,
             Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit) {
-        boolean batchSelectiveCql = limit == Long.MAX_VALUE && filter.getCQLFilter() != null &&
-                JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(filter.getCQLFilter());
-        List<List<ArchiveGeneration>> clusters = batchSelectiveCql
-                ? batchWindowClusters(generations, MAX_CQL_PAYLOAD_BATCH)
-                : windowClusters(generations);
+        List<List<ArchiveGeneration>> clusters = windowClusters(generations);
         if (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().descendingOrder())
             java.util.Collections.reverse(clusters);
+        if (limit == Long.MAX_VALUE && filter.getCQLFilter() != null && clusters.size() > 1 &&
+                JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(filter.getCQLFilter())) {
+            clusters = batchOrderedClusters(clusters, MAX_CQL_PAYLOAD_BATCH);
+        }
         WindowClusterCursor cursor = new WindowClusterCursor(
                 clusters.iterator(), filter, allowedDataStreams, allowedFois, limit);
         return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
@@ -816,9 +816,14 @@ public final class ParquetArchiveReader {
 
     private static List<List<ArchiveGeneration>> batchWindowClusters(
             List<ArchiveGeneration> generations, int targetBatchSize) {
+        return batchOrderedClusters(windowClusters(generations), targetBatchSize);
+    }
+
+    private static List<List<ArchiveGeneration>> batchOrderedClusters(
+            List<List<ArchiveGeneration>> orderedClusters, int targetBatchSize) {
         List<List<ArchiveGeneration>> batches = new ArrayList<>();
         List<ArchiveGeneration> current = new ArrayList<>();
-        for (List<ArchiveGeneration> cluster : windowClusters(generations)) {
+        for (List<ArchiveGeneration> cluster : orderedClusters) {
             if (!current.isEmpty() && current.size() + cluster.size() > targetBatchSize) {
                 batches.add(current);
                 current = new ArrayList<>();

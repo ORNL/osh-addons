@@ -137,6 +137,9 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             this.archiveCatalog = new ArchiveCatalog(connectionManager::getConnection, dataStoreName, idScope,
                     archiveConfig);
             this.archiveCatalog.migrate();
+            if (archiveConfig.enabled && archiveConfig.rootDirectory != null && !archiveConfig.rootDirectory.isBlank()) {
+                this.archiveCatalog.backfillGenerationSummariesBatch(Path.of(archiveConfig.rootDirectory), 500);
+            }
             this.archiveCatalog.maximumObservationId().ifPresent(archiveMaximum ->
                     lastId.accumulateAndGet(archiveMaximum, Math::max));
             this.archiveExporter = new ArchiveExporter(connectionManager::getConnection, archiveCatalog, archiveConfig,
@@ -228,7 +231,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         archiveLifecycle.maintain();
         if (immutableStage != null)
             immutableStage.retireVerifiedPartitions();
-        archiveCatalog.backfillGenerationSummariesBatch(Path.of(archiveConfig.rootDirectory), 25);
+        archiveCatalog.backfillGenerationSummariesBatch(Path.of(archiveConfig.rootDirectory), 100);
         long now = System.currentTimeMillis();
         long previous = lastMutableReindexEpochMillis.get();
         if (now - previous >= MUTABLE_INDEX_REINDEX_INTERVAL.toMillis() &&
@@ -911,13 +914,29 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             hot = hotEntries.stream();
             cold = streamColdBasesForLatest(tierFilter, tierLimit,
                     dataStreams, fois, hotEntries);
+        } else if (boundedMerge && tierLimit <= STREAM_FETCH_SIZE) {
+            List<Entry<BigId, IObsData>> hotEntries;
+            try (Stream<Entry<BigId, IObsData>> hotStream =
+                         super.selectEntries(tierFilter, (Set<ObsField>) null,
+                                 false, initialHotPageSize)) {
+                Stream<Entry<BigId, IObsData>> effectiveHot = effectiveHasMutations
+                        ? excludeMutated(hotStream, entry -> entry.getKey().getIdAsLong(), mutationBatchSize)
+                        : hotStream;
+                hotEntries = effectiveHot.toList();
+            }
+            hot = hotEntries.stream();
+            Instant hotBoundaryTime = (filter.getLimit() > 0 && hotEntries.size() >= filter.getLimit())
+                    ? hotEntries.get((int) filter.getLimit() - 1).getValue().getPhenomenonTime()
+                    : null;
+            cold = streamColdBases(tierFilter, tierLimit,
+                    dataStreams, fois, effectiveHasMutations, mutationBatchSize, hotBoundaryTime);
         } else {
             hot = super.selectEntries(tierFilter, (Set<ObsField>) null,
                     false, initialHotPageSize);
             if (effectiveHasMutations)
                 hot = excludeMutated(hot, entry -> entry.getKey().getIdAsLong(), mutationBatchSize);
             cold = streamColdBases(tierFilter, tierLimit,
-                    dataStreams, fois, effectiveHasMutations, mutationBatchSize);
+                    dataStreams, fois, effectiveHasMutations, mutationBatchSize, null);
         }
         Stream<Entry<BigId, IObsData>> overlays = parentTableOnly
                 ? Stream.empty()
@@ -1124,7 +1143,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private Stream<Entry<BigId, IObsData>> streamColdBases(
             ObsFilter filter, long readerLimit, Set<Long> dataStreams, Set<Long> fois,
             boolean hasMutations, int mutationBatchSize) {
-        ArchiveBounds bounds = archiveBounds(filter);
+        return streamColdBases(filter, readerLimit, dataStreams, fois, hasMutations, mutationBatchSize, null);
+    }
+
+    private Stream<Entry<BigId, IObsData>> streamColdBases(
+            ObsFilter filter, long readerLimit, Set<Long> dataStreams, Set<Long> fois,
+            boolean hasMutations, int mutationBatchSize, Instant hotBoundaryTime) {
+        ArchiveBounds bounds = archiveBounds(filter, hotBoundaryTime);
+        if (!bounds.start().isBefore(bounds.end()))
+            return Stream.empty();
         Instant minResultTime = minResultTimeBound(filter);
         Long oneId = filter.getInternalIDs() != null && filter.getInternalIDs().size() == 1
                 ? filter.getInternalIDs().first().getIdAsLong() : null;
@@ -1136,6 +1163,51 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         if (oneId == null && minId == null && !hasLatestSelection(filter)) {
             boolean descending = filter.getPhenomenonTime() != null &&
                     filter.getPhenomenonTime().descendingOrder();
+            JsonCqlEvaluator.SummaryCounterSpec summarySpec =
+                    fois == null && filter.getCQLFilter() != null
+                            ? JsonCqlEvaluator.summaryCounterSpec(filter.getCQLFilter()).orElse(null)
+                            : null;
+            String exactEventId = fois == null && filter.getCQLFilter() != null
+                    ? JsonCqlEvaluator.extractExactEventIdFilter(filter.getCQLFilter()).orElse(null)
+                    : null;
+            if (summarySpec != null || exactEventId != null) {
+                List<ArchiveGeneration> allCandidates = pruneAndBackfillLegacyResultTimeCandidates(
+                        archiveCatalog.candidates(
+                                bounds.start(), bounds.end(), null, null, null, dataStreams, minResultTime),
+                        minResultTime);
+                if (allCandidates.isEmpty())
+                    return Stream.empty();
+                ArchiveCatalog.CandidateSelectionPlan plan =
+                        archiveCatalog.selectSummaryMatchedCandidates(
+                                allCandidates, filter.getPhenomenonTime(), filter.getResultTime(),
+                                dataStreams, descending, readerLimit, hasMutations,
+                                summarySpec, exactEventId);
+                if (plan.primaryCandidates().isEmpty())
+                    return Stream.empty();
+                if (plan.overflowCandidates().isEmpty()) {
+                    return streamColdBasesFromPreprunedCandidates(
+                            plan.primaryCandidates(), filter, readerLimit,
+                            dataStreams, fois, hasMutations, mutationBatchSize);
+                }
+                java.util.concurrent.atomic.AtomicLong emitted = new java.util.concurrent.atomic.AtomicLong();
+                Supplier<Stream<Entry<BigId, IObsData>>> primarySupplier = () ->
+                        streamColdBasesFromPreprunedCandidates(
+                                plan.primaryCandidates(), filter, readerLimit,
+                                dataStreams, fois, hasMutations, mutationBatchSize)
+                                .peek(ignored -> emitted.incrementAndGet());
+                Supplier<Stream<Entry<BigId, IObsData>>> overflowSupplier = () -> {
+                    long remainingLimit = readerLimit == Long.MAX_VALUE
+                            ? Long.MAX_VALUE
+                            : readerLimit - emitted.get();
+                    if (readerLimit != Long.MAX_VALUE && remainingLimit <= 0)
+                        return Stream.empty();
+                    return streamColdBasesFromPreprunedCandidates(
+                            plan.overflowCandidates(), filter, remainingLimit,
+                            dataStreams, fois, hasMutations, mutationBatchSize);
+                };
+                return Stream.of(primarySupplier, overflowSupplier).flatMap(Supplier::get);
+            }
+
             ArchiveCatalog.InitialCandidateBatch initialBatch =
                     archiveCatalog.candidatesInitialClusters(
                             bounds.start(), bounds.end(), dataStreams, minResultTime,
@@ -1193,6 +1265,13 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         effectiveCandidates, dataStreams, summaryExpr, exactEventId);
             }
         }
+        return streamColdBasesFromPreprunedCandidates(
+                effectiveCandidates, filter, readerLimit, dataStreams, fois, hasMutations, mutationBatchSize);
+    }
+
+    private Stream<Entry<BigId, IObsData>> streamColdBasesFromPreprunedCandidates(
+            List<ArchiveGeneration> effectiveCandidates, ObsFilter filter, long readerLimit,
+            Set<Long> dataStreams, Set<Long> fois, boolean hasMutations, int mutationBatchSize) {
         if (effectiveCandidates.isEmpty())
             return Stream.empty();
         Stream<ParquetArchiveReader.ArchivedRow> rows = archiveReader.stream(
@@ -1339,6 +1418,10 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     }
 
     private ArchiveBounds archiveBounds(ObsFilter filter) {
+        return archiveBounds(filter, null);
+    }
+
+    private ArchiveBounds archiveBounds(ObsFilter filter, Instant hotBoundaryTime) {
         Instant start = MIN_ARCHIVE_TIME;
         Instant end = MAX_ARCHIVE_TIME;
         if (filter.getPhenomenonTime() != null && !filter.getPhenomenonTime().isLatestTime()) {
@@ -1348,6 +1431,35 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 start = minimum;
             if (maximum != null && !Instant.MAX.equals(maximum))
                 end = maximum.plusNanos(1);
+        }
+        if (filter.getCQLFilter() != null) {
+            java.util.Optional<JsonCqlEvaluator.CqlTimeBounds> cqlBounds =
+                    JsonCqlEvaluator.extractCqlPhenomenonTimeBounds(filter.getCQLFilter());
+            if (cqlBounds.isPresent()) {
+                Instant cqlMin = cqlBounds.get().minPhenomenonTime();
+                Instant cqlMax = cqlBounds.get().maxPhenomenonTime();
+                if (cqlMin != null && cqlMin.isAfter(start))
+                    start = cqlMin;
+                if (cqlMax != null) {
+                    Instant cqlEnd = cqlMax.isBefore(MAX_ARCHIVE_TIME.minusSeconds(1))
+                            ? cqlMax.plusNanos(1) : MAX_ARCHIVE_TIME;
+                    if (cqlEnd.isBefore(end))
+                        end = cqlEnd;
+                }
+            }
+        }
+        if (hotBoundaryTime != null) {
+            boolean descending = filter.getPhenomenonTime() != null &&
+                    filter.getPhenomenonTime().descendingOrder();
+            if (descending) {
+                if (hotBoundaryTime.isAfter(start))
+                    start = hotBoundaryTime;
+            } else {
+                Instant boundaryEnd = hotBoundaryTime.isBefore(MAX_ARCHIVE_TIME.minusSeconds(1))
+                        ? hotBoundaryTime.plusNanos(1) : MAX_ARCHIVE_TIME;
+                if (boundaryEnd.isBefore(end))
+                    end = boundaryEnd;
+            }
         }
         return new ArchiveBounds(start, end);
     }
@@ -3295,13 +3407,14 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 List<ArchiveGeneration> parquetCandidates = candidates;
                 long summarizedColdCount = 0L;
                 if (fois == null && oneId == null && minId == null && maxId == null &&
-                        resolvedFilter.getResultTime() == null) {
-                    String summaryExpr = JsonCqlEvaluator.summaryCounterExpression(
+                        (resolvedFilter.getResultTime() == null || !resolvedFilter.getResultTime().isLatestTime())) {
+                    JsonCqlEvaluator.SummaryCounterSpec summarySpec = JsonCqlEvaluator.summaryCounterSpec(
                             resolvedFilter.getCQLFilter()).orElse(null);
-                    if (summaryExpr != null) {
+                    if (summarySpec != null) {
                         ArchiveCatalog.ColdSummaryPlan summaryPlan = archiveCatalog.summarizeColdCandidates(
                                 candidates, resolvedFilter.getPhenomenonTime(),
-                                dataStreams, mutatedByGen.keySet(), summaryExpr);
+                                resolvedFilter.getResultTime(),
+                                dataStreams, mutatedByGen.keySet(), summarySpec);
                         summarizedColdCount = summaryPlan.summarizedCount();
                         parquetCandidates = summaryPlan.remainingCandidates();
                     }
