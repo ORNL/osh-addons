@@ -76,6 +76,10 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
         return open(DEFAULT_CANCELLATION_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
     }
 
+    static boolean isActive() {
+        return CURRENT.get() != null;
+    }
+
     static CancellableConnectionScope open(long cancellationTimeout, TimeUnit unit) {
         if (CURRENT.get() != null)
             throw new IllegalStateException("A cancellable datastore operation is already active on this thread");
@@ -85,8 +89,12 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
     }
 
     static Connection track(Connection connection) {
+        return track(connection, null);
+    }
+
+    static Connection track(Connection connection, Runnable evictionHook) {
         CancellableConnectionScope scope = CURRENT.get();
-        return scope == null ? connection : scope.trackConnection(connection);
+        return scope == null ? connection : scope.trackConnection(connection, evictionHook);
     }
 
     /**
@@ -116,8 +124,18 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
             throw new CancellationException("Datastore operation was cancelled");
     }
 
-    private Connection trackConnection(Connection connection) {
-        TrackedConnection tracked = new TrackedConnection(connection);
+    static Runnable captureCancellationCheck() {
+        CancellableConnectionScope scope = CURRENT.get();
+        if (scope == null)
+            return () -> {};
+        return () -> {
+            if (scope.cancelled.get())
+                throw new CancellationException("Datastore operation was cancelled");
+        };
+    }
+
+    private Connection trackConnection(Connection connection, Runnable evictionHook) {
+        TrackedConnection tracked = new TrackedConnection(connection, evictionHook);
         connections.add(tracked);
         if (cancelled.get()) {
             IllegalStateException failure = runBoundedActions(
@@ -505,14 +523,17 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
 
     private final class TrackedConnection {
         private final Connection delegate;
+        private final Runnable evictionHook;
         private final Connection proxy;
         private final Set<TrackedStatement> statements = ConcurrentHashMap.newKeySet();
         private final AtomicBoolean abortAttempted = new AtomicBoolean();
+        private final AtomicBoolean evicted = new AtomicBoolean();
         private volatile boolean connectionClosed;
         private volatile boolean connectionAborted;
 
-        TrackedConnection(Connection delegate) {
+        TrackedConnection(Connection delegate, Runnable evictionHook) {
             this.delegate = delegate;
+            this.evictionHook = evictionHook;
             this.proxy = (Connection) Proxy.newProxyInstance(
                     Connection.class.getClassLoader(),
                     new Class<?>[]{Connection.class},
@@ -575,6 +596,15 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
                     }));
         }
 
+        private void evict() {
+            if (evictionHook != null && evicted.compareAndSet(false, true)) {
+                try {
+                    evictionHook.run();
+                } catch (RuntimeException ignored) {
+                }
+            }
+        }
+
         void abort() {
             if (connectionClosed || connectionAborted)
                 return;
@@ -588,12 +618,16 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
                 connectionAborted = true;
             } catch (SQLException error) {
                 throw new IllegalStateException("Could not abort scoped PostgreSQL connection", error);
+            } finally {
+                evict();
             }
         }
 
         synchronized void close() {
             if (connectionClosed)
                 return;
+            if (cancelled.get() || connectionAborted)
+                evict();
             IllegalStateException failure = null;
             for (TrackedStatement statement : new ArrayList<>(statements)) {
                 try {

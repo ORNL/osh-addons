@@ -52,6 +52,11 @@ public class QueryBuilderCommandStatusStore extends QueryBuilder {
                 ")";
     }
 
+    public String createCommandReportTimeIndexQuery() {
+        return "CREATE INDEX IF NOT EXISTS " + getStoreTableName() +
+                "_cmd_report_idx ON " + getStoreTableName() + " (commandid, reportTime DESC)";
+    }
+
     public String insertCommandQuery() {
         return "INSERT INTO "+this.getStoreTableName()+" " +
                 "(commandid, progress, reportTime, statusCode, executionTime, message, result) " +

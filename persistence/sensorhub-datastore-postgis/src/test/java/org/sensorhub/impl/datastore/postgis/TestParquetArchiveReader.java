@@ -933,6 +933,94 @@ public class TestParquetArchiveReader {
                 JsonCqlEvaluator.matches(code4Filter.getCQLFilter(), coldReAdjudicatedJson));
     }
 
+    @Test
+    public void parallelAuthorizeAndCachedCqlCountsPreserveTamperSymlinkAndBoundarySemantics() throws Exception {
+        Path root = temporary.newFolder("parallel-authorize-cql-cache").toPath();
+        Files.createDirectories(root.resolve("datasets/observations/date=2026-01-01/profile=RAW_GATED"));
+        List<ArchiveGeneration> generations = new java.util.ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            Instant winStart = Instant.parse("2026-01-01T00:00:00Z").plusSeconds(i * 1800L);
+            Instant winEnd = winStart.plusSeconds(1800L);
+            Instant rowTime = winStart.plusSeconds(60L);
+            String rel = "datasets/observations/date=2026-01-01/profile=RAW_GATED/gen-" + i + ".parquet";
+            long id1 = i * 10L + 1L;
+            long id2 = i * 10L + 2L;
+            ArchiveGeneration raw = writeGeneration(root, rel, new TestRow[]{
+                    new TestRow(id1, 10L, rowTime.toString(),
+                            "{\"alarmState\":\"Fault - Neutron High\",\"gammaAlarm\":false,\"neutronAlarm\":false}"),
+                    new TestRow(id2, 20L, rowTime.plusSeconds(30L).toString(),
+                            "{\"alarmState\":\"Background\",\"gammaAlarm\":false,\"neutronAlarm\":false}")
+            });
+            generations.add(new ArchiveGeneration(
+                    raw.id(), "RAW_GATED", winStart, winEnd, raw.objectPath(),
+                    raw.sha256(), raw.rowCount(), id1, id2, "SEALED", true));
+        }
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+        ObsFilter fullRangeFault = new ObsFilter.Builder()
+                .withPhenomenonTime()
+                .withRange(Instant.parse("2026-01-01T00:00:00Z"), Instant.parse("2026-01-01T12:00:00Z"))
+                .done()
+                .withCQLFilter("alarmState = 'Fault - Neutron High'")
+                .build();
+
+        // Populates per-generation immutable CQL counts across 12 generations (> 8-way threshold).
+        assertEquals(12L, reader.countCql(generations, fullRangeFault, null, null, Set.of()));
+        // Repeated full-window count hits unmutatedCqlCounts and still returns 12.
+        assertEquals(12L, reader.countCql(generations, fullRangeFault, null, null, Set.of()));
+        // Sub-window fully containing generations 6..11 reuses cached counts for those 6 generations.
+        ObsFilter subRangeFault = new ObsFilter.Builder()
+                .withPhenomenonTime()
+                .withRange(Instant.parse("2026-01-01T03:00:00Z"), Instant.parse("2026-01-01T12:00:00Z"))
+                .done()
+                .withCQLFilter("alarmState = 'Fault - Neutron High'")
+                .build();
+        assertEquals(6L, reader.countCql(generations.subList(6, 12), subRangeFault, null, null, Set.of()));
+
+        // Partial boundary window cutting inside generation 0 before rowTime (winStart+60s) must NOT serve cached 1L.
+        ObsFilter partialBoundary = new ObsFilter.Builder()
+                .withPhenomenonTime()
+                .withRange(Instant.parse("2026-01-01T00:00:00Z"), Instant.parse("2026-01-01T00:00:30Z"))
+                .done()
+                .withCQLFilter("alarmState = 'Fault - Neutron High'")
+                .build();
+        assertEquals(0L, reader.countCql(List.of(generations.get(0)), partialBoundary, null, null, Set.of()));
+
+        // Exclusions inside one generation's [minId, maxId] bypass cached count for that generation.
+        assertEquals(10L, reader.countCql(generations, fullRangeFault, null, null, Set.of(1L, 51L)));
+        // Different allowedDataStreams do not collide with wildcard stream cache key.
+        assertEquals(0L, reader.countCql(generations, fullRangeFault, Set.of(20L), null, Set.of()));
+        assertEquals(12L, reader.countCql(generations, fullRangeFault, Set.of(10L), null, Set.of()));
+
+        // Symlinked intermediate directory in a multi-generation batch must be rejected.
+        Path outsideDir = temporary.newFolder("outside-dir").toPath();
+        Path linkedSubdir = root.resolve("datasets/observations/linked-day");
+        boolean symlinkSupported = true;
+        try {
+            Files.createSymbolicLink(linkedSubdir, outsideDir);
+        } catch (UnsupportedOperationException | java.nio.file.FileSystemException unsupported) {
+            symlinkSupported = false;
+        }
+        if (symlinkSupported) {
+            Path outsideParquet = outsideDir.resolve("escaped.parquet");
+            Files.copy(root.resolve(generations.get(0).objectPath()), outsideParquet);
+            ArchiveGeneration escapedGen = new ArchiveGeneration(
+                    UUID.randomUUID(), "RAW_GATED",
+                    Instant.parse("2026-01-01T06:00:00Z"), Instant.parse("2026-01-01T06:30:00Z"),
+                    Path.of("datasets/observations/linked-day/escaped.parquet"),
+                    generations.get(0).sha256(), 2, 200L, 201L, "SEALED", true);
+            List<ArchiveGeneration> withSymlinkDir = new java.util.ArrayList<>(generations);
+            withSymlinkDir.add(escapedGen);
+            assertThrows(IllegalStateException.class,
+                    () -> reader.countCql(withSymlinkDir, fullRangeFault, null, null, Set.of()));
+        }
+
+        // Tampering with a cached generation file on disk must still be rejected on cached countCql.
+        Files.writeString(root.resolve(generations.get(11).objectPath()), "corrupted after cql count cache warm");
+        assertThrows(IllegalStateException.class,
+                () -> reader.countCql(generations, fullRangeFault, null, null, Set.of()));
+    }
+
     private record TestRow(long id, long dataStreamId, String time, String resultJson) {
         private TestRow(long id, long dataStreamId, String time) {
             this(id, dataStreamId, time, "{\"value\":" + id + "}");

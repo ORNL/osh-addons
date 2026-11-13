@@ -20,6 +20,7 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
@@ -62,6 +63,7 @@ public final class ArchiveCatalog {
     private final TieredArchiveConfig resourceConfig;
     private final AtomicInteger openOverlayCursors = new AtomicInteger();
     private final AtomicLong overlayRowsRead = new AtomicLong();
+    private final Set<String> persistedSchemaBlobHashes = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /*
      * Lock ordering for every observation mutation is deliberately fixed:
@@ -452,13 +454,29 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_obs_overlay ADD COLUMN IF NOT EXISTS generation_id uuid " +
                         "REFERENCES oscar_archive_generation(id)");
                 statement.execute("ALTER TABLE oscar_obs_overlay ADD COLUMN IF NOT EXISTS schema_json jsonb");
-                statement.execute("UPDATE oscar_obs_overlay overlay_row " +
-                        "SET schema_json=COALESCE(schema_row.schema_json, blob.schema_json) " +
-                        "FROM oscar_archive_schema schema_row " +
-                        "LEFT JOIN oscar_archive_schema_blob blob ON blob.schema_sha256=schema_row.schema_sha256 " +
-                        "WHERE overlay_row.schema_json IS NULL " +
-                        "AND overlay_row.generation_id=schema_row.generation_id " +
-                        "AND overlay_row.datastream_id=schema_row.datastream_id");
+                statement.execute("ALTER TABLE oscar_obs_overlay ADD COLUMN IF NOT EXISTS schema_sha256 text " +
+                        "REFERENCES oscar_archive_schema_blob(schema_sha256)");
+                statement.execute("ALTER TABLE oscar_obs_overlay ALTER COLUMN schema_json DROP NOT NULL");
+                // Once the validated constraint is installed, invalid schema-less
+                // rows cannot be inserted. Avoid a history-sized repair scan on
+                // every restart for a site with years of adjudication overlays.
+                boolean needsOverlaySchemaRepair;
+                try (ResultSet constraint = statement.executeQuery(
+                        "SELECT EXISTS (SELECT 1 FROM pg_constraint " +
+                        "WHERE conrelid='oscar_obs_overlay'::regclass " +
+                        "AND conname='oscar_obs_overlay_schema_present_chk' AND convalidated)")) {
+                    constraint.next();
+                    needsOverlaySchemaRepair = !constraint.getBoolean(1);
+                }
+                if (needsOverlaySchemaRepair) {
+                    statement.execute("UPDATE oscar_obs_overlay overlay_row " +
+                            "SET schema_json=COALESCE(schema_row.schema_json, blob.schema_json) " +
+                            "FROM oscar_archive_schema schema_row " +
+                            "LEFT JOIN oscar_archive_schema_blob blob ON blob.schema_sha256=schema_row.schema_sha256 " +
+                            "WHERE overlay_row.schema_json IS NULL AND overlay_row.schema_sha256 IS NULL " +
+                            "AND overlay_row.generation_id=schema_row.generation_id " +
+                            "AND overlay_row.datastream_id=schema_row.datastream_id");
+                }
                 // A pre-v4 overlay has no exact generation owner. Coarse ID
                 // ranges are not ownership, so retain it for an operator-led
                 // migration without allowing it to become query-visible.
@@ -469,18 +487,27 @@ public final class ArchiveCatalog {
                         "quarantined_at timestamptz NOT NULL DEFAULT now())");
                 statement.execute("ALTER TABLE oscar_obs_overlay_legacy_unowned " +
                         "ADD COLUMN IF NOT EXISTS schema_json jsonb");
-                statement.execute("INSERT INTO oscar_obs_overlay_legacy_unowned(" +
-                        "store_key,id_scope,observation_id,datastream_id,foi_id,phenomenon_time,result_time,result_json,schema_json,updated_at) " +
-                        "SELECT store_key,id_scope,observation_id,datastream_id,foi_id,phenomenon_time,result_time,result_json,schema_json,updated_at " +
-                        "FROM oscar_obs_overlay WHERE generation_id IS NULL OR schema_json IS NULL");
-                statement.execute("DELETE FROM oscar_obs_overlay WHERE generation_id IS NULL OR schema_json IS NULL");
-                statement.execute("ALTER TABLE oscar_obs_overlay ALTER COLUMN generation_id SET NOT NULL");
-                statement.execute("ALTER TABLE oscar_obs_overlay ALTER COLUMN schema_json SET NOT NULL");
+                if (needsOverlaySchemaRepair) {
+                    statement.execute("INSERT INTO oscar_obs_overlay_legacy_unowned(" +
+                            "store_key,id_scope,observation_id,datastream_id,foi_id,phenomenon_time,result_time,result_json,schema_json,updated_at) " +
+                            "SELECT store_key,id_scope,observation_id,datastream_id,foi_id,phenomenon_time,result_time,result_json,schema_json,updated_at " +
+                            "FROM oscar_obs_overlay WHERE generation_id IS NULL OR (schema_json IS NULL AND schema_sha256 IS NULL)");
+                    statement.execute("DELETE FROM oscar_obs_overlay WHERE generation_id IS NULL OR (schema_json IS NULL AND schema_sha256 IS NULL)");
+                    statement.execute("ALTER TABLE oscar_obs_overlay ALTER COLUMN generation_id SET NOT NULL");
+                    statement.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint " +
+                            "WHERE conrelid='oscar_obs_overlay'::regclass AND conname='oscar_obs_overlay_schema_present_chk') THEN " +
+                            "ALTER TABLE oscar_obs_overlay ADD CONSTRAINT oscar_obs_overlay_schema_present_chk " +
+                            "CHECK (schema_json IS NOT NULL OR schema_sha256 IS NOT NULL); END IF; END $$");
+                }
+                statement.execute("CREATE INDEX IF NOT EXISTS oscar_obs_overlay_legacy_schema_idx " +
+                        "ON oscar_obs_overlay(store_key, id_scope, observation_id) WHERE schema_json IS NOT NULL");
                 statement.execute("DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='oscar_obs_overlay'::regclass " +
                         "AND conname='oscar_obs_overlay_pkey' AND pg_get_constraintdef(oid)='PRIMARY KEY (observation_id)') THEN " +
                         "ALTER TABLE oscar_obs_overlay DROP CONSTRAINT oscar_obs_overlay_pkey; " +
                         "ALTER TABLE oscar_obs_overlay ADD CONSTRAINT oscar_obs_overlay_pkey " +
                         "PRIMARY KEY(store_key, id_scope, observation_id); END IF; END $$");
+                statement.execute("CREATE INDEX IF NOT EXISTS oscar_obs_overlay_stream_result_idx " +
+                        "ON oscar_obs_overlay(store_key, id_scope, datastream_id, result_time DESC)");
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_obs_overlay_generation_idx " +
                         "ON oscar_obs_overlay(generation_id)");
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_obs_overlay_query_idx " +
@@ -1623,6 +1650,91 @@ public final class ArchiveCatalog {
     }
 
     /**
+     * Resolves every active/sealed archive generation whose ID block covers at
+     * least one requested observation ID in a single PostgreSQL round trip.
+     */
+    public List<ArchiveGeneration> candidatesForObservationIds(Collection<Long> observationIds) {
+        if (observationIds == null || observationIds.isEmpty())
+            return List.of();
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            return candidatesForObservationIds(connection, observationIds);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot plan archive point-ID query", e);
+        }
+    }
+
+    public List<ArchiveGeneration> candidatesForObservationIds(
+            Connection connection, Collection<Long> observationIds) throws SQLException {
+        if (observationIds == null || observationIds.isEmpty())
+            return List.of();
+        String sql = "WITH requested(id) AS (SELECT DISTINCT unnest(?::bigint[])) " +
+                "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
+                "FROM oscar_archive_generation g " +
+                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                "AND EXISTS (SELECT 1 FROM requested r JOIN oscar_archive_id_block b " +
+                "ON r.id BETWEEN b.min_id AND b.max_id WHERE b.generation_id=g.id) " +
+                "ORDER BY g.window_start, g.id";
+        List<ArchiveGeneration> generations = new ArrayList<>();
+        java.sql.Array ids = connection.createArrayOf("bigint", observationIds.toArray(Long[]::new));
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setArray(1, ids);
+            statement.setString(2, storeKey);
+            statement.setInt(3, idScope);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next())
+                    generations.add(readGeneration(result));
+            }
+        } finally {
+            ids.free();
+        }
+        return generations;
+    }
+
+    public boolean isGenerationQueryVisible(UUID generationId) {
+        if (generationId == null)
+            return false;
+        try (Connection connection = connections.open();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT 1 FROM oscar_archive_generation " +
+                             "WHERE id=? AND store_key=? AND id_scope=? AND state IN ('ACTIVE','SEALED')")) {
+            connection.setReadOnly(true);
+            statement.setObject(1, generationId);
+            statement.setString(2, storeKey);
+            statement.setInt(3, idScope);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect archive generation visibility", e);
+        }
+    }
+
+    public Set<UUID> activeOrSealedGenerationIds(Connection connection, Collection<UUID> generationIds)
+            throws SQLException {
+        if (generationIds == null || generationIds.isEmpty())
+            return Set.of();
+        Set<UUID> visible = new HashSet<>();
+        java.sql.Array genArray = connection.createArrayOf("uuid", generationIds.toArray(UUID[]::new));
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT id FROM oscar_archive_generation " +
+                        "WHERE store_key=? AND id_scope=? AND state IN ('ACTIVE','SEALED') " +
+                        "AND id=ANY (?::uuid[])")) {
+            statement.setString(1, storeKey);
+            statement.setInt(2, idScope);
+            statement.setArray(3, genArray);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next())
+                    visible.add(result.getObject(1, UUID.class));
+            }
+        } finally {
+            genArray.free();
+        }
+        return visible;
+    }
+
+    /**
      * Pushes {@code resultTime} lower-bound / {@code resultTime=latest} high-water
      * filtering into PostgreSQL so multi-year archives do not materialize tens of
      * thousands of historical generations whose {@code max_result_time} is older
@@ -2248,6 +2360,84 @@ public final class ArchiveCatalog {
         }
     }
 
+    public static String computeSchemaSha256(String schemaJson) {
+        return sha256Hex(schemaJson);
+    }
+
+    public void recordPersistedSchemaBlobHashes(Collection<String> hashes) {
+        if (hashes == null || hashes.isEmpty() || persistedSchemaBlobHashes.size() >= 4096)
+            return;
+        for (String hash : hashes) {
+            if (hash != null && persistedSchemaBlobHashes.size() < 4096)
+                persistedSchemaBlobHashes.add(hash);
+        }
+    }
+
+    public record PointLookupStatus(boolean tombstoned, ArchivedOverlay overlay) {}
+
+    /**
+     * Checks both active/sealed observation tombstone status and overlay state
+     * in a single PostgreSQL round trip, preserving tombstone precedence.
+     */
+    public PointLookupStatus lookupOverlayOrTombstone(long observationId, int scope, String profile) {
+        String sql = "SELECT (" +
+                "SELECT EXISTS (SELECT 1 FROM oscar_tombstone tombstone " +
+                "WHERE tombstone.store_key=? AND tombstone.id_scope=? " +
+                "AND tombstone.subject_type='OBSERVATION' AND tombstone.subject_id=? " +
+                "AND tombstone.generation_id IS NOT NULL " +
+                "AND EXISTS (SELECT 1 FROM oscar_archive_generation generation " +
+                "WHERE generation.id=tombstone.generation_id AND generation.store_key=tombstone.store_key " +
+                "AND generation.id_scope=tombstone.id_scope AND generation.state IN ('ACTIVE','SEALED')))" +
+                ") AS is_tombstoned, " +
+                "overlay_info.generation_id, overlay_info.datastream_id, overlay_info.foi_id, " +
+                "overlay_info.phenomenon_time, overlay_info.result_time, " +
+                "overlay_info.result_json_text, overlay_info.schema_json_text " +
+                "FROM (SELECT 1) AS probe " +
+                "LEFT JOIN LATERAL (" +
+                "SELECT overlay_row.generation_id, overlay_row.datastream_id, overlay_row.foi_id, " +
+                "overlay_row.phenomenon_time, overlay_row.result_time, " +
+                "overlay_row.result_json::text AS result_json_text, " +
+                "COALESCE(overlay_row.schema_json, overlay_schema_blob.schema_json)::text AS schema_json_text " +
+                "FROM oscar_obs_overlay overlay_row " +
+                "JOIN oscar_archive_generation generation ON generation.id=overlay_row.generation_id " +
+                "LEFT JOIN oscar_archive_schema_blob overlay_schema_blob " +
+                "ON overlay_schema_blob.schema_sha256=overlay_row.schema_sha256 " +
+                "WHERE overlay_row.store_key=? AND overlay_row.id_scope=? AND overlay_row.observation_id=? " +
+                "AND generation.store_key=overlay_row.store_key AND generation.id_scope=overlay_row.id_scope " +
+                "AND generation.state IN ('ACTIVE','SEALED')" +
+                ") overlay_info ON true";
+        try (Connection connection = connections.open();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            connection.setReadOnly(true);
+            statement.setString(1, storeKey);
+            statement.setInt(2, idScope);
+            statement.setString(3, Long.toString(observationId));
+            statement.setString(4, storeKey);
+            statement.setInt(5, idScope);
+            statement.setLong(6, observationId);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next())
+                    return new PointLookupStatus(false, null);
+                if (result.getBoolean(1))
+                    return new PointLookupStatus(true, null);
+                UUID generationId = result.getObject(2, UUID.class);
+                if (generationId == null)
+                    return new PointLookupStatus(false, null);
+                Long foi = result.getObject(4, Long.class);
+                Instant phenomenon = UtcJdbcTime.getInstant(result, 5);
+                Instant resultTime = UtcJdbcTime.getInstant(result, 6);
+                ArchivedObservation observation = new ArchivedObservation(
+                        scope, observationId, scope, result.getLong(3),
+                        foi == null ? null : scope, foi, phenomenon,
+                        resultTime, result.getString(7), profile);
+                return new PointLookupStatus(false,
+                        new ArchivedOverlay(generationId, result.getString(8), observation));
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect archive overlay/tombstone state", e);
+        }
+    }
+
     private static String sha256Hex(String value) {
         try {
             byte[] digest = MessageDigest.getInstance("SHA-256")
@@ -2274,11 +2464,14 @@ public final class ArchiveCatalog {
                                                             int scope, String profile,
                                                             boolean forUpdate) throws SQLException {
         String sql =
-                "SELECT overlay_row.generation_id, datastream_id, foi_id, phenomenon_time, result_time, " +
-                        "result_json::text, schema_json::text " +
+                "SELECT overlay_row.generation_id, overlay_row.datastream_id, overlay_row.foi_id, " +
+                        "overlay_row.phenomenon_time, overlay_row.result_time, overlay_row.result_json::text, " +
+                        "COALESCE(overlay_row.schema_json, overlay_schema_blob.schema_json)::text " +
                         "FROM oscar_obs_overlay overlay_row JOIN oscar_archive_generation generation " +
                         "ON generation.id=overlay_row.generation_id " +
-                        "WHERE overlay_row.store_key=? AND overlay_row.id_scope=? AND observation_id=? " +
+                        "LEFT JOIN oscar_archive_schema_blob overlay_schema_blob " +
+                        "ON overlay_schema_blob.schema_sha256=overlay_row.schema_sha256 " +
+                        "WHERE overlay_row.store_key=? AND overlay_row.id_scope=? AND overlay_row.observation_id=? " +
                         "AND generation.store_key=overlay_row.store_key AND generation.id_scope=overlay_row.id_scope " +
                         "AND generation.state IN ('ACTIVE','SEALED')" +
                         (forUpdate ? " FOR UPDATE OF overlay_row" : "");
@@ -2302,16 +2495,209 @@ public final class ArchiveCatalog {
         }
     }
 
+    /**
+     * Convert a bounded page of legacy inline schemas without rewriting archive
+     * files or blocking startup on an unbounded table migration. Each page is
+     * independently atomic and safe to retry after a crash.
+     */
+    public int migrateLegacyOverlaySchemas(int limit) {
+        if (limit <= 0 || limit > 250)
+            throw new IllegalArgumentException("Overlay schema migration limit must be in 1..250");
+        record LegacySchema(long observationId, String json, String hash) {}
+        try (Connection connection = connections.open()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                List<LegacySchema> rows = new ArrayList<>();
+                try (PreparedStatement select = connection.prepareStatement(
+                        "SELECT observation_id, schema_json::text FROM oscar_obs_overlay " +
+                        "WHERE store_key=? AND id_scope=? AND schema_json IS NOT NULL " +
+                        "ORDER BY observation_id LIMIT ?")) {
+                    select.setString(1, storeKey);
+                    select.setInt(2, idScope);
+                    select.setInt(3, limit);
+                    try (ResultSet result = select.executeQuery()) {
+                        while (result.next()) {
+                            String json = result.getString(2);
+                            rows.add(new LegacySchema(result.getLong(1), json, sha256Hex(json)));
+                        }
+                    }
+                }
+                if (!rows.isEmpty()) {
+                    try (PreparedStatement blob = connection.prepareStatement(
+                            "INSERT INTO oscar_archive_schema_blob(schema_sha256,schema_json) " +
+                            "VALUES (?, ?::jsonb) ON CONFLICT (schema_sha256) DO NOTHING");
+                         PreparedStatement update = connection.prepareStatement(
+                            "UPDATE oscar_obs_overlay SET schema_sha256=?, schema_json=NULL " +
+                            "WHERE store_key=? AND id_scope=? AND observation_id=? AND schema_json=?::jsonb")) {
+                        // Insert blobs before locking overlay rows, matching upsert's
+                        // lock order. The conditional update preserves a concurrent
+                        // adjudication's newer schema. Duplicate workers may overlap.
+                        // Different stores can migrate concurrently. Acquire
+                        // unique blob keys in the same order to avoid cycles.
+                        for (LegacySchema row : rows.stream()
+                                .sorted(Comparator.comparing(LegacySchema::hash)).toList()) {
+                            blob.setString(1, row.hash());
+                            blob.setString(2, row.json());
+                            blob.addBatch();
+                        }
+                        blob.executeBatch();
+                        for (LegacySchema row : rows) {
+                            update.setString(1, row.hash());
+                            update.setString(2, storeKey);
+                            update.setInt(3, idScope);
+                            update.setLong(4, row.observationId());
+                            update.setString(5, row.json());
+                            update.addBatch();
+                        }
+                        int changed = 0;
+                        for (int count : update.executeBatch())
+                            if (count > 0 || count == Statement.SUCCESS_NO_INFO)
+                                changed++;
+                        connection.commit();
+                        return changed;
+                    }
+                }
+                connection.commit();
+                return 0;
+            } catch (Exception error) {
+                connection.rollback();
+                throw error;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("Cannot migrate legacy overlay schemas", error);
+        }
+    }
+
+    public record OverlayBatchItem(UUID generationId, ArchivedObservation observation,
+                                   String schemaJson, String schemaSha256) {}
+
+    /**
+     * Inserts any uncached schema blobs in ascending {@code schemaSha256} order
+     * before the caller locks {@code oscar_obs_overlay} rows, preserving the
+     * global lock order required by concurrent legacy-schema migration.
+     */
+    public void ensureSchemaBlobsPersisted(Connection connection,
+                                           Map<String, String> schemaJsonByHash) throws SQLException {
+        if (schemaJsonByHash == null || schemaJsonByHash.isEmpty())
+            return;
+        List<Map.Entry<String, String>> pending = schemaJsonByHash.entrySet().stream()
+                .filter(entry -> entry.getKey() != null && entry.getValue() != null &&
+                        !persistedSchemaBlobHashes.contains(entry.getKey()))
+                .sorted(Map.Entry.comparingByKey())
+                .toList();
+        if (pending.isEmpty())
+            return;
+        try (PreparedStatement blob = connection.prepareStatement(
+                "INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) VALUES (?, ?::jsonb) " +
+                        "ON CONFLICT (schema_sha256) DO NOTHING")) {
+            for (Map.Entry<String, String> entry : pending) {
+                blob.setString(1, entry.getKey());
+                blob.setString(2, entry.getValue());
+                blob.addBatch();
+            }
+            blob.executeBatch();
+        }
+    }
+
+    /**
+     * Batch-upserts generation-owned overlays and updates {@code oscar_obs_latest}
+     * within a caller-owned transaction after {@link #ensureSchemaBlobsPersisted}
+     * and {@link #lockForMutation(Connection, Collection)} have completed.
+     */
+    public void upsertOverlaysBatch(Connection connection, List<OverlayBatchItem> items) throws SQLException {
+        if (items == null || items.isEmpty())
+            return;
+        try (PreparedStatement statement = connection.prepareStatement(
+                "INSERT INTO oscar_obs_overlay(store_key, id_scope, observation_id, generation_id, datastream_id, foi_id, phenomenon_time, result_time, result_json, schema_sha256) " +
+                        "SELECT ?, ?, ?, generation.id, ?, ?, ?, ?, ?::jsonb, ? " +
+                        "FROM oscar_archive_generation generation WHERE generation.id=? " +
+                        "AND generation.store_key=? AND generation.id_scope=? " +
+                        "AND generation.state IN ('ACTIVE','SEALED') " +
+                        "ON CONFLICT (store_key, id_scope, observation_id) DO UPDATE SET " +
+                        "generation_id=EXCLUDED.generation_id, datastream_id=EXCLUDED.datastream_id, " +
+                        "foi_id=EXCLUDED.foi_id, phenomenon_time=EXCLUDED.phenomenon_time, " +
+                        "result_time=EXCLUDED.result_time, result_json=EXCLUDED.result_json, " +
+                        "schema_json=NULL, schema_sha256=EXCLUDED.schema_sha256, updated_at=now()")) {
+            for (OverlayBatchItem item : items) {
+                ArchivedObservation observation = item.observation();
+                statement.setString(1, storeKey);
+                statement.setInt(2, idScope);
+                statement.setLong(3, observation.id());
+                statement.setLong(4, observation.dataStreamId());
+                if (observation.foiId() == null)
+                    statement.setNull(5, java.sql.Types.BIGINT);
+                else
+                    statement.setLong(5, observation.foiId());
+                if (observation.phenomenonTime() == null)
+                    statement.setNull(6, java.sql.Types.TIMESTAMP_WITH_TIMEZONE);
+                else
+                    UtcJdbcTime.setInstant(statement, 6, observation.phenomenonTime());
+                if (observation.resultTime() == null)
+                    statement.setNull(7, java.sql.Types.TIMESTAMP_WITH_TIMEZONE);
+                else
+                    UtcJdbcTime.setInstant(statement, 7, observation.resultTime());
+                statement.setString(8, observation.resultJson());
+                statement.setString(9, item.schemaSha256());
+                statement.setObject(10, item.generationId());
+                statement.setString(11, storeKey);
+                statement.setInt(12, idScope);
+                statement.addBatch();
+            }
+            int[] counts = statement.executeBatch();
+            for (int i = 0; i < counts.length; i++) {
+                if (counts[i] != 1 && counts[i] != Statement.SUCCESS_NO_INFO) {
+                    throw new IllegalArgumentException(
+                            "Archive generation does not belong to this observation store: " +
+                                    items.get(i).generationId());
+                }
+            }
+        }
+        try (PreparedStatement latestUpdate = connection.prepareStatement(
+                "UPDATE oscar_obs_latest SET generation_id=?, foi_id=?, phenomenon_time=?, " +
+                        "result_time=?, result_json=?::jsonb, schema_json=?::jsonb, updated_at=now() " +
+                        "WHERE store_key=? AND id_scope=? AND datastream_id=? AND observation_id=?")) {
+            for (OverlayBatchItem item : items) {
+                ArchivedObservation observation = item.observation();
+                latestUpdate.setObject(1, item.generationId());
+                if (observation.foiId() == null)
+                    latestUpdate.setNull(2, java.sql.Types.BIGINT);
+                else
+                    latestUpdate.setLong(2, observation.foiId());
+                if (observation.phenomenonTime() == null)
+                    latestUpdate.setNull(3, java.sql.Types.TIMESTAMP_WITH_TIMEZONE);
+                else
+                    UtcJdbcTime.setInstant(latestUpdate, 3, observation.phenomenonTime());
+                if (observation.resultTime() == null)
+                    latestUpdate.setNull(4, java.sql.Types.TIMESTAMP_WITH_TIMEZONE);
+                else
+                    UtcJdbcTime.setInstant(latestUpdate, 4, observation.resultTime());
+                latestUpdate.setString(5, observation.resultJson());
+                latestUpdate.setString(6, item.schemaJson());
+                latestUpdate.setString(7, storeKey);
+                latestUpdate.setInt(8, idScope);
+                latestUpdate.setLong(9, observation.dataStreamId());
+                latestUpdate.setLong(10, observation.id());
+                latestUpdate.addBatch();
+            }
+            latestUpdate.executeBatch();
+        }
+    }
+
     public void upsertOverlay(UUID generationId, ArchivedObservation observation, String schemaJson) {
         if (schemaJson == null || schemaJson.isBlank())
             throw new IllegalArgumentException("Archived observation overlays require an immutable schema snapshot");
+        String schemaHash = sha256Hex(schemaJson);
         try (Connection connection = connections.open()) {
             boolean oldAutoCommit = connection.getAutoCommit();
             connection.setAutoCommit(false);
             try {
                 lockForMutation(connection, observation.id());
-                upsertOverlay(connection, generationId, observation, schemaJson);
+                upsertOverlay(connection, generationId, observation, schemaJson, schemaHash);
                 connection.commit();
+                recordPersistedSchemaBlobHashes(List.of(schemaHash));
             } catch (Exception error) {
                 connection.rollback();
                 throw error;
@@ -2335,57 +2721,56 @@ public final class ArchiveCatalog {
                               ArchivedObservation observation, String schemaJson) throws SQLException {
         if (schemaJson == null || schemaJson.isBlank())
             throw new IllegalArgumentException("Archived observation overlays require an immutable schema snapshot");
-        try (PreparedStatement statement = connection.prepareStatement(
-                "INSERT INTO oscar_obs_overlay(store_key, id_scope, observation_id, generation_id, datastream_id, foi_id, phenomenon_time, result_time, result_json, schema_json) " +
-                        "SELECT ?, ?, ?, generation.id, ?, ?, ?, ?, ?::jsonb, ?::jsonb " +
-                        "FROM oscar_archive_generation generation WHERE generation.id=? " +
-                        "AND generation.store_key=? AND generation.id_scope=? " +
-                        "AND generation.state IN ('ACTIVE','SEALED') " +
-                        "ON CONFLICT (store_key, id_scope, observation_id) DO UPDATE SET " +
-                        "generation_id=EXCLUDED.generation_id, datastream_id=EXCLUDED.datastream_id, " +
-                        "foi_id=EXCLUDED.foi_id, phenomenon_time=EXCLUDED.phenomenon_time, " +
-                        "result_time=EXCLUDED.result_time, result_json=EXCLUDED.result_json, " +
-                        "schema_json=EXCLUDED.schema_json, updated_at=now()")) {
-            statement.setString(1, storeKey);
-            statement.setInt(2, idScope);
-            statement.setLong(3, observation.id());
-            statement.setLong(4, observation.dataStreamId());
-            if (observation.foiId() == null) statement.setNull(5, java.sql.Types.BIGINT); else statement.setLong(5, observation.foiId());
-            if (observation.phenomenonTime() == null) statement.setNull(6, java.sql.Types.TIMESTAMP_WITH_TIMEZONE); else UtcJdbcTime.setInstant(statement, 6, observation.phenomenonTime());
-            if (observation.resultTime() == null) statement.setNull(7, java.sql.Types.TIMESTAMP_WITH_TIMEZONE); else UtcJdbcTime.setInstant(statement, 7, observation.resultTime());
-            statement.setString(8, observation.resultJson());
-            statement.setString(9, schemaJson);
-            statement.setObject(10, generationId);
-            statement.setString(11, storeKey);
-            statement.setInt(12, idScope);
-            if (statement.executeUpdate() != 1)
-                throw new IllegalArgumentException("Archive generation does not belong to this observation store: " + generationId);
+        upsertOverlay(connection, generationId, observation, schemaJson, sha256Hex(schemaJson));
+    }
+
+    public void upsertOverlay(Connection connection, UUID generationId,
+                              ArchivedObservation observation, String schemaJson,
+                              String schemaHash) throws SQLException {
+        if (schemaJson == null || schemaJson.isBlank())
+            throw new IllegalArgumentException("Archived observation overlays require an immutable schema snapshot");
+        if (schemaHash == null || schemaHash.isBlank())
+            schemaHash = sha256Hex(schemaJson);
+        if (!persistedSchemaBlobHashes.contains(schemaHash)) {
+            try (PreparedStatement blob = connection.prepareStatement(
+                    "INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) VALUES (?, ?::jsonb) " +
+                            "ON CONFLICT (schema_sha256) DO NOTHING")) {
+                blob.setString(1, schemaHash);
+                blob.setString(2, schemaJson);
+                blob.executeUpdate();
+            }
         }
-        try (PreparedStatement latestUpdate = connection.prepareStatement(
-                "UPDATE oscar_obs_latest SET generation_id=?, foi_id=?, phenomenon_time=?, " +
-                        "result_time=?, result_json=?::jsonb, schema_json=?::jsonb, updated_at=now() " +
-                        "WHERE store_key=? AND id_scope=? AND datastream_id=? AND observation_id=?")) {
-            latestUpdate.setObject(1, generationId);
-            if (observation.foiId() == null)
-                latestUpdate.setNull(2, java.sql.Types.BIGINT);
-            else
-                latestUpdate.setLong(2, observation.foiId());
-            if (observation.phenomenonTime() == null)
-                latestUpdate.setNull(3, java.sql.Types.TIMESTAMP_WITH_TIMEZONE);
-            else
-                UtcJdbcTime.setInstant(latestUpdate, 3, observation.phenomenonTime());
-            if (observation.resultTime() == null)
-                latestUpdate.setNull(4, java.sql.Types.TIMESTAMP_WITH_TIMEZONE);
-            else
-                UtcJdbcTime.setInstant(latestUpdate, 4, observation.resultTime());
-            latestUpdate.setString(5, observation.resultJson());
-            latestUpdate.setString(6, schemaJson);
-            latestUpdate.setString(7, storeKey);
-            latestUpdate.setInt(8, idScope);
-            latestUpdate.setLong(9, observation.dataStreamId());
-            latestUpdate.setLong(10, observation.id());
-            latestUpdate.executeUpdate();
+        upsertOverlaysBatch(connection, List.of(
+                new OverlayBatchItem(generationId, observation, schemaJson, schemaHash)));
+    }
+
+    public Set<Long> activeTombstonedObservationIds(Connection connection,
+                                                    Collection<Long> observationIds) throws SQLException {
+        if (observationIds == null || observationIds.isEmpty())
+            return Set.of();
+        String sql = "WITH requested(id) AS (SELECT DISTINCT unnest(?::bigint[])) " +
+                "SELECT r.id FROM requested r WHERE EXISTS (" +
+                "SELECT 1 FROM oscar_tombstone tombstone " +
+                "WHERE tombstone.store_key=? AND tombstone.id_scope=? " +
+                "AND tombstone.subject_type='OBSERVATION' AND tombstone.subject_id=r.id::text " +
+                "AND tombstone.generation_id IS NOT NULL " +
+                "AND EXISTS (SELECT 1 FROM oscar_archive_generation generation " +
+                "WHERE generation.id=tombstone.generation_id AND generation.store_key=tombstone.store_key " +
+                "AND generation.id_scope=tombstone.id_scope AND generation.state IN ('ACTIVE','SEALED')))";
+        Set<Long> tombstoned = new HashSet<>();
+        java.sql.Array ids = connection.createArrayOf("bigint", observationIds.toArray(Long[]::new));
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setArray(1, ids);
+            statement.setString(2, storeKey);
+            statement.setInt(3, idScope);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next())
+                    tombstoned.add(result.getLong(1));
+            }
+        } finally {
+            ids.free();
         }
+        return tombstoned;
     }
 
     public boolean isTombstoned(long observationId) {
@@ -2524,13 +2909,15 @@ public final class ArchiveCatalog {
                 "COALESCE(overlay_row.phenomenon_time, latest.phenomenon_time), " +
                 "COALESCE(overlay_row.result_time, latest.result_time), " +
                 "COALESCE(overlay_row.result_json, latest.result_json)::text, " +
-                "COALESCE(overlay_row.schema_json, latest.schema_json)::text, " +
+                "COALESCE(overlay_row.schema_json, overlay_schema_blob.schema_json, latest.schema_json)::text, " +
                 "CASE WHEN overlay_row.observation_id IS NOT NULL THEN 'OVERLAY' ELSE latest.profile END " +
                 "FROM oscar_obs_latest latest " +
                 "JOIN oscar_archive_generation g ON g.id=latest.generation_id " +
                 "LEFT JOIN oscar_obs_overlay overlay_row " +
                 "ON overlay_row.store_key=latest.store_key AND overlay_row.id_scope=latest.id_scope " +
                 "AND overlay_row.observation_id=latest.observation_id " +
+                "LEFT JOIN oscar_archive_schema_blob overlay_schema_blob " +
+                "ON overlay_schema_blob.schema_sha256=overlay_row.schema_sha256 " +
                 "WHERE latest.store_key=? AND latest.id_scope=? " +
                 "AND latest.datastream_id=ANY (?::bigint[]) " +
                 "AND g.store_key=latest.store_key AND g.id_scope=latest.id_scope " +
@@ -2678,6 +3065,41 @@ public final class ArchiveCatalog {
             boolean hasMutations,
             JsonCqlEvaluator.SummaryCounterSpec summarySpec,
             String exactEventId) {
+        return selectSummaryMatchedCandidates(
+                candidates, phenomenonTimeFilter, resultTimeFilter,
+                dataStreams, descending, readerLimit, readerLimit,
+                hasMutations, summarySpec, exactEventId);
+    }
+
+    public CandidateSelectionPlan selectSummaryMatchedCandidates(
+            List<ArchiveGeneration> candidates,
+            TemporalFilter phenomenonTimeFilter,
+            TemporalFilter resultTimeFilter,
+            Set<Long> dataStreams,
+            boolean descending,
+            long callerLimit,
+            long readerLimit,
+            boolean hasMutations,
+            JsonCqlEvaluator.SummaryCounterSpec summarySpec,
+            String exactEventId) {
+        return selectSummaryMatchedCandidates(
+                candidates, phenomenonTimeFilter, resultTimeFilter,
+                dataStreams, descending, callerLimit, readerLimit,
+                hasMutations, summarySpec, exactEventId, null);
+    }
+
+    public CandidateSelectionPlan selectSummaryMatchedCandidates(
+            List<ArchiveGeneration> candidates,
+            TemporalFilter phenomenonTimeFilter,
+            TemporalFilter resultTimeFilter,
+            Set<Long> dataStreams,
+            boolean descending,
+            long callerLimit,
+            long readerLimit,
+            boolean hasMutations,
+            JsonCqlEvaluator.SummaryCounterSpec summarySpec,
+            String exactEventId,
+            java.util.function.BiFunction<List<ArchiveGeneration>, Map<UUID, Set<Long>>, Map<UUID, Long>> exactMutatedMatchResolver) {
         if (candidates == null || candidates.isEmpty())
             return new CandidateSelectionPlan(List.of(), List.of());
 
@@ -2770,19 +3192,118 @@ public final class ArchiveCatalog {
                 continue;
             surviving.add(generation);
         }
-        if (surviving.isEmpty() || readerLimit == Long.MAX_VALUE)
+        if (surviving.isEmpty())
+            return new CandidateSelectionPlan(List.of(), List.of());
+
+        boolean boundedTarget = callerLimit != Long.MAX_VALUE && readerLimit != Long.MAX_VALUE;
+        if (!hasMutations && (!boundedTarget || surviving.size() <= 1))
             return new CandidateSelectionPlan(surviving, List.of());
 
         List<List<ArchiveGeneration>> clusters = groupDisjointClusters(surviving);
         if (descending)
             java.util.Collections.reverse(clusters);
-        if (clusters.size() <= 1)
+        if (!hasMutations && clusters.size() <= 1)
             return new CandidateSelectionPlan(surviving, List.of());
 
         Map<UUID, Set<Long>> mutatedByGen = hasMutations
                 ? mutatedObservationIdsByGeneration(
                         surviving.stream().map(ArchiveGeneration::id).toList())
                 : Map.of();
+        if (mutatedByGen.isEmpty() && (!boundedTarget || clusters.size() <= 1))
+            return new CandidateSelectionPlan(surviving, List.of());
+
+        long targetMatches = boundedTarget ? Math.max(1L, Math.min(callerLimit, readerLimit)) : Long.MAX_VALUE;
+        Map<UUID, Long> exactMutatedMatches = new HashMap<>();
+        if (exactMutatedMatchResolver != null && !mutatedByGen.isEmpty()) {
+            int resolveLimit = clusters.size();
+            if (boundedTarget) {
+                long fastGuaranteed = 0L;
+                for (int i = 0; i < clusters.size(); i++) {
+                    List<ArchiveGeneration> cluster = clusters.get(i);
+                    boolean clusterExact = true;
+                    long clusterExactSum = 0L;
+                    for (ArchiveGeneration gen : cluster) {
+                        UUID genId = gen.id();
+                        long mutatedCount = mutatedByGen.getOrDefault(genId, Set.of()).size();
+                        if (Boolean.TRUE.equals(populatedByGen.get(genId)) &&
+                                Boolean.TRUE.equals(exactReadyByGen.get(genId)) &&
+                                isGenerationWindowFullyContained(gen, phenomenonTimeFilter) &&
+                                isGenerationResultTimeFullyContained(gen, resultTimeFilter)) {
+                            long exactUnmutated = Math.max(0L, exactByGen.getOrDefault(genId, 0L) - mutatedCount);
+                            clusterExactSum = saturateAddLong(clusterExactSum, exactUnmutated);
+                        } else {
+                            clusterExact = false;
+                            break;
+                        }
+                    }
+                    if (clusterExact) {
+                        fastGuaranteed = saturateAddLong(fastGuaranteed, clusterExactSum);
+                        if (fastGuaranteed >= targetMatches) {
+                            resolveLimit = i + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            List<ArchiveGeneration> eligibleMutated = new ArrayList<>();
+            Map<UUID, Integer> lastGenClusterIndex = new HashMap<>();
+            for (int i = 0; i < resolveLimit; i++) {
+                List<ArchiveGeneration> cluster = clusters.get(i);
+                for (ArchiveGeneration gen : cluster) {
+                    UUID genId = gen.id();
+                    if (!mutatedByGen.getOrDefault(genId, Set.of()).isEmpty() &&
+                            Boolean.TRUE.equals(populatedByGen.get(genId)) &&
+                            Boolean.TRUE.equals(exactReadyByGen.get(genId)) &&
+                            isGenerationWindowFullyContained(gen, phenomenonTimeFilter) &&
+                            isGenerationResultTimeFullyContained(gen, resultTimeFilter) &&
+                            exactByGen.getOrDefault(genId, 0L) > 0L) {
+                        eligibleMutated.add(gen);
+                        lastGenClusterIndex.put(genId, i);
+                    }
+                }
+            }
+
+            int nextClusterToCheck = 0;
+            long resolvedGuaranteed = 0L;
+            for (int start = 0; start < eligibleMutated.size(); start += 256) {
+                List<ArchiveGeneration> chunk = eligibleMutated.subList(
+                        start, Math.min(eligibleMutated.size(), start + 256));
+                exactMutatedMatches.putAll(exactMutatedMatchResolver.apply(chunk, mutatedByGen));
+                if (boundedTarget) {
+                    boolean moreChunksRemain = start + 256 < eligibleMutated.size();
+                    int safeClusterExclusive = moreChunksRemain
+                            ? lastGenClusterIndex.getOrDefault(eligibleMutated.get(start + 256).id(), resolveLimit)
+                            : resolveLimit;
+                    while (nextClusterToCheck < safeClusterExclusive) {
+                        List<ArchiveGeneration> cluster = clusters.get(nextClusterToCheck);
+                        boolean clusterExact = true;
+                        long clusterExactSum = 0L;
+                        for (ArchiveGeneration gen : cluster) {
+                            UUID genId = gen.id();
+                            long mutatedCount = mutatedByGen.getOrDefault(genId, Set.of()).size();
+                            if (Boolean.TRUE.equals(populatedByGen.get(genId)) &&
+                                    Boolean.TRUE.equals(exactReadyByGen.get(genId)) &&
+                                    isGenerationWindowFullyContained(gen, phenomenonTimeFilter) &&
+                                    isGenerationResultTimeFullyContained(gen, resultTimeFilter)) {
+                                long exactVal = exactByGen.getOrDefault(genId, 0L);
+                                long exactUnmutated = exactMutatedMatches.containsKey(genId)
+                                        ? Math.max(0L, exactVal - exactMutatedMatches.get(genId))
+                                        : Math.max(0L, exactVal - mutatedCount);
+                                clusterExactSum = saturateAddLong(clusterExactSum, exactUnmutated);
+                            } else {
+                                clusterExact = false;
+                            }
+                        }
+                        nextClusterToCheck++;
+                        if (clusterExact)
+                            resolvedGuaranteed = saturateAddLong(resolvedGuaranteed, clusterExactSum);
+                    }
+                    if (resolvedGuaranteed >= targetMatches)
+                        break;
+                }
+            }
+        }
 
         List<ArchiveGeneration> primary = new ArrayList<>();
         List<ArchiveGeneration> overflow = new ArrayList<>();
@@ -2791,7 +3312,24 @@ public final class ArchiveCatalog {
         int primaryClusterCount = 0;
         boolean fillOverflow = false;
 
-        for (List<ArchiveGeneration> cluster : clusters) {
+        for (List<ArchiveGeneration> rawCluster : clusters) {
+            List<ArchiveGeneration> cluster = new ArrayList<>(rawCluster.size());
+            for (ArchiveGeneration gen : rawCluster) {
+                UUID genId = gen.id();
+                if (exactMutatedMatches.containsKey(genId)) {
+                    long exactRemaining = Math.max(0L,
+                            exactByGen.getOrDefault(genId, 0L) - exactMutatedMatches.get(genId));
+                    if (exactRemaining == 0L)
+                        continue;
+                }
+                cluster.add(gen);
+            }
+            if (cluster.isEmpty())
+                continue;
+            if (!boundedTarget) {
+                primary.addAll(cluster);
+                continue;
+            }
             if (fillOverflow) {
                 overflow.addAll(cluster);
                 continue;
@@ -2804,13 +3342,20 @@ public final class ArchiveCatalog {
             for (ArchiveGeneration gen : cluster) {
                 UUID genId = gen.id();
                 boolean populated = Boolean.TRUE.equals(populatedByGen.get(genId));
-                long upper = populated ? upperByGen.getOrDefault(genId, 0L) : readerLimit;
-                clusterUpperSum = saturateAddLong(clusterUpperSum, upper);
+                long mutatedCount = mutatedByGen.getOrDefault(genId, Set.of()).size();
+                if (exactMutatedMatches.containsKey(genId)) {
+                    long exactRemaining = Math.max(0L,
+                            exactByGen.getOrDefault(genId, 0L) - exactMutatedMatches.get(genId));
+                    clusterUpperSum = saturateAddLong(clusterUpperSum, exactRemaining);
+                    clusterExactSum = saturateAddLong(clusterExactSum, exactRemaining);
+                    continue;
+                }
+                long upper = populated ? upperByGen.getOrDefault(genId, 0L) : targetMatches;
+                clusterUpperSum = saturateAddLong(clusterUpperSum, Math.max(0L, upper - mutatedCount));
                 if (clusterExact &&
                         Boolean.TRUE.equals(exactReadyByGen.get(genId)) &&
                         isGenerationWindowFullyContained(gen, phenomenonTimeFilter) &&
                         isGenerationResultTimeFullyContained(gen, resultTimeFilter)) {
-                    long mutatedCount = mutatedByGen.getOrDefault(genId, Set.of()).size();
                     long exactUnmutated = Math.max(0L, exactByGen.getOrDefault(genId, 0L) - mutatedCount);
                     clusterExactSum = saturateAddLong(clusterExactSum, exactUnmutated);
                 } else {
@@ -2821,10 +3366,10 @@ public final class ArchiveCatalog {
             if (clusterExact)
                 guaranteedMatches = saturateAddLong(guaranteedMatches, clusterExactSum);
 
-            if (guaranteedMatches >= readerLimit) {
+            if (guaranteedMatches >= targetMatches) {
                 break;
             }
-            if (upperBoundMatches >= readerLimit && primaryClusterCount >= 4) {
+            if (upperBoundMatches >= targetMatches && primaryClusterCount >= 4) {
                 fillOverflow = true;
             }
         }
@@ -2864,17 +3409,25 @@ public final class ArchiveCatalog {
         return r < 0L ? Long.MAX_VALUE : r;
     }
 
-    public record ColdSummaryPlan(long summarizedCount, List<ArchiveGeneration> remainingCandidates) {}
+    public record ColdSummaryPlan(
+            long summarizedCount,
+            List<ArchiveGeneration> remainingCandidates,
+            List<ArchiveGeneration> exactMutatedCandidates) {
+        public ColdSummaryPlan(long summarizedCount, List<ArchiveGeneration> remainingCandidates) {
+            this(summarizedCount, remainingCandidates, List.of());
+        }
+    }
 
     /**
-     * Sums unmutated interior generations directly from {@code oscar_archive_schema}
-     * summary counters in PostgreSQL and prunes zero-match boundary generations.
+     * Sums fully-contained generations directly from {@code oscar_archive_schema}
+     * summary counters in PostgreSQL, records mutated interior generations whose
+     * base matches must be subtracted by ID, and prunes zero-match generations.
      */
     public ColdSummaryPlan summarizeColdCandidates(
             List<ArchiveGeneration> candidates, TemporalFilter phenomenonTimeFilter,
             Set<Long> dataStreams, Set<UUID> mutatedGenerationIds, String summaryExpr) {
         if (summaryExpr == null)
-            return new ColdSummaryPlan(0L, candidates == null ? List.of() : candidates);
+            return new ColdSummaryPlan(0L, candidates == null ? List.of() : candidates, List.of());
         return summarizeColdCandidates(candidates, phenomenonTimeFilter, null,
                 dataStreams, mutatedGenerationIds,
                 new JsonCqlEvaluator.SummaryCounterSpec(summaryExpr, summaryExpr, "s.summary_populated"));
@@ -2885,15 +3438,41 @@ public final class ArchiveCatalog {
             TemporalFilter resultTimeFilter,
             Set<Long> dataStreams, Set<UUID> mutatedGenerationIds,
             JsonCqlEvaluator.SummaryCounterSpec summarySpec) {
-        if (candidates == null || candidates.isEmpty() || summarySpec == null)
-            return new ColdSummaryPlan(0L, candidates == null ? List.of() : candidates);
+        return summarizeColdCandidates(
+                candidates, phenomenonTimeFilter, resultTimeFilter,
+                dataStreams, mutatedGenerationIds, summarySpec, null);
+    }
+
+    public ColdSummaryPlan summarizeColdCandidates(
+            List<ArchiveGeneration> candidates, TemporalFilter phenomenonTimeFilter,
+            TemporalFilter resultTimeFilter,
+            Set<Long> dataStreams, Set<UUID> mutatedGenerationIds,
+            JsonCqlEvaluator.SummaryCounterSpec summarySpec,
+            JsonCqlEvaluator.TimeContainedSummarySpec timeContainedSpec) {
+        if (candidates == null || candidates.isEmpty() || (summarySpec == null && timeContainedSpec == null))
+            return new ColdSummaryPlan(0L, candidates == null ? List.of() : candidates, List.of());
+        String upperExpr = summarySpec != null ? summarySpec.upperBoundExpr() : timeContainedSpec.upperBoundExpr();
+        String exactReadyExpr = summarySpec != null ? summarySpec.exactReadyExpr() : "false";
+        String exactExpr = summarySpec != null ? summarySpec.exactExpr() : "0::bigint";
+        boolean checkTimeContained = timeContainedSpec != null && !timeContainedSpec.requiredTimeFields().isEmpty();
+        String tcReadyExpr = checkTimeContained
+                ? "((" + timeContainedSpec.exactReadyExpr() + ") AND ((" +
+                  timeContainedSpec.upperBoundExpr() + ") = 0 OR (" +
+                  buildRequiredTimeFieldsSchemaSql(timeContainedSpec.requiredTimeFields()) + ")))"
+                : "false";
+        String tcExactExpr = checkTimeContained ? timeContainedSpec.exactExpr() : "0::bigint";
+
         boolean filterStreams = dataStreams != null;
         boolean omitGenFilter = filterStreams && candidates.size() > 64;
         String sql = "SELECT s.generation_id, BOOL_AND(s.summary_populated), " +
-                "COALESCE(SUM(" + summarySpec.upperBoundExpr() + "), 0)::bigint, " +
-                "BOOL_AND(" + summarySpec.exactReadyExpr() + "), " +
-                "COALESCE(SUM(" + summarySpec.exactExpr() + "), 0)::bigint " +
-                "FROM oscar_archive_schema s WHERE " +
+                "COALESCE(SUM(" + upperExpr + "), 0)::bigint, " +
+                "BOOL_AND(" + exactReadyExpr + "), " +
+                "COALESCE(SUM(" + exactExpr + "), 0)::bigint, " +
+                "BOOL_AND(" + tcReadyExpr + "), " +
+                "COALESCE(SUM(" + tcExactExpr + "), 0)::bigint " +
+                "FROM oscar_archive_schema s " +
+                (checkTimeContained ? "LEFT JOIN oscar_archive_schema_blob b ON b.schema_sha256 = s.schema_sha256 " : "") +
+                "WHERE " +
                 (omitGenFilter
                         ? "s.datastream_id=ANY (?::bigint[])"
                         : "s.generation_id=ANY (?::uuid[])" +
@@ -2903,6 +3482,8 @@ public final class ArchiveCatalog {
         Map<UUID, Long> upperByGen = new HashMap<>();
         Map<UUID, Boolean> exactReadyByGen = new HashMap<>();
         Map<UUID, Long> exactByGen = new HashMap<>();
+        Map<UUID, Boolean> tcReadyByGen = checkTimeContained ? new HashMap<>() : Map.of();
+        Map<UUID, Long> tcExactByGen = checkTimeContained ? new HashMap<>() : Map.of();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
             java.sql.Array genArray = omitGenFilter ? null : connection.createArrayOf("uuid",
@@ -2923,6 +3504,10 @@ public final class ArchiveCatalog {
                         upperByGen.put(genId, result.getLong(3));
                         exactReadyByGen.put(genId, result.getBoolean(4));
                         exactByGen.put(genId, result.getLong(5));
+                        if (checkTimeContained) {
+                            tcReadyByGen.put(genId, result.getBoolean(6));
+                            tcExactByGen.put(genId, result.getLong(7));
+                        }
                     }
                 }
             } finally {
@@ -2932,11 +3517,12 @@ public final class ArchiveCatalog {
                     streamArray.free();
             }
         } catch (SQLException e) {
-            return new ColdSummaryPlan(0L, candidates);
+            return new ColdSummaryPlan(0L, candidates, List.of());
         }
 
         long summarized = 0L;
         List<ArchiveGeneration> remaining = new ArrayList<>();
+        List<ArchiveGeneration> exactMutated = new ArrayList<>();
         for (ArchiveGeneration generation : candidates) {
             UUID genId = generation.id();
             boolean populated = Boolean.TRUE.equals(populatedByGen.get(genId));
@@ -2947,15 +3533,57 @@ public final class ArchiveCatalog {
             if (populated && upper == 0L) {
                 continue; // Zero matching base rows in this generation even at window boundaries.
             }
-            if (!mutated && populated && exactReady &&
+            if (populated && exactReady &&
                     isGenerationWindowFullyContained(generation, phenomenonTimeFilter) &&
                     isGenerationResultTimeFullyContained(generation, resultTimeFilter)) {
                 summarized = Math.addExact(summarized, exact);
+                if (mutated && exact > 0L) {
+                    exactMutated.add(generation);
+                }
+                continue;
+            }
+            if (checkTimeContained && populated &&
+                    Boolean.TRUE.equals(tcReadyByGen.get(genId)) &&
+                    isGenerationWindowFullyContained(generation, phenomenonTimeFilter) &&
+                    isGenerationResultTimeFullyContained(generation, resultTimeFilter) &&
+                    isGenerationInsideTimeContainedBounds(generation, timeContainedSpec)) {
+                long tcExact = tcExactByGen.getOrDefault(genId, 0L);
+                summarized = Math.addExact(summarized, tcExact);
+                if (mutated && tcExact > 0L) {
+                    exactMutated.add(generation);
+                }
                 continue;
             }
             remaining.add(generation);
         }
-        return new ColdSummaryPlan(summarized, remaining);
+        return new ColdSummaryPlan(summarized, remaining, exactMutated);
+    }
+
+    private static boolean isGenerationInsideTimeContainedBounds(
+            ArchiveGeneration generation, JsonCqlEvaluator.TimeContainedSummarySpec spec) {
+        if (generation.start() == null || generation.end() == null)
+            return false;
+        Instant minStart = spec.minContainedWindowStart();
+        if (minStart != null && generation.start().isBefore(minStart))
+            return false;
+        Instant maxEnd = spec.maxContainedWindowEnd();
+        if (maxEnd != null && generation.end().isAfter(maxEnd))
+            return false;
+        return true;
+    }
+
+    private static String buildRequiredTimeFieldsSchemaSql(Set<String> requiredTimeFields) {
+        List<String> checks = new ArrayList<>(requiredTimeFields.size());
+        for (String field : requiredTimeFields) {
+            String literal = switch (field) {
+                case "startTime" -> "'[{\"name\":\"startTime\",\"type\":\"Time\"}]'::jsonb";
+                case "endTime" -> "'[{\"name\":\"endTime\",\"type\":\"Time\"}]'::jsonb";
+                case "samplingTime" -> "'[{\"name\":\"samplingTime\",\"type\":\"Time\"}]'::jsonb";
+                default -> throw new IllegalArgumentException("Unsupported time summary field: " + field);
+            };
+            checks.add("COALESCE(s.schema_json, b.schema_json)->'recordSchema'->'fields' @> " + literal);
+        }
+        return checks.isEmpty() ? "false" : String.join(" AND ", checks);
     }
 
     private static boolean isGenerationWindowFullyContained(
@@ -3096,6 +3724,18 @@ public final class ArchiveCatalog {
      */
     public Stream<ArchivedOverlay> streamOverlays(int scope, ObsFilter filter,
                                                    Set<Long> dataStreams, Set<Long> fois) {
+        return streamOverlays(scope, filter, dataStreams, fois, 1_000);
+    }
+
+    /**
+     * A small first page avoids materializing hundreds of unused overlays for
+     * short, unfiltered reads. Later pages grow to the usual bounded size.
+     */
+    public Stream<ArchivedOverlay> streamOverlays(int scope, ObsFilter filter,
+                                                   Set<Long> dataStreams, Set<Long> fois,
+                                                   int initialPageSize) {
+        if (initialPageSize < 1 || initialPageSize > 1_000)
+            throw new IllegalArgumentException("Overlay initial page size must be in 1..1000");
         if (dataStreams != null && dataStreams.isEmpty())
             return Stream.empty();
         if (fois != null && fois.isEmpty())
@@ -3105,7 +3745,7 @@ public final class ArchiveCatalog {
         String baseSql = buildOverlayQuerySql(
                 "overlay_row.generation_id, overlay_row.observation_id, overlay_row.datastream_id, " +
                         "overlay_row.foi_id, overlay_row.phenomenon_time, overlay_row.result_time, " +
-                        "overlay_row.result_json::text, overlay_row.schema_json::text",
+                        "overlay_row.result_json, overlay_row.schema_json, overlay_row.schema_sha256",
                 filter, dataStreams, fois, parameters);
         boolean descending = filter.getPhenomenonTime() != null &&
                 filter.getPhenomenonTime().descendingOrder();
@@ -3115,7 +3755,7 @@ public final class ArchiveCatalog {
         // one (or when every pool connection is serving a concurrent merge).
         // Keyset pages keep memory bounded without OFFSET's quadratic rescans.
         OverlayCursor cursor = new OverlayCursor(scope, baseSql,
-                List.copyOf(parameters), descending);
+                List.copyOf(parameters), descending, initialPageSize);
         openOverlayCursors.incrementAndGet();
         return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
                         Spliterator.ORDERED | Spliterator.NONNULL), false)
@@ -3151,9 +3791,11 @@ public final class ArchiveCatalog {
                 try (ResultSet result = statement.executeQuery()) {
                     if (!hasCql)
                         return result.next() ? result.getLong(1) : 0L;
+                    java.util.function.Predicate<String> cqlMatcher =
+                            JsonCqlEvaluator.compileMatcher(filter.getCQLFilter());
                     long matched = 0L;
                     while (result.next()) {
-                        if (JsonCqlEvaluator.matches(filter.getCQLFilter(), result.getString(1)))
+                        if (cqlMatcher.test(result.getString(1)))
                             matched = Math.addExact(matched, 1L);
                     }
                     return matched;
@@ -3225,6 +3867,9 @@ public final class ArchiveCatalog {
         StringBuilder sql = new StringBuilder("SELECT ").append(projection)
                 .append(" FROM oscar_obs_overlay overlay_row " +
                         "JOIN oscar_archive_generation generation ON generation.id=overlay_row.generation_id " +
+                        (projection.contains("overlay_schema_blob") ?
+                                "LEFT JOIN oscar_archive_schema_blob overlay_schema_blob " +
+                                "ON overlay_schema_blob.schema_sha256=overlay_row.schema_sha256 " : "") +
                         "WHERE overlay_row.store_key=? AND overlay_row.id_scope=? " +
                         "AND generation.store_key=overlay_row.store_key AND generation.id_scope=overlay_row.id_scope " +
                         "AND generation.state IN ('ACTIVE','SEALED') " +
@@ -3262,6 +3907,10 @@ public final class ArchiveCatalog {
         }
         appendTime(sql, "overlay_row.phenomenon_time", filter.getPhenomenonTime(), parameters);
         appendTime(sql, "overlay_row.result_time", filter.getResultTime(), parameters);
+        // Apply only a conservative predicate: mutation membership remains
+        // independent of this query and exact CQL evaluation follows on survivors.
+        JsonCqlEvaluator.appendPostgresOverlayPrefilter(
+                filter.getCQLFilter(), "overlay_row.result_json", sql);
         return sql.toString();
     }
 
@@ -3340,19 +3989,21 @@ public final class ArchiveCatalog {
         private final String baseSql;
         private final List<QueryParameter> baseParameters;
         private final boolean descending;
-        private final ArrayDeque<ArchivedOverlay> ready = new ArrayDeque<>(PAGE_SIZE);
+        private final ArrayDeque<ArchivedOverlay> ready = new ArrayDeque<>();
         private final AtomicBoolean closed = new AtomicBoolean();
+        private int nextPageSize;
         private Instant lastPhenomenonTime;
         private long lastObservationId;
         private boolean hasContinuation;
         private boolean exhausted;
 
         OverlayCursor(int scope, String baseSql, List<QueryParameter> baseParameters,
-                      boolean descending) {
+                      boolean descending, int initialPageSize) {
             this.scope = scope;
             this.baseSql = baseSql;
             this.baseParameters = baseParameters;
             this.descending = descending;
+            this.nextPageSize = initialPageSize;
         }
 
         @Override
@@ -3383,7 +4034,14 @@ public final class ArchiveCatalog {
         }
 
         private void fetchPage() throws SQLException {
-            StringBuilder sql = new StringBuilder(baseSql);
+            // Limit the ordered candidate rows before converting payloads and
+            // resolving shared schema JSON. The outer order preserves the cursor
+            // contract even if the join chooses a different physical order.
+            StringBuilder sql = new StringBuilder(
+                    "SELECT page.generation_id, page.observation_id, page.datastream_id, " +
+                    "page.foi_id, page.phenomenon_time, page.result_time, " +
+                    "page.result_json::text, COALESCE(page.schema_json, overlay_schema_blob.schema_json)::text " +
+                    "FROM (").append(baseSql);
             if (hasContinuation) {
                 if (lastPhenomenonTime == null) {
                     sql.append(" AND ((overlay_row.phenomenon_time IS NULL " +
@@ -3399,9 +4057,15 @@ public final class ArchiveCatalog {
             }
             sql.append(" ORDER BY overlay_row.phenomenon_time ")
                     .append(descending ? "DESC" : "ASC")
-                    .append(" NULLS FIRST, overlay_row.observation_id ASC LIMIT ?");
+                    .append(" NULLS FIRST, overlay_row.observation_id ASC LIMIT ?) page ")
+                    .append("LEFT JOIN oscar_archive_schema_blob overlay_schema_blob ")
+                    .append("ON overlay_schema_blob.schema_sha256=page.schema_sha256 ")
+                    .append("ORDER BY page.phenomenon_time ")
+                    .append(descending ? "DESC" : "ASC")
+                    .append(" NULLS FIRST, page.observation_id ASC");
 
             int fetched = 0;
+            int pageSize = nextPageSize;
             try (Connection connection = connections.open();
                  PreparedStatement statement = connection.prepareStatement(sql.toString())) {
                 connection.setReadOnly(true);
@@ -3417,7 +4081,7 @@ public final class ArchiveCatalog {
                         statement.setLong(parameter++, lastObservationId);
                     }
                 }
-                statement.setInt(parameter, PAGE_SIZE);
+                statement.setInt(parameter, pageSize);
                 try (ResultSet result = statement.executeQuery()) {
                     while (result.next()) {
                         UUID generationId = result.getObject(1, UUID.class);
@@ -3436,7 +4100,9 @@ public final class ArchiveCatalog {
             }
             overlayRowsRead.addAndGet(fetched);
             hasContinuation = fetched > 0;
-            exhausted = fetched < PAGE_SIZE;
+            exhausted = fetched < pageSize;
+            if (!exhausted)
+                nextPageSize = Math.min(PAGE_SIZE, pageSize * 2);
         }
 
         @Override

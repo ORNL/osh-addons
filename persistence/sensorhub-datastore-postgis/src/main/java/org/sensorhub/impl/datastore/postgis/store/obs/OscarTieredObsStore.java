@@ -1,5 +1,7 @@
 package org.sensorhub.impl.datastore.postgis.store.obs;
 
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import com.google.gson.JsonParser;
 import net.opengis.swe.v20.DataBlock;
 import org.postgresql.util.PGobject;
@@ -29,6 +31,7 @@ import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
 import org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator;
 import org.sensorhub.impl.datastore.postgis.builder.ParameterizedQuery;
 import org.sensorhub.impl.datastore.postgis.builder.QueryBuilderObsStore;
+import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
 import org.sensorhub.impl.datastore.postgis.utils.SerializerUtils;
 import org.vast.util.TimeExtent;
 import org.vast.data.DataBlockByte;
@@ -63,6 +66,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
@@ -71,7 +75,9 @@ import java.util.Set;
 import java.util.Spliterator;
 import java.util.Spliterators;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -95,6 +101,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private static final Duration MUTABLE_INDEX_REINDEX_INTERVAL = Duration.ofDays(7);
     private static final int INITIAL_CANDIDATE_CLUSTER_BATCH = 64;
     private static final int REMOVE_BATCH_SIZE = 512;
+    private static final int POINT_READ_COALESCER_BATCH = 64;
+    private static final int OVERLAY_WRITE_COALESCER_BATCH = 64;
 
     private final TieredArchiveConfig archiveConfig;
     private final ArchiveCatalog archiveCatalog;
@@ -103,6 +111,24 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private final ParquetArchiveReader archiveReader;
     private final ImmutableObservationStageManager immutableStage;
     private final Map<String, IDataStreamInfo> archivedSchemas = new ConcurrentHashMap<>();
+    private final Cache<String, IDataStreamInfo> decodedOverlaySchemas = CacheBuilder.newBuilder()
+            .maximumSize(512)
+            .expireAfterAccess(30, TimeUnit.MINUTES)
+            .build();
+    private final Cache<Long, CachedOverlaySchema> liveOverlaySchemas = CacheBuilder.newBuilder()
+            .maximumSize(2048)
+            .expireAfterAccess(30, TimeUnit.MINUTES)
+            .build();
+    private final Cache<Long, ParquetArchiveReader.ArchivedRow> recentColdBaseById = CacheBuilder.newBuilder()
+            .maximumSize(4096)
+            .expireAfterWrite(2, TimeUnit.MINUTES)
+            .build();
+    private final Cache<MutatedGenSummaryCountKey, Long> mutatedGenSummaryCounts = CacheBuilder.newBuilder()
+            .maximumSize(16_384)
+            .expireAfterAccess(30, TimeUnit.MINUTES)
+            .build();
+    private final ColdPointReadCoalescer coldPointReadCoalescer = new ColdPointReadCoalescer();
+    private final OverlayWriteCoalescer overlayWriteCoalescer = new OverlayWriteCoalescer();
     private final Map<Long, Boolean> immutableDataStreamCache = new ConcurrentHashMap<>();
     private final ThreadLocal<Map<Long, IDataStreamInfo>> pinnedDataStreamSchemas =
             new ThreadLocal<>();
@@ -232,12 +258,17 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         if (immutableStage != null)
             immutableStage.retireVerifiedPartitions();
         archiveCatalog.backfillGenerationSummariesBatch(Path.of(archiveConfig.rootDirectory), 100);
+        archiveCatalog.migrateLegacyOverlaySchemas(250);
         long now = System.currentTimeMillis();
         long previous = lastMutableReindexEpochMillis.get();
         if (now - previous >= MUTABLE_INDEX_REINDEX_INTERVAL.toMillis() &&
                 lastMutableReindexEpochMillis.compareAndSet(previous, now)) {
             reindexMutableHotTables();
         }
+    }
+
+    public int migrateLegacyOverlaySchemas(int limit) {
+        return archiveCatalog.migrateLegacyOverlaySchemas(limit);
     }
 
     /**
@@ -920,7 +951,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     : hotEntries.stream();
             cold = streamColdBasesForLatest(tierFilter, tierLimit,
                     dataStreams, fois, hotEntries, effectiveHasMutations);
-        } else if (boundedMerge && tierLimit <= STREAM_FETCH_SIZE) {
+        } else if (boundedMerge && filter.getLimit() <= STREAM_FETCH_SIZE) {
             List<Entry<BigId, IObsData>> hotEntries;
             try (Stream<Entry<BigId, IObsData>> hotStream =
                          super.selectEntries(tierFilter, (Set<ObsField>) null,
@@ -928,25 +959,32 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 Stream<Entry<BigId, IObsData>> effectiveHot = effectiveHasMutations
                         ? excludeMutated(hotStream, entry -> entry.getKey().getIdAsLong(), mutationBatchSize)
                         : hotStream;
-                hotEntries = effectiveHot.toList();
+                hotEntries = effectiveHot.limit(filter.getLimit()).toList();
             }
             hot = hotEntries.stream();
             Instant hotBoundaryTime = (filter.getLimit() > 0 && hotEntries.size() >= filter.getLimit())
                     ? hotEntries.get((int) filter.getLimit() - 1).getValue().getPhenomenonTime()
                     : null;
-            cold = streamColdBases(tierFilter, tierLimit,
+            cold = streamColdBases(tierFilter, filter.getLimit(), tierLimit,
                     dataStreams, fois, effectiveHasMutations, mutationBatchSize, hotBoundaryTime);
         } else {
             hot = super.selectEntries(tierFilter, (Set<ObsField>) null,
                     false, initialHotPageSize);
             if (effectiveHasMutations)
                 hot = excludeMutated(hot, entry -> entry.getKey().getIdAsLong(), mutationBatchSize);
-            cold = streamColdBases(tierFilter, tierLimit,
+            cold = streamColdBases(tierFilter, filter.getLimit(), tierLimit,
                     dataStreams, fois, effectiveHasMutations, mutationBatchSize, null);
         }
+        boolean smallPlainRead = !latest && filter.getCQLFilter() == null &&
+                filter.getValuePredicate() == null &&
+                filter.getPhenomenonLocation() == null &&
+                filter.getLimit() != Long.MAX_VALUE;
+        int overlayInitialPageSize = smallPlainRead
+                ? Math.min(1_000, adaptiveInitialPageSize(filter.getLimit()))
+                : 1_000;
         Stream<Entry<BigId, IObsData>> overlays = parentTableOnly
                 ? Stream.empty()
-                : streamOverlays(tierFilter, dataStreams, fois, effectiveHasMutations);
+                : streamOverlays(tierFilter, dataStreams, fois, effectiveHasMutations, overlayInitialPageSize);
 
         // Each source is already ordered by phenomenon time and ID. Merge it
         // lazily so cold payloads are never accumulated in a JVM collection.
@@ -1160,11 +1198,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private Stream<Entry<BigId, IObsData>> streamColdBases(
             ObsFilter filter, long readerLimit, Set<Long> dataStreams, Set<Long> fois,
             boolean hasMutations, int mutationBatchSize) {
-        return streamColdBases(filter, readerLimit, dataStreams, fois, hasMutations, mutationBatchSize, null);
+        return streamColdBases(filter, readerLimit, readerLimit, dataStreams, fois, hasMutations, mutationBatchSize, null);
     }
 
     private Stream<Entry<BigId, IObsData>> streamColdBases(
-            ObsFilter filter, long readerLimit, Set<Long> dataStreams, Set<Long> fois,
+            ObsFilter filter, long callerLimit, long readerLimit, Set<Long> dataStreams, Set<Long> fois,
             boolean hasMutations, int mutationBatchSize, Instant hotBoundaryTime) {
         ArchiveBounds bounds = archiveBounds(filter, hotBoundaryTime);
         if (!bounds.start().isBefore(bounds.end()))
@@ -1199,19 +1237,26 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 ArchiveCatalog.CandidateSelectionPlan plan =
                         archiveCatalog.selectSummaryMatchedCandidates(
                                 allCandidates, filter.getPhenomenonTime(), filter.getResultTime(),
-                                dataStreams, descending, readerLimit, hasMutations,
-                                summarySpec, exactEventId);
+                                dataStreams, descending, callerLimit, readerLimit, hasMutations,
+                                summarySpec, exactEventId,
+                                summarySpec != null && hasMutations
+                                        ? (chunk, mutatedByGen) -> countMutatedSummaryBaseMatchesByGeneration(
+                                                chunk, mutatedByGen, filter, dataStreams, fois)
+                                        : null);
                 if (plan.primaryCandidates().isEmpty())
                     return Stream.empty();
+                ObsFilter coldStreamFilter = callerLimit == readerLimit
+                        ? filter
+                        : ObsFilter.Builder.from(filter).withLimit(callerLimit).build();
                 if (plan.overflowCandidates().isEmpty()) {
                     return streamColdBasesFromPreprunedCandidates(
-                            plan.primaryCandidates(), filter, readerLimit,
+                            plan.primaryCandidates(), coldStreamFilter, readerLimit,
                             dataStreams, fois, hasMutations, mutationBatchSize);
                 }
                 java.util.concurrent.atomic.AtomicLong emitted = new java.util.concurrent.atomic.AtomicLong();
                 Supplier<Stream<Entry<BigId, IObsData>>> primarySupplier = () ->
                         streamColdBasesFromPreprunedCandidates(
-                                plan.primaryCandidates(), filter, readerLimit,
+                                plan.primaryCandidates(), coldStreamFilter, readerLimit,
                                 dataStreams, fois, hasMutations, mutationBatchSize)
                                 .peek(ignored -> emitted.incrementAndGet());
                 Supplier<Stream<Entry<BigId, IObsData>>> overflowSupplier = () -> {
@@ -1221,7 +1266,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     if (readerLimit != Long.MAX_VALUE && remainingLimit <= 0)
                         return Stream.empty();
                     return streamColdBasesFromPreprunedCandidates(
-                            plan.overflowCandidates(), filter, remainingLimit,
+                            plan.overflowCandidates(), coldStreamFilter, remainingLimit,
                             dataStreams, fois, hasMutations, mutationBatchSize);
                 };
                 return Stream.of(primarySupplier, overflowSupplier).flatMap(Supplier::get);
@@ -1338,16 +1383,30 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private Stream<Entry<BigId, IObsData>> streamOverlays(
             ObsFilter filter, Set<Long> dataStreams, Set<Long> fois,
             boolean hasMutations) {
+        return streamOverlays(filter, dataStreams, fois, hasMutations, 1_000);
+    }
+
+    private Stream<Entry<BigId, IObsData>> streamOverlays(
+            ObsFilter filter, Set<Long> dataStreams, Set<Long> fois,
+            boolean hasMutations, int initialPageSize) {
         if (!hasMutations)
             return Stream.empty();
-        return archiveCatalog.streamOverlays(idScope, filter, dataStreams, fois)
+        org.geotools.api.filter.Filter cqlFilter = filter.getCQLFilter();
+        boolean canPrecheckCql = cqlFilter != null &&
+                JsonCqlEvaluator.canonicalCacheKey(cqlFilter).isPresent();
+        java.util.function.Predicate<String> cqlMatcher = canPrecheckCql
+                ? JsonCqlEvaluator.compileMatcher(cqlFilter)
+                : null;
+        return archiveCatalog.streamOverlays(idScope, filter, dataStreams, fois, initialPageSize)
                 .flatMap(mutation -> {
                     ArchivedObservation overlay = mutation.observation();
+                    if (cqlMatcher != null && !cqlMatcher.test(overlay.resultJson()))
+                        return Stream.empty();
                     long id = overlay.id();
                     IObsData observation = toObservation(
                             mutation.generationId(), mutation.schemaJson(), overlay);
-                    return matchesObservation(filter, dataStreams, fois, id,
-                            overlay.resultJson(), observation)
+                    return matchesObservationWithoutCqlIfPrechecked(
+                            filter, dataStreams, fois, id, overlay.resultJson(), observation, cqlMatcher != null)
                             ? Stream.of(Map.entry(BigId.fromLong(idScope, id), observation))
                             : Stream.empty();
                 });
@@ -1510,6 +1569,13 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
     private boolean matchesObservation(ObsFilter filter, Set<Long> dataStreams, Set<Long> fois,
                                        long id, String resultJson, IObsData observation) {
+        return matchesObservationWithoutCqlIfPrechecked(
+                filter, dataStreams, fois, id, resultJson, observation, false);
+    }
+
+    private boolean matchesObservationWithoutCqlIfPrechecked(
+            ObsFilter filter, Set<Long> dataStreams, Set<Long> fois,
+            long id, String resultJson, IObsData observation, boolean cqlAlreadyVerified) {
         if (filter.getInternalIDs() != null &&
                 !filter.getInternalIDs().contains(BigId.fromLong(idScope, id)))
             return false;
@@ -1522,7 +1588,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         }
         if (!filter.test(observation))
             return false;
-        if (!JsonCqlEvaluator.matches(filter.getCQLFilter(), resultJson))
+        if (!cqlAlreadyVerified && !JsonCqlEvaluator.matches(filter.getCQLFilter(), resultJson))
             return false;
         return true;
     }
@@ -1588,10 +1654,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         boolean overlay = "OVERLAY".equals(archived.profile());
         IDataStreamInfo schema = null;
         if (overlay && overlaySchemaJson != null) {
-            try {
-                schema = SerializerUtils.readIDataStreamInfoFromJson(overlaySchemaJson);
-            } catch (IOException e) {
-                throw new IllegalStateException("Cannot decode archived overlay schema", e);
+            String schemaHash = ArchiveCatalog.computeSchemaSha256(overlaySchemaJson);
+            schema = decodedOverlaySchemas.getIfPresent(schemaHash);
+            if (schema == null) {
+                try {
+                    schema = SerializerUtils.readIDataStreamInfoFromJson(overlaySchemaJson);
+                    decodedOverlaySchemas.put(schemaHash, schema);
+                } catch (IOException e) {
+                    throw new IllegalStateException("Cannot decode archived overlay schema", e);
+                }
             }
         }
         if (schema == null && generationId != null) {
@@ -2346,37 +2417,111 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     public IObsData get(Object key) {
         if (!(key instanceof BigId id))
             return super.get(key);
-        if (archiveCatalog.isTombstoned(id.getIdAsLong()))
-            return null;
-        if (!archiveConfig.enabled)
+        long observationId = id.getIdAsLong();
+        if (!archiveConfig.enabled) {
+            if (archiveCatalog.isTombstoned(observationId))
+                return null;
             return super.get(key);
+        }
+        ArchiveCatalog.PointLookupStatus pointStatus =
+                archiveCatalog.lookupOverlayOrTombstone(observationId, idScope, "OVERLAY");
+        if (pointStatus.tombstoned())
+            return null;
+        if (pointStatus.overlay() != null) {
+            ArchiveCatalog.ArchivedOverlay overlay = pointStatus.overlay();
+            return toObservation(overlay.generationId(), overlay.schemaJson(), overlay.observation());
+        }
         IObsData hot = super.get(key);
-        java.util.Optional<ArchiveCatalog.ArchivedOverlay> overlay = archiveCatalog.overlayWithGeneration(
-                id.getIdAsLong(), idScope, "OVERLAY");
-        if (overlay.isPresent())
-            return toObservation(overlay.get().generationId(), overlay.get().schemaJson(),
-                    overlay.get().observation());
         if (hot != null)
             return hot;
-        ObsFilter filter = new ObsFilter.Builder().withInternalIDs(id).build();
-        return readCold(filter).orElse(null);
+        return getColdByPointId(observationId);
+    }
+
+    private IObsData getColdByPointId(long observationId) {
+        ParquetArchiveReader.ArchivedRow cached = getVerifiedCachedColdBase(observationId);
+        if (cached != null) {
+            if (archiveCatalog.isGenerationQueryVisible(cached.generation().id())) {
+                return toObservation(cached.generation().id(), null, cached.observation());
+            }
+            recentColdBaseById.invalidate(observationId);
+        }
+        if (ConnectionManager.hasActiveCancellableOperation()) {
+            ObsFilter filter = new ObsFilter.Builder()
+                    .withInternalIDs(BigId.fromLong(idScope, observationId))
+                    .build();
+            return readCold(filter).orElse(null);
+        }
+        ParquetArchiveReader.ArchivedRow loaded = coldPointReadCoalescer.readOne(observationId);
+        if (loaded == null)
+            return null;
+        return toObservation(loaded.generation().id(), null, loaded.observation());
+    }
+
+    private ParquetArchiveReader.ArchivedRow getVerifiedCachedColdBase(long observationId) {
+        ParquetArchiveReader.ArchivedRow cached = recentColdBaseById.getIfPresent(observationId);
+        if (cached == null)
+            return null;
+        try {
+            archiveReader.verifyGenerationObject(cached.generation());
+            return cached;
+        } catch (RuntimeException error) {
+            recentColdBaseById.invalidate(observationId);
+            throw error;
+        }
     }
 
     @Override
     public IObsData put(BigId key, IObsData observation) {
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(observation, "observation");
         if (!archiveConfig.enabled)
             return super.put(key, observation);
-        flushPendingForMutation("update");
+        if (ConnectionManager.hasActiveCancellableOperation())
+            return putSingleDirect(key, observation);
+        return overlayWriteCoalescer.submit(key, observation);
+    }
+
+    @Override
+    public void putAll(Map<? extends BigId, ? extends IObsData> map) {
+        Objects.requireNonNull(map, "map");
+        if (map.isEmpty())
+            return;
+        if (!archiveConfig.enabled) {
+            super.putAll(map);
+            return;
+        }
+        List<PendingPut> all = new ArrayList<>(map.size());
+        for (Map.Entry<? extends BigId, ? extends IObsData> entry : map.entrySet()) {
+            BigId key = Objects.requireNonNull(entry.getKey(), "key");
+            IObsData obs = Objects.requireNonNull(entry.getValue(), "observation");
+            all.add(new PendingPut(key, obs, new CompletableFuture<>()));
+        }
+        for (int offset = 0; offset < all.size(); offset += OVERLAY_WRITE_COALESCER_BATCH) {
+            List<PendingPut> slice = all.subList(
+                    offset, Math.min(all.size(), offset + OVERLAY_WRITE_COALESCER_BATCH));
+            if (slice.size() == 1) {
+                putSingleDirect(slice.get(0).key(), slice.get(0).observation());
+            } else {
+                putBatchDirect(slice);
+            }
+        }
+    }
+
+    private IObsData putSingleDirect(BigId key, IObsData observation) {
+        long id = key.getIdAsLong();
+        flushPendingIdsForMutation(List.of(id), "update");
 
         OverlayPayload overlay = prepareOverlay(key, observation);
+        ParquetArchiveReader.ArchivedRow preResolvedCold = resolveColdBasesOutsideTransaction(List.of(id)).get(id);
         try (Connection connection = connectionManager.getConnection()) {
             boolean oldAutoCommit = connection.getAutoCommit();
             connection.setAutoCommit(false);
             try {
-                long id = key.getIdAsLong();
                 archiveCatalog.lockForMutation(connection, id);
+                archiveCatalog.ensureSchemaBlobsPersisted(
+                        connection, Map.of(overlay.schemaSha256(), overlay.schemaJson()));
                 java.util.Optional<LockedLogicalObservation> locked =
-                        loadLockedLogicalObservation(connection, id);
+                        resolveSingleLockedObservation(connection, id, preResolvedCold);
                 if (locked.isEmpty())
                     throw new UnsupportedOperationException(
                             "Put can only be used to update existing entries");
@@ -2387,12 +2532,14 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     // Logical updates live only in the generation-owned sparse
                     // overlay until lifecycle deletion removes that hot base.
                     archiveCatalog.upsertOverlay(connection, previous.generationId(),
-                            overlay.observation(), overlay.schemaJson());
+                            overlay.observation(), overlay.schemaJson(), overlay.schemaSha256());
                 } else {
                     updateLiveObservation(connection, key, observation,
                             overlay.observation().resultJson());
                 }
                 connection.commit();
+                archiveCatalog.recordPersistedSchemaBlobHashes(List.of(overlay.schemaSha256()));
+                recentColdBaseById.invalidate(id);
                 return previous.observation();
             } catch (Exception error) {
                 connection.rollback();
@@ -2407,22 +2554,292 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         }
     }
 
+    private java.util.Optional<LockedLogicalObservation> resolveSingleLockedObservation(
+            Connection connection, long observationId,
+            ParquetArchiveReader.ArchivedRow preResolvedCold) throws Exception {
+        if (archiveCatalog.isTombstoned(connection, observationId))
+            return java.util.Optional.empty();
+        java.util.Optional<LockedLogicalObservation> hot =
+                lockHotLogicalObservation(connection, observationId);
+        if (hot.isPresent())
+            return hot;
+        java.util.Optional<LockedLogicalObservation> overlay =
+                lockColdOverlay(connection, observationId);
+        if (overlay.isPresent())
+            return overlay;
+        if (preResolvedCold != null) {
+            Set<UUID> visible = archiveCatalog.activeOrSealedGenerationIds(
+                    connection, List.of(preResolvedCold.generation().id()));
+            if (visible.contains(preResolvedCold.generation().id())) {
+                ArchivedObservation archived = preResolvedCold.observation();
+                return java.util.Optional.of(new LockedLogicalObservation(
+                        preResolvedCold.generation().id(), archived.resultJson(),
+                        archived.phenomenonTime(), archived.resultTime(),
+                        archived.dataStreamId(), archived.foiId(),
+                        toObservation(connection, preResolvedCold.generation().id(), null, archived)));
+            }
+            recentColdBaseById.invalidate(observationId);
+        }
+        return loadLockedColdParquetObservation(connection, observationId);
+    }
+
+    private List<IObsData> putBatchDirect(List<PendingPut> batch) {
+        List<Long> sortedIds = batch.stream()
+                .map(item -> item.key().getIdAsLong())
+                .distinct()
+                .sorted()
+                .toList();
+        flushPendingIdsForMutation(sortedIds, "update");
+
+        List<PreparedPut> prepared = new ArrayList<>(batch.size());
+        Map<String, String> schemaJsonByHash = new HashMap<>();
+        for (PendingPut item : batch) {
+            OverlayPayload payload = prepareOverlay(item.key(), item.observation());
+            prepared.add(new PreparedPut(item.key(), item.key().getIdAsLong(), item.observation(), payload));
+            schemaJsonByHash.putIfAbsent(payload.schemaSha256(), payload.schemaJson());
+        }
+
+        Map<Long, ParquetArchiveReader.ArchivedRow> preResolvedColdById =
+                resolveColdBasesOutsideTransaction(sortedIds);
+        List<BigId> sortedBigIds = sortedIds.stream()
+                .map(id -> BigId.fromLong(idScope, id))
+                .toList();
+
+        try (Connection connection = connectionManager.getConnection()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                archiveCatalog.lockForMutation(connection, sortedIds);
+                archiveCatalog.ensureSchemaBlobsPersisted(connection, schemaJsonByHash);
+                Set<Long> tombstoned = archiveCatalog.activeTombstonedObservationIds(connection, sortedIds);
+                if (!tombstoned.isEmpty()) {
+                    throw new UnsupportedOperationException(
+                            "Put can only be used to update existing entries");
+                }
+
+                Map<Long, LockedLogicalObservation> hotById = lockHotLogicalObservations(
+                        connection, sortedBigIds, false, true, false);
+                Map<Long, LockedLogicalObservation> overlayById = lockOverlaysBatch(connection, sortedIds);
+
+                Set<UUID> candidateGenIds = new HashSet<>();
+                for (Long id : sortedIds) {
+                    if (!hotById.containsKey(id) && !overlayById.containsKey(id)) {
+                        ParquetArchiveReader.ArchivedRow coldRow = preResolvedColdById.get(id);
+                        if (coldRow != null)
+                            candidateGenIds.add(coldRow.generation().id());
+                    }
+                }
+                Set<UUID> visibleColdGens = candidateGenIds.isEmpty()
+                        ? Set.of()
+                        : archiveCatalog.activeOrSealedGenerationIds(connection, candidateGenIds);
+
+                Map<Long, LockedLogicalObservation> initialById = new HashMap<>(sortedIds.size());
+                for (Long id : sortedIds) {
+                    LockedLogicalObservation hot = hotById.get(id);
+                    if (hot != null) {
+                        if (hot.generationId() != null) {
+                            LockedLogicalObservation ov = overlayById.get(id);
+                            if (ov != null && hot.generationId().equals(ov.generationId())) {
+                                initialById.put(id, ov);
+                                continue;
+                            }
+                        }
+                        initialById.put(id, hot);
+                        continue;
+                    }
+                    LockedLogicalObservation ov = overlayById.get(id);
+                    if (ov != null) {
+                        initialById.put(id, ov);
+                        continue;
+                    }
+                    ParquetArchiveReader.ArchivedRow coldRow = preResolvedColdById.get(id);
+                    if (coldRow != null && visibleColdGens.contains(coldRow.generation().id())) {
+                        ArchivedObservation archived = coldRow.observation();
+                        initialById.put(id, new LockedLogicalObservation(
+                                coldRow.generation().id(), archived.resultJson(),
+                                archived.phenomenonTime(), archived.resultTime(),
+                                archived.dataStreamId(), archived.foiId(),
+                                toObservation(connection, coldRow.generation().id(), null, archived)));
+                        continue;
+                    }
+                    if (coldRow != null)
+                        recentColdBaseById.invalidate(id);
+                    java.util.Optional<LockedLogicalObservation> fallback =
+                            loadLockedColdParquetObservation(connection, id);
+                    if (fallback.isEmpty()) {
+                        throw new UnsupportedOperationException(
+                                "Put can only be used to update existing entries");
+                    }
+                    initialById.put(id, fallback.get());
+                }
+
+                Map<Long, IObsData> runningPreviousById = new HashMap<>(sortedIds.size());
+                for (Map.Entry<Long, LockedLogicalObservation> entry : initialById.entrySet())
+                    runningPreviousById.put(entry.getKey(), entry.getValue().observation());
+
+                List<IObsData> returnValues = new ArrayList<>(prepared.size());
+                Map<Long, PreparedPut> finalWriteById = new LinkedHashMap<>(sortedIds.size());
+                for (PreparedPut item : prepared) {
+                    returnValues.add(runningPreviousById.put(item.id(), item.observation()));
+                    finalWriteById.put(item.id(), item);
+                }
+
+                List<ArchiveCatalog.OverlayBatchItem> overlayBatchItems = new ArrayList<>(finalWriteById.size());
+                for (Long id : sortedIds) {
+                    PreparedPut finalItem = finalWriteById.get(id);
+                    if (finalItem == null)
+                        continue;
+                    LockedLogicalObservation baseLocked = initialById.get(id);
+                    if (baseLocked.generationId() != null) {
+                        overlayBatchItems.add(new ArchiveCatalog.OverlayBatchItem(
+                                baseLocked.generationId(),
+                                finalItem.payload().observation(),
+                                finalItem.payload().schemaJson(),
+                                finalItem.payload().schemaSha256()));
+                    } else {
+                        updateLiveObservation(connection, finalItem.key(), finalItem.observation(),
+                                finalItem.payload().observation().resultJson());
+                    }
+                }
+                if (!overlayBatchItems.isEmpty())
+                    archiveCatalog.upsertOverlaysBatch(connection, overlayBatchItems);
+
+                connection.commit();
+                archiveCatalog.recordPersistedSchemaBlobHashes(schemaJsonByHash.keySet());
+                recentColdBaseById.invalidateAll(sortedIds);
+                return returnValues;
+            } catch (Exception error) {
+                connection.rollback();
+                throw error;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (UnsupportedOperationException error) {
+            throw error;
+        } catch (Exception error) {
+            throw new IllegalStateException("Cannot atomically update tiered observation batch", error);
+        }
+    }
+
+    private Map<Long, ParquetArchiveReader.ArchivedRow> resolveColdBasesOutsideTransaction(
+            List<Long> sortedIds) {
+        if (sortedIds.isEmpty())
+            return Map.of();
+        Map<Long, ParquetArchiveReader.ArchivedRow> resolved = new HashMap<>(sortedIds.size());
+        List<Long> uncachedCandidateIds = new ArrayList<>();
+        for (Long id : sortedIds) {
+            ParquetArchiveReader.ArchivedRow cached = getVerifiedCachedColdBase(id);
+            if (cached != null)
+                resolved.put(id, cached);
+            else
+                uncachedCandidateIds.add(id);
+        }
+        if (uncachedCandidateIds.isEmpty())
+            return resolved;
+
+        // Probe only IDs that have neither a hot base row nor an existing overlay
+        // so live/already-overlaid updates never touch DuckDB.
+        Set<Long> hotOrOverlayIds = findExistingHotOrOverlayIds(uncachedCandidateIds);
+        List<Long> coldMissIds = new ArrayList<>();
+        for (Long id : uncachedCandidateIds) {
+            if (!hotOrOverlayIds.contains(id))
+                coldMissIds.add(id);
+        }
+        if (coldMissIds.isEmpty())
+            return resolved;
+
+        if (ConnectionManager.hasActiveCancellableOperation()) {
+            resolved.putAll(readColdPointBatchDirect(coldMissIds));
+        } else {
+            resolved.putAll(coldPointReadCoalescer.readMany(coldMissIds));
+        }
+        return resolved;
+    }
+
+    private Set<Long> findExistingHotOrOverlayIds(List<Long> observationIds) {
+        if (observationIds.isEmpty())
+            return Set.of();
+        String sql = "WITH requested(id) AS (SELECT unnest(?::bigint[])) " +
+                "SELECT r.id FROM requested r WHERE " +
+                "EXISTS (SELECT 1 FROM " + getDatastoreName() + " o WHERE o.id=r.id) " +
+                "OR EXISTS (SELECT 1 FROM oscar_obs_overlay ov " +
+                "JOIN oscar_archive_generation g ON g.id=ov.generation_id " +
+                "WHERE ov.store_key=? AND ov.id_scope=? AND ov.observation_id=r.id " +
+                "AND g.store_key=ov.store_key AND g.id_scope=ov.id_scope " +
+                "AND g.state IN ('ACTIVE','SEALED'))";
+        Set<Long> present = new HashSet<>();
+        try (Connection connection = connectionManager.getConnection()) {
+            connection.setReadOnly(true);
+            java.sql.Array ids = connection.createArrayOf("bigint", observationIds.toArray(Long[]::new));
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setArray(1, ids);
+                statement.setString(2, getDatastoreName());
+                statement.setInt(3, idScope);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next())
+                        present.add(result.getLong(1));
+                }
+            } finally {
+                ids.free();
+            }
+            return present;
+        } catch (SQLException error) {
+            throw new IllegalStateException("Cannot inspect hot/overlay presence before update", error);
+        }
+    }
+
+    private Map<Long, ParquetArchiveReader.ArchivedRow> readColdPointBatchDirect(
+            Collection<Long> observationIds) {
+        if (observationIds == null || observationIds.isEmpty())
+            return Map.of();
+        List<Long> distinctIds = observationIds.stream().distinct().sorted().toList();
+        List<ArchiveGeneration> generations = archiveCatalog.candidatesForObservationIds(distinctIds);
+        if (generations.isEmpty())
+            return Map.of();
+        ObsFilter filter = new ObsFilter.Builder()
+                .withInternalIDs(distinctIds.stream()
+                        .map(id -> BigId.fromLong(idScope, id))
+                        .toList())
+                .build();
+        List<ParquetArchiveReader.ArchivedRow> rows =
+                archiveReader.read(generations, filter, null, null, Long.MAX_VALUE);
+        if (rows.isEmpty())
+            return Map.of();
+        Map<Long, ParquetArchiveReader.ArchivedRow> byId = new HashMap<>(rows.size());
+        for (ParquetArchiveReader.ArchivedRow row : rows) {
+            long id = row.observation().id();
+            byId.put(id, row);
+            recentColdBaseById.put(id, row);
+        }
+        return byId;
+    }
+
     private OverlayPayload prepareOverlay(BigId key, IObsData observation) {
-        IDataStreamInfo schema = getDataStreamInfo(observation.getDataStreamID());
+        BigId dsBigId = observation.getDataStreamID();
+        IDataStreamInfo schema = getDataStreamInfo(dsBigId);
         if (schema == null)
             throw new IllegalStateException("Cannot mutate archived observation without a live datastream schema");
         String resultJson = SerializerUtils.writeDataBlockToJson(
                 schema.getRecordStructure(), schema.getRecordEncoding(), observation.getResult());
-        try {
-            return new OverlayPayload(new ArchivedObservation(
-                    idScope, key.getIdAsLong(), observation.getDataStreamID().getScope(), observation.getDataStreamID().getIdAsLong(),
-                    observation.hasFoi() ? observation.getFoiID().getScope() : null,
-                    observation.hasFoi() ? observation.getFoiID().getIdAsLong() : null,
-                    observation.getPhenomenonTime(), observation.getResultTime(), resultJson, "OVERLAY"),
-                    SerializerUtils.writeIDataStreamInfoToJson(schema));
-        } catch (IOException e) {
-            throw new IllegalStateException("Cannot snapshot archived overlay datastream schema", e);
+        long dsId = dsBigId.getIdAsLong();
+        CachedOverlaySchema cachedSchema = liveOverlaySchemas.getIfPresent(dsId);
+        if (cachedSchema == null || cachedSchema.sourceRef() != schema) {
+            try {
+                String schemaJson = SerializerUtils.writeIDataStreamInfoToJson(schema);
+                String schemaSha256 = ArchiveCatalog.computeSchemaSha256(schemaJson);
+                cachedSchema = new CachedOverlaySchema(schema, schemaJson, schemaSha256);
+                liveOverlaySchemas.put(dsId, cachedSchema);
+            } catch (IOException e) {
+                throw new IllegalStateException("Cannot snapshot archived overlay datastream schema", e);
+            }
         }
+        return new OverlayPayload(new ArchivedObservation(
+                idScope, key.getIdAsLong(), dsBigId.getScope(), dsId,
+                observation.hasFoi() ? observation.getFoiID().getScope() : null,
+                observation.hasFoi() ? observation.getFoiID().getIdAsLong() : null,
+                observation.getPhenomenonTime(), observation.getResultTime(), resultJson, "OVERLAY"),
+                cachedSchema.schemaJson(),
+                cachedSchema.schemaSha256());
     }
 
     private void updateLiveObservation(Connection connection, BigId key, IObsData observation,
@@ -2472,7 +2889,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     public IObsData remove(Object key) {
         if (!(key instanceof BigId id))
             return super.remove(key);
-        flushPendingForMutation("remove");
+        flushPendingIdsForMutation(List.of(id.getIdAsLong()), "remove");
         try (Connection connection = connectionManager.getConnection()) {
             boolean oldAutoCommit = connection.getAutoCommit();
             connection.setAutoCommit(false);
@@ -2486,6 +2903,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         : lockHotLogicalObservation(connection, observationId, false);
                 if (locked.isEmpty()) {
                     connection.commit();
+                    recentColdBaseById.invalidate(observationId);
                     return null;
                 }
 
@@ -2522,6 +2940,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     }
                 }
                 connection.commit();
+                recentColdBaseById.invalidate(observationId);
                 return previous.observation();
             } catch (Exception error) {
                 connection.rollback();
@@ -2574,6 +2993,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private void flushPendingForMutation(String operation) {
         try {
             commit();
+        } catch (DataStoreException error) {
+            throw new IllegalStateException(
+                    "Cannot flush observations before tiered " + operation, error);
+        }
+    }
+
+    private void flushPendingIdsForMutation(Collection<Long> observationIds, String operation) {
+        try {
+            flushPendingForIds(observationIds);
         } catch (DataStoreException error) {
             throw new IllegalStateException(
                     "Cannot flush observations before tiered " + operation, error);
@@ -3010,6 +3438,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     removed = Math.addExact(removed, deleted);
                 }
                 connection.commit();
+                recentColdBaseById.invalidateAll(
+                        ordered.stream().map(BigId::getIdAsLong).toList());
                 return new RemovalBatchResult(removed, Set.copyOf(heldObservationIds));
             } catch (Exception error) {
                 connection.rollback();
@@ -3242,8 +3672,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         String generationClause = expectedGeneration == null ? "" : " AND overlay_row.generation_id=?";
         String sql = "SELECT overlay_row.generation_id, overlay_row.datastream_id, overlay_row.foi_id, " +
                 "overlay_row.phenomenon_time, overlay_row.result_time, overlay_row.result_json::text, " +
-                "overlay_row.schema_json::text FROM oscar_obs_overlay overlay_row " +
+                "COALESCE(overlay_row.schema_json, overlay_schema_blob.schema_json)::text " +
+                "FROM oscar_obs_overlay overlay_row " +
                 "JOIN oscar_archive_generation generation ON generation.id=overlay_row.generation_id " +
+                "LEFT JOIN oscar_archive_schema_blob overlay_schema_blob " +
+                "ON overlay_schema_blob.schema_sha256=overlay_row.schema_sha256 " +
                 "WHERE overlay_row.store_key=? AND overlay_row.id_scope=? AND overlay_row.observation_id=? " +
                 "AND generation.store_key=overlay_row.store_key AND generation.id_scope=overlay_row.id_scope " +
                 "AND generation.state IN ('ACTIVE','SEALED')" + generationClause +
@@ -3276,6 +3709,55 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         }
     }
 
+    private Map<Long, LockedLogicalObservation> lockOverlaysBatch(
+            Connection connection, List<Long> sortedIds) throws Exception {
+        if (sortedIds.isEmpty())
+            return Map.of();
+        String sql = "SELECT overlay_row.observation_id, overlay_row.generation_id, " +
+                "overlay_row.datastream_id, overlay_row.foi_id, overlay_row.phenomenon_time, " +
+                "overlay_row.result_time, overlay_row.result_json::text, " +
+                "COALESCE(overlay_row.schema_json, overlay_schema_blob.schema_json)::text " +
+                "FROM oscar_obs_overlay overlay_row " +
+                "JOIN oscar_archive_generation generation ON generation.id=overlay_row.generation_id " +
+                "LEFT JOIN oscar_archive_schema_blob overlay_schema_blob " +
+                "ON overlay_schema_blob.schema_sha256=overlay_row.schema_sha256 " +
+                "WHERE overlay_row.store_key=? AND overlay_row.id_scope=? " +
+                "AND overlay_row.observation_id=ANY (?::bigint[]) " +
+                "AND generation.store_key=overlay_row.store_key AND generation.id_scope=overlay_row.id_scope " +
+                "AND generation.state IN ('ACTIVE','SEALED') " +
+                "ORDER BY overlay_row.observation_id ASC FOR UPDATE OF overlay_row";
+        Map<Long, LockedLogicalObservation> locked = new HashMap<>();
+        java.sql.Array ids = connection.createArrayOf("bigint", sortedIds.toArray(Long[]::new));
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, getDatastoreName());
+            statement.setInt(2, idScope);
+            statement.setArray(3, ids);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    long obsId = result.getLong(1);
+                    UUID generationId = result.getObject(2, UUID.class);
+                    long dataStreamId = result.getLong(3);
+                    Long foiId = result.getObject(4, Long.class);
+                    Instant phenomenonTime = UtcJdbcTime.getInstant(result, 5);
+                    Instant resultTime = UtcJdbcTime.getInstant(result, 6);
+                    String resultJson = result.getString(7);
+                    String schemaJson = result.getString(8);
+                    ArchivedObservation archived = new ArchivedObservation(
+                            idScope, obsId, idScope, dataStreamId,
+                            foiId == null ? null : idScope, foiId,
+                            phenomenonTime, resultTime, resultJson, "OVERLAY");
+                    locked.put(obsId, new LockedLogicalObservation(
+                            generationId, resultJson, phenomenonTime, resultTime,
+                            dataStreamId, foiId,
+                            toObservation(connection, generationId, schemaJson, archived)));
+                }
+            }
+        } finally {
+            ids.free();
+        }
+        return locked;
+    }
+
     private java.util.Optional<LockedLogicalObservation> loadLockedLogicalObservation(
             Connection connection, long observationId) throws Exception {
         if (archiveCatalog.isTombstoned(connection, observationId))
@@ -3291,6 +3773,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         if (overlay.isPresent())
             return overlay;
 
+        return loadLockedColdParquetObservation(connection, observationId);
+    }
+
+    private java.util.Optional<LockedLogicalObservation> loadLockedColdParquetObservation(
+            Connection connection, long observationId) throws Exception {
         List<ArchiveGeneration> generations = archiveCatalog.candidates(
                 connection, MIN_ARCHIVE_TIME, MAX_ARCHIVE_TIME, observationId);
         if (generations.isEmpty())
@@ -3331,6 +3818,211 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         return builder.build();
     }
 
+    private final class ColdPointReadCoalescer {
+        private static final int MAX_WORKERS = 2;
+        private static final long COALESCE_WAIT_NS = TimeUnit.MILLISECONDS.toNanos(4);
+
+        private final Object lock = new Object();
+        private final ArrayDeque<PendingColdRead> queue = new ArrayDeque<>();
+        private int activeWorkers;
+
+        ParquetArchiveReader.ArchivedRow readOne(long observationId) {
+            return readMany(List.of(observationId)).get(observationId);
+        }
+
+        Map<Long, ParquetArchiveReader.ArchivedRow> readMany(Collection<Long> observationIds) {
+            if (observationIds == null || observationIds.isEmpty())
+                return Map.of();
+            CompletableFuture<Map<Long, ParquetArchiveReader.ArchivedRow>> future = new CompletableFuture<>();
+            List<Long> ids = observationIds.stream().distinct().toList();
+            PendingColdRead request = new PendingColdRead(ids, future);
+            boolean becomeWorker = false;
+            synchronized (lock) {
+                queue.addLast(request);
+                if (activeWorkers < MAX_WORKERS) {
+                    activeWorkers++;
+                    becomeWorker = true;
+                } else {
+                    lock.notifyAll();
+                }
+            }
+            if (becomeWorker)
+                runWorkerLoop(future);
+            return awaitFuture(future, "Interrupted while reading archived observation");
+        }
+
+        private void runWorkerLoop(CompletableFuture<?> ownFuture) {
+            boolean registered = true;
+            try {
+                while (true) {
+                    List<PendingColdRead> drained = new ArrayList<>();
+                    Set<Long> distinctIds = new HashSet<>();
+                    synchronized (lock) {
+                        if (!queue.isEmpty() && queue.size() < 4 && !ownFuture.isDone()) {
+                            long deadline = System.nanoTime() + COALESCE_WAIT_NS;
+                            while (queue.size() < 8) {
+                                long remainingNs = deadline - System.nanoTime();
+                                if (remainingNs <= 0L)
+                                    break;
+                                long ms = remainingNs / 1_000_000L;
+                                int ns = (int) (remainingNs % 1_000_000L);
+                                try {
+                                    lock.wait(ms, ns);
+                                } catch (InterruptedException interrupted) {
+                                    Thread.currentThread().interrupt();
+                                    break;
+                                }
+                            }
+                        }
+                        while (!queue.isEmpty()) {
+                            PendingColdRead next = queue.peekFirst();
+                            if (!drained.isEmpty() &&
+                                    distinctIds.size() + next.ids().size() > POINT_READ_COALESCER_BATCH) {
+                                break;
+                            }
+                            queue.removeFirst();
+                            drained.add(next);
+                            distinctIds.addAll(next.ids());
+                            if (distinctIds.size() >= POINT_READ_COALESCER_BATCH)
+                                break;
+                        }
+                        if (drained.isEmpty()) {
+                            activeWorkers--;
+                            registered = false;
+                            return;
+                        }
+                    }
+                    try {
+                        Map<Long, ParquetArchiveReader.ArchivedRow> resolved = new HashMap<>();
+                        List<Long> stillMissing = new ArrayList<>();
+                        for (Long id : distinctIds) {
+                            ParquetArchiveReader.ArchivedRow cached = getVerifiedCachedColdBase(id);
+                            if (cached != null && archiveCatalog.isGenerationQueryVisible(cached.generation().id()))
+                                resolved.put(id, cached);
+                            else
+                                stillMissing.add(id);
+                        }
+                        if (!stillMissing.isEmpty())
+                            resolved.putAll(readColdPointBatchDirect(stillMissing));
+                        for (PendingColdRead item : drained) {
+                            Map<Long, ParquetArchiveReader.ArchivedRow> sub = new HashMap<>();
+                            for (Long id : item.ids()) {
+                                ParquetArchiveReader.ArchivedRow row = resolved.get(id);
+                                if (row != null)
+                                    sub.put(id, row);
+                            }
+                            item.future().complete(sub);
+                        }
+                    } catch (Throwable failure) {
+                        for (PendingColdRead item : drained)
+                            item.future().completeExceptionally(failure);
+                    }
+                    if (ownFuture.isDone()) {
+                        synchronized (lock) {
+                            if (queue.isEmpty()) {
+                                activeWorkers--;
+                                registered = false;
+                                return;
+                            }
+                        }
+                    }
+                }
+            } finally {
+                if (registered) {
+                    synchronized (lock) {
+                        activeWorkers--;
+                    }
+                }
+            }
+        }
+    }
+
+    private final class OverlayWriteCoalescer {
+        private final Object lock = new Object();
+        private final ArrayDeque<PendingPut> queue = new ArrayDeque<>();
+        private boolean workerActive;
+
+        IObsData submit(BigId key, IObsData observation) {
+            CompletableFuture<IObsData> future = new CompletableFuture<>();
+            PendingPut request = new PendingPut(key, observation, future);
+            boolean becomeWorker = false;
+            synchronized (lock) {
+                queue.addLast(request);
+                if (!workerActive) {
+                    workerActive = true;
+                    becomeWorker = true;
+                }
+            }
+            if (becomeWorker)
+                runWorkerLoop();
+            return awaitFuture(future, "Interrupted while updating tiered observation " + key);
+        }
+
+        private void runWorkerLoop() {
+            while (true) {
+                List<PendingPut> batch = new ArrayList<>();
+                synchronized (lock) {
+                    while (!queue.isEmpty() && batch.size() < OVERLAY_WRITE_COALESCER_BATCH) {
+                        batch.add(queue.removeFirst());
+                    }
+                    if (batch.isEmpty()) {
+                        workerActive = false;
+                        return;
+                    }
+                }
+                if (batch.size() == 1) {
+                    PendingPut single = batch.get(0);
+                    try {
+                        single.future().complete(putSingleDirect(single.key(), single.observation()));
+                    } catch (Throwable failure) {
+                        single.future().completeExceptionally(failure);
+                    }
+                    continue;
+                }
+                try {
+                    List<IObsData> results = putBatchDirect(batch);
+                    for (int i = 0; i < batch.size(); i++)
+                        batch.get(i).future().complete(results.get(i));
+                } catch (Throwable batchFailure) {
+                    // Isolate per-caller validation or missing-key failures so a
+                    // bad update cannot fail unrelated concurrent callers.
+                    for (PendingPut item : batch) {
+                        try {
+                            item.future().complete(putSingleDirect(item.key(), item.observation()));
+                        } catch (Throwable individualFailure) {
+                            item.future().completeExceptionally(individualFailure);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static <T> T awaitFuture(CompletableFuture<T> future, String interruptMessage) {
+        try {
+            return future.get();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(interruptMessage, interrupted);
+        } catch (ExecutionException execution) {
+            Throwable cause = execution.getCause();
+            if (cause instanceof RuntimeException runtime)
+                throw runtime;
+            if (cause instanceof Error err)
+                throw err;
+            throw new IllegalStateException(interruptMessage, cause);
+        }
+    }
+
+    private record PendingColdRead(
+            List<Long> ids,
+            CompletableFuture<Map<Long, ParquetArchiveReader.ArchivedRow>> future) {}
+    private record PendingPut(
+            BigId key, IObsData observation, CompletableFuture<IObsData> future) {}
+    private record PreparedPut(
+            BigId key, long id, IObsData observation, OverlayPayload payload) {}
+    private record CachedOverlaySchema(
+            IDataStreamInfo sourceRef, String schemaJson, String schemaSha256) {}
     private record LockedLogicalObservation(UUID generationId, String resultJson,
                                             Instant phenomenonTime, Instant resultTime,
                                             long dataStreamId, Long foiId,
@@ -3339,7 +4031,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                                 Instant phenomenonTime, Instant resultTime,
                                 String resultJson, UUID generationId) {}
     private record RemovalBatchResult(long removed, Set<Long> heldObservationIds) {}
-    private record OverlayPayload(ArchivedObservation observation, String schemaJson) {}
+    private record OverlayPayload(ArchivedObservation observation, String schemaJson, String schemaSha256) {}
 
     @Override
     public long countMatchingEntries(ObsFilter filter) {
@@ -3447,12 +4139,22 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         (resolvedFilter.getResultTime() == null || !resolvedFilter.getResultTime().isLatestTime())) {
                     JsonCqlEvaluator.SummaryCounterSpec summarySpec = JsonCqlEvaluator.summaryCounterSpec(
                             resolvedFilter.getCQLFilter()).orElse(null);
-                    if (summarySpec != null) {
+                    JsonCqlEvaluator.TimeContainedSummarySpec timeContainedSpec =
+                            JsonCqlEvaluator.timeContainedSummarySpec(resolvedFilter.getCQLFilter()).orElse(null);
+                    if (summarySpec != null || timeContainedSpec != null) {
                         ArchiveCatalog.ColdSummaryPlan summaryPlan = archiveCatalog.summarizeColdCandidates(
                                 candidates, resolvedFilter.getPhenomenonTime(),
                                 resolvedFilter.getResultTime(),
-                                dataStreams, mutatedByGen.keySet(), summarySpec);
-                        summarizedColdCount = summaryPlan.summarizedCount();
+                                dataStreams, mutatedByGen.keySet(), summarySpec, timeContainedSpec);
+                        long mutatedSummaryMatches = summaryPlan.exactMutatedCandidates().isEmpty()
+                                ? 0L
+                                : countMutatedSummaryBaseMatches(
+                                        summaryPlan.exactMutatedCandidates(),
+                                        mutatedByGen,
+                                        resolvedFilter,
+                                        dataStreams,
+                                        fois);
+                        summarizedColdCount = Math.subtractExact(summaryPlan.summarizedCount(), mutatedSummaryMatches);
                         parquetCandidates = summaryPlan.remainingCandidates();
                     }
                 }
@@ -3487,6 +4189,70 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         if (total < 0)
             throw new IllegalStateException("Negative tiered observation count");
         return total;
+    }
+
+    private record MutatedGenSummaryCountKey(
+            UUID generationId,
+            String generationSha256,
+            Set<Long> mutatedIds,
+            Set<Long> dataStreams,
+            org.geotools.api.filter.Filter cqlFilter) {}
+
+    private long countMutatedSummaryBaseMatches(
+            List<ArchiveGeneration> exactMutatedCandidates,
+            Map<UUID, Set<Long>> mutatedByGen,
+            ObsFilter resolvedFilter,
+            Set<Long> dataStreams,
+            Set<Long> fois) {
+        long total = 0L;
+        for (Long matched : countMutatedSummaryBaseMatchesByGeneration(
+                exactMutatedCandidates, mutatedByGen, resolvedFilter, dataStreams, fois).values()) {
+            total = Math.addExact(total, matched);
+        }
+        return total;
+    }
+
+    private Map<UUID, Long> countMutatedSummaryBaseMatchesByGeneration(
+            List<ArchiveGeneration> exactMutatedCandidates,
+            Map<UUID, Set<Long>> mutatedByGen,
+            ObsFilter resolvedFilter,
+            Set<Long> dataStreams,
+            Set<Long> fois) {
+        if (exactMutatedCandidates == null || exactMutatedCandidates.isEmpty())
+            return Map.of();
+        Set<Long> immutableStreams = dataStreams == null ? null : Set.copyOf(dataStreams);
+        org.geotools.api.filter.Filter cqlFilter = resolvedFilter.getCQLFilter();
+        Map<UUID, Long> byGeneration = new HashMap<>(exactMutatedCandidates.size());
+        List<ArchiveGeneration> misses = new ArrayList<>();
+        Map<UUID, MutatedGenSummaryCountKey> missKeys = new HashMap<>();
+        Map<UUID, Set<Long>> missTargets = new HashMap<>();
+        for (ArchiveGeneration generation : exactMutatedCandidates) {
+            Set<Long> genMutated = mutatedByGen.get(generation.id());
+            if (genMutated == null || genMutated.isEmpty())
+                continue;
+            archiveReader.verifyGenerationObject(generation);
+            Set<Long> immutableMutated = Set.copyOf(genMutated);
+            MutatedGenSummaryCountKey key = new MutatedGenSummaryCountKey(
+                    generation.id(), generation.sha256(), immutableMutated, immutableStreams, cqlFilter);
+            Long cached = mutatedGenSummaryCounts.getIfPresent(key);
+            if (cached != null) {
+                byGeneration.put(generation.id(), cached);
+            } else {
+                misses.add(generation);
+                missKeys.put(generation.id(), key);
+                missTargets.put(generation.id(), immutableMutated);
+            }
+        }
+        if (!misses.isEmpty()) {
+            Map<UUID, Long> computed = archiveReader.countMatchingIdsCqlByGeneration(
+                    misses, missTargets, resolvedFilter, dataStreams, fois);
+            for (ArchiveGeneration generation : misses) {
+                long matched = computed.getOrDefault(generation.id(), 0L);
+                mutatedGenSummaryCounts.put(missKeys.get(generation.id()), matched);
+                byGeneration.put(generation.id(), matched);
+            }
+        }
+        return byGeneration;
     }
 
     private String buildUnownedHotCountPredicate(boolean parentTableOnly, boolean hasMutations) {

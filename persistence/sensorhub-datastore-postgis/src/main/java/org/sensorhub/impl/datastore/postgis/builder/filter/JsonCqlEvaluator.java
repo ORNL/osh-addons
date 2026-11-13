@@ -4,6 +4,8 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
 import org.geotools.api.filter.And;
 import org.geotools.api.filter.BinaryComparisonOperator;
 import org.geotools.api.filter.Filter;
@@ -19,16 +21,19 @@ import org.geotools.api.filter.PropertyIsNotEqualTo;
 import org.geotools.api.filter.expression.Literal;
 import org.geotools.api.filter.expression.PropertyName;
 
+import java.io.StringReader;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.StreamSupport;
 
@@ -56,6 +61,29 @@ public final class JsonCqlEvaluator {
     }
 
     /**
+     * Compiles {@code filter} once into a reusable row matcher that pre-compiles
+     * property paths, LIKE regexes, and scalar/RFC-3339 literals, and skips
+     * unreferenced top-level JSON arrays/objects (such as {@code gammaCount} and
+     * {@code neutronCount}) via streaming {@link JsonReader#skipValue()}.
+     */
+    public static Predicate<String> compileMatcher(Filter filter) {
+        if (filter == null || filter == Filter.INCLUDE)
+            return json -> true;
+        if (filter == Filter.EXCLUDE)
+            return json -> false;
+        Set<String> topLevelKeys = new LinkedHashSet<>();
+        boolean[] allSupported = {true};
+        CompiledNode root = compileNode(filter, topLevelKeys, allSupported);
+        Set<String> projectedKeys = allSupported[0] ? Collections.unmodifiableSet(topLevelKeys) : null;
+        return json -> {
+            JsonObject obj = parseProjectedJsonObject(json, projectedKeys);
+            if (obj == null)
+                return false;
+            return root.evaluate(obj);
+        };
+    }
+
+    /**
      * Appends a sound (zero-false-negative) DuckDB SQL prefilter over {@code column} when possible.
      * Callers must still run {@link #matches(Filter, String)} on surviving candidate rows.
      */
@@ -74,12 +102,77 @@ public final class JsonCqlEvaluator {
         return true;
     }
 
+    /**
+     * Reject only explicit nonzero numeric adjudication counts. Arrays, missing
+     * fields, nulls and other types remain candidates for exact Java evaluation.
+     * The caller supplies a trusted PostgreSQL jsonb column expression.
+     */
+    public static boolean appendPostgresOverlayPrefilter(
+            Filter filter, String column, StringBuilder sql) {
+        if (!isPostgresOverlayPrefilterSafe(filter) || !requiresUnadjudicated(filter))
+            return false;
+        sql.append(" AND NOT COALESCE((jsonb_typeof(").append(column)
+                .append("->'adjudicatedIdsCount') = 'number' AND ")
+                .append(column).append("->'adjudicatedIdsCount' <> '0'::jsonb), false)");
+        return true;
+    }
+
+    private static boolean requiresUnadjudicated(Filter filter) {
+        if (filter instanceof And and)
+            return and.getChildren().stream().anyMatch(JsonCqlEvaluator::requiresUnadjudicated);
+        if (filter instanceof Or or)
+            return !or.getChildren().isEmpty() &&
+                    or.getChildren().stream().allMatch(JsonCqlEvaluator::requiresUnadjudicated);
+        return filter instanceof PropertyIsEqualTo eq &&
+                eq.getExpression1() instanceof PropertyName property &&
+                "adjudicatedIdsCount".equals(property.getPropertyName()) &&
+                eq.getExpression2() instanceof Literal literal && isExactNumericZero(literal.getValue());
+    }
+
+    private static boolean isPostgresOverlayPrefilterSafe(Filter filter) {
+        if (filter == Filter.EXCLUDE)
+            return true;
+        if (filter instanceof And and)
+            return !and.getChildren().isEmpty() &&
+                    and.getChildren().stream().allMatch(JsonCqlEvaluator::isPostgresOverlayPrefilterSafe);
+        if (filter instanceof Or or)
+            return !or.getChildren().isEmpty() &&
+                    or.getChildren().stream().allMatch(JsonCqlEvaluator::isPostgresOverlayPrefilterSafe);
+        if (!(filter instanceof PropertyIsEqualTo eq) ||
+                !(eq.getExpression1() instanceof PropertyName property) ||
+                !(eq.getExpression2() instanceof Literal literal))
+            return false;
+        String name = property.getPropertyName();
+        Object value = literal.getValue();
+        if (("gammaAlarm".equals(name) || "neutronAlarm".equals(name)) && value instanceof Boolean)
+            return true;
+        return "adjudicatedIdsCount".equals(name) && isExactNumericZero(value);
+    }
+
+    private static boolean isExactNumericZero(Object value) {
+        if (!(value instanceof Number))
+            return false;
+        try {
+            return new BigDecimal(value.toString()).compareTo(BigDecimal.ZERO) == 0;
+        } catch (NumberFormatException ignored) {
+            return false;
+        }
+    }
+
     public static boolean hasSelectiveDuckDbPrefilter(Filter filter) {
         PrefilterClause clause = buildDuckDbPrefilter(filter, "result_json");
         return clause != null && clause.selective();
     }
 
     public record SummaryCounterSpec(String upperBoundExpr, String exactExpr, String exactReadyExpr) {}
+
+    public record TimeContainedSummarySpec(
+            String upperBoundExpr,
+            String exactExpr,
+            String exactReadyExpr,
+            Instant minContainedWindowStart,
+            Instant maxContainedWindowEnd,
+            Set<String> requiredTimeFields) {}
 
     public record CqlTimeBounds(Instant minPhenomenonTime, Instant maxPhenomenonTime) {}
 
@@ -259,6 +352,147 @@ public final class JsonCqlEvaluator {
             return Optional.of(new SummaryCounterSpec(spec.upperBoundExpr(), "0::bigint", "false"));
         }
         return Optional.of(spec);
+    }
+
+    /**
+     * Identifies CQL filters consisting strictly of an exact summary-counter
+     * base predicate conjoined with one or more RFC-3339 range comparisons
+     * ({@code <}, {@code <=}, {@code >}, {@code >=}) on top-level
+     * {@code startTime}, {@code endTime}, or {@code samplingTime}.
+     * For archive generations whose schema declares those SWE {@code Time}
+     * fields and whose window lies strictly inside the conservative 24-hour
+     * interior region, the time comparisons are tautologically true and the
+     * generation's summary counter is exact.
+     */
+    public static Optional<TimeContainedSummarySpec> timeContainedSummarySpec(Filter filter) {
+        if (filter == null || filter == Filter.INCLUDE || filter == Filter.EXCLUDE)
+            return Optional.empty();
+        List<Filter> conjuncts = new ArrayList<>();
+        flattenAndChildren(filter, conjuncts);
+        if (conjuncts.isEmpty())
+            return Optional.empty();
+
+        final java.time.Duration safetyMargin = java.time.Duration.ofHours(24);
+        Instant minContainedStart = null;
+        Instant maxContainedEnd = null;
+        Set<String> requiredTimeFields = new LinkedHashSet<>();
+        List<Filter> nonTimeConjuncts = new ArrayList<>();
+
+        for (Filter child : conjuncts) {
+            if ((child instanceof PropertyIsLessThan ||
+                    child instanceof PropertyIsLessThanOrEqualTo ||
+                    child instanceof PropertyIsGreaterThan ||
+                    child instanceof PropertyIsGreaterThanOrEqualTo) &&
+                    ((BinaryComparisonOperator) child).getExpression1() instanceof PropertyName prop &&
+                    ((BinaryComparisonOperator) child).getExpression2() instanceof Literal lit &&
+                    lit.getValue() instanceof String text) {
+                String name = prop.getPropertyName();
+                if ("startTime".equals(name) || "endTime".equals(name) || "samplingTime".equals(name)) {
+                    Instant parsed = parseRfc3339Instant(text.trim());
+                    if (parsed == null)
+                        return Optional.empty();
+                    requiredTimeFields.add(name);
+                    if (child instanceof PropertyIsLessThan || child instanceof PropertyIsLessThanOrEqualTo) {
+                        Instant safeEnd = parsed.minus(safetyMargin);
+                        maxContainedEnd = maxContainedEnd == null || safeEnd.isBefore(maxContainedEnd)
+                                ? safeEnd : maxContainedEnd;
+                    } else {
+                        Instant safeStart = parsed.plus(safetyMargin);
+                        minContainedStart = minContainedStart == null || safeStart.isAfter(minContainedStart)
+                                ? safeStart : minContainedStart;
+                    }
+                    continue;
+                }
+            }
+            nonTimeConjuncts.add(child);
+        }
+
+        if (requiredTimeFields.isEmpty())
+            return Optional.empty();
+        if (minContainedStart != null && maxContainedEnd != null && !minContainedStart.isBefore(maxContainedEnd))
+            return Optional.empty();
+
+        SummaryCounterSpec baseSpec;
+        if (nonTimeConjuncts.isEmpty()) {
+            String expr = "COALESCE(s.row_count, 0)";
+            baseSpec = new SummaryCounterSpec(expr, expr, "s.summary_populated");
+        } else if (nonTimeConjuncts.size() == 1) {
+            Optional<SummaryCounterSpec> single = summaryCounterSpec(nonTimeConjuncts.get(0));
+            if (single.isEmpty())
+                return Optional.empty();
+            baseSpec = single.get();
+        } else {
+            Optional<SummaryCounterSpec> combined = summaryCounterSpecForConjuncts(nonTimeConjuncts);
+            if (combined.isEmpty())
+                return Optional.empty();
+            baseSpec = combined.get();
+        }
+
+        if ("false".equals(baseSpec.exactReadyExpr()) || "0::bigint".equals(baseSpec.upperBoundExpr()))
+            return Optional.empty();
+
+        return Optional.of(new TimeContainedSummarySpec(
+                baseSpec.upperBoundExpr(),
+                baseSpec.exactExpr(),
+                baseSpec.exactReadyExpr(),
+                minContainedStart,
+                maxContainedEnd,
+                Collections.unmodifiableSet(requiredTimeFields)));
+    }
+
+    private static Optional<SummaryCounterSpec> summaryCounterSpecForConjuncts(List<Filter> conjuncts) {
+        Boolean gamma = null;
+        Boolean neutron = null;
+        boolean requireAnyAlarm = false;
+        Boolean adjudicated = null;
+        for (Filter child : conjuncts) {
+            if (child instanceof Or or && isAnyAlarmOr(or)) {
+                requireAnyAlarm = true;
+                continue;
+            }
+            if (child instanceof PropertyIsEqualTo eq &&
+                    eq.getExpression1() instanceof PropertyName prop &&
+                    eq.getExpression2() instanceof Literal lit &&
+                    lit.getValue() != null) {
+                String name = prop.getPropertyName();
+                Object val = lit.getValue();
+                if (val instanceof Boolean boolVal) {
+                    if ("gammaAlarm".equals(name)) {
+                        if (gamma != null && !gamma.equals(boolVal))
+                            return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
+                        gamma = boolVal;
+                        continue;
+                    }
+                    if ("neutronAlarm".equals(name)) {
+                        if (neutron != null && !neutron.equals(boolVal))
+                            return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
+                        neutron = boolVal;
+                        continue;
+                    }
+                }
+                if ("adjudicatedIdsCount".equals(name) && isZeroNumber(val)) {
+                    if (adjudicated != null && adjudicated)
+                        return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
+                    adjudicated = Boolean.FALSE;
+                    continue;
+                }
+                return Optional.empty();
+            }
+            if (child instanceof PropertyIsGreaterThan gt &&
+                    gt.getExpression1() instanceof PropertyName prop &&
+                    gt.getExpression2() instanceof Literal lit &&
+                    "adjudicatedIdsCount".equals(prop.getPropertyName()) &&
+                    isZeroNumber(lit.getValue())) {
+                if (adjudicated != null && !adjudicated)
+                    return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
+                adjudicated = Boolean.TRUE;
+                continue;
+            }
+            return Optional.empty();
+        }
+        if (requireAnyAlarm && Boolean.FALSE.equals(gamma) && Boolean.FALSE.equals(neutron))
+            return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
+        return resolveBaseAndSummarySpec(gamma, neutron, requireAnyAlarm, adjudicated);
     }
 
     private static Optional<SummaryCounterSpec> resolveBaseAndSummarySpec(
@@ -841,5 +1075,385 @@ public final class JsonCqlEvaluator {
         String left = actual.getAsString();
         String right = String.valueOf(expected);
         return matchingCase ? left.equals(right) : left.equalsIgnoreCase(right);
+    }
+
+    @FunctionalInterface
+    private interface CompiledNode {
+        boolean evaluate(JsonObject json);
+    }
+
+    private enum ComparisonKind {
+        EQ, NE, GT, GE, LT, LE
+    }
+
+    private static JsonObject parseProjectedJsonObject(String json, Set<String> projectedKeys) {
+        if (json == null || projectedKeys == null) {
+            JsonElement value = JsonParser.parseString(json);
+            return value.isJsonObject() ? value.getAsJsonObject() : null;
+        }
+        try (JsonReader reader = new JsonReader(new StringReader(json))) {
+            if (reader.peek() != JsonToken.BEGIN_OBJECT) {
+                JsonElement value = JsonParser.parseString(json);
+                return value.isJsonObject() ? value.getAsJsonObject() : null;
+            }
+            JsonObject projected = new JsonObject();
+            reader.beginObject();
+            while (reader.hasNext()) {
+                String key = reader.nextName();
+                if (projectedKeys.contains(key)) {
+                    projected.add(key, JsonParser.parseReader(reader));
+                } else {
+                    reader.skipValue();
+                }
+            }
+            reader.endObject();
+            if (reader.peek() != JsonToken.END_DOCUMENT) {
+                JsonElement value = JsonParser.parseString(json);
+                return value.isJsonObject() ? value.getAsJsonObject() : null;
+            }
+            return projected;
+        } catch (Exception ignored) {
+            JsonElement value = JsonParser.parseString(json);
+            return value.isJsonObject() ? value.getAsJsonObject() : null;
+        }
+    }
+
+    private static CompiledNode compileNode(Filter filter, Set<String> topLevelKeys, boolean[] allSupported) {
+        if (filter == Filter.INCLUDE)
+            return json -> true;
+        if (filter == Filter.EXCLUDE)
+            return json -> false;
+        if (filter instanceof And and) {
+            List<CompiledNode> children = new ArrayList<>(and.getChildren().size());
+            for (Filter child : and.getChildren())
+                children.add(compileNode(child, topLevelKeys, allSupported));
+            return json -> {
+                for (CompiledNode child : children) {
+                    if (!child.evaluate(json))
+                        return false;
+                }
+                return true;
+            };
+        }
+        if (filter instanceof Or or) {
+            List<CompiledNode> children = new ArrayList<>(or.getChildren().size());
+            for (Filter child : or.getChildren())
+                children.add(compileNode(child, topLevelKeys, allSupported));
+            return json -> {
+                for (CompiledNode child : children) {
+                    if (child.evaluate(json))
+                        return true;
+                }
+                return false;
+            };
+        }
+        if (filter instanceof Not not) {
+            CompiledNode inner = compileNode(not.getFilter(), topLevelKeys, allSupported);
+            return json -> !inner.evaluate(json);
+        }
+        if (filter instanceof PropertyIsLike like) {
+            if (!(like.getExpression() instanceof PropertyName property)) {
+                allSupported[0] = false;
+                return json -> {
+                    throw new IllegalArgumentException("Archived CQL LIKE requires a property expression");
+                };
+            }
+            String path = property.getPropertyName();
+            String[] segments = path.split("\\.");
+            registerTopLevelKeys(path, segments, topLevelKeys);
+            int flags = like.isMatchingCase() ? 0 : Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE;
+            Pattern compiled = Pattern.compile(likeRegex(like), flags);
+            return json -> {
+                JsonElement actual = resolveCompiled(json, path, segments);
+                if (actual == null || actual.isJsonNull())
+                    return false;
+                if (actual.isJsonArray()) {
+                    return StreamSupport.stream(actual.getAsJsonArray().spliterator(), false)
+                            .anyMatch(el -> el != null && el.isJsonPrimitive() &&
+                                    compiled.matcher(el.getAsString()).matches());
+                }
+                if (!actual.isJsonPrimitive())
+                    return false;
+                return compiled.matcher(actual.getAsString()).matches();
+            };
+        }
+        if (filter instanceof BinaryComparisonOperator comparison) {
+            if (!(comparison.getExpression1() instanceof PropertyName property) ||
+                    !(comparison.getExpression2() instanceof Literal literal)) {
+                allSupported[0] = false;
+                return json -> {
+                    throw new IllegalArgumentException("Archived CQL comparisons require property-to-literal expressions");
+                };
+            }
+            ComparisonKind kind;
+            if (comparison instanceof PropertyIsEqualTo)
+                kind = ComparisonKind.EQ;
+            else if (comparison instanceof PropertyIsNotEqualTo)
+                kind = ComparisonKind.NE;
+            else if (comparison instanceof PropertyIsGreaterThan)
+                kind = ComparisonKind.GT;
+            else if (comparison instanceof PropertyIsGreaterThanOrEqualTo)
+                kind = ComparisonKind.GE;
+            else if (comparison instanceof PropertyIsLessThan)
+                kind = ComparisonKind.LT;
+            else if (comparison instanceof PropertyIsLessThanOrEqualTo)
+                kind = ComparisonKind.LE;
+            else {
+                allSupported[0] = false;
+                String className = comparison.getClass().getName();
+                return json -> {
+                    throw new IllegalArgumentException("Unsupported archived CQL comparison: " + className);
+                };
+            }
+            String path = property.getPropertyName();
+            String[] segments = path.split("\\.");
+            registerTopLevelKeys(path, segments, topLevelKeys);
+            Object expected = literal.getValue();
+            boolean matchingCase = comparison.isMatchingCase();
+            BigDecimal preParsedDecimal = null;
+            if (expected instanceof Number || expected instanceof String) {
+                try {
+                    preParsedDecimal = new BigDecimal(expected.toString());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            Instant preParsedInstant = expected instanceof String expectedText
+                    ? parseRfc3339Instant(expectedText)
+                    : null;
+            final BigDecimal expectedDecimal = preParsedDecimal;
+            final Instant expectedInstant = preParsedInstant;
+            return json -> evaluateCompiledComparison(
+                    kind, matchingCase, path, segments, expected, expectedDecimal, expectedInstant, json);
+        }
+        allSupported[0] = false;
+        String className = filter.getClass().getName();
+        return json -> {
+            throw new IllegalArgumentException("Unsupported archived CQL predicate: " + className);
+        };
+    }
+
+    private static void registerTopLevelKeys(String path, String[] segments, Set<String> topLevelKeys) {
+        if (segments.length > 0)
+            topLevelKeys.add(segments[0]);
+        if ("adjudicatedIdsCount".equals(path))
+            topLevelKeys.add("adjudicatedIds");
+    }
+
+    private static JsonElement resolveCompiled(JsonObject root, String path, String[] segments) {
+        JsonElement current = root;
+        for (String part : segments) {
+            if (current == null || !current.isJsonObject())
+                return null;
+            current = current.getAsJsonObject().get(part);
+        }
+        if ((current == null || current.isJsonNull()) && "adjudicatedIdsCount".equals(path)) {
+            JsonElement arr = root.get("adjudicatedIds");
+            if (arr != null && arr.isJsonArray())
+                return new com.google.gson.JsonPrimitive(arr.getAsJsonArray().size());
+        }
+        return current;
+    }
+
+    private static boolean evaluateCompiledComparison(
+            ComparisonKind kind,
+            boolean matchingCase,
+            String path,
+            String[] segments,
+            Object expected,
+            BigDecimal expectedDecimal,
+            Instant expectedInstant,
+            JsonObject json) {
+        JsonElement actual = resolveCompiled(json, path, segments);
+        boolean absent = actual == null || actual instanceof JsonNull || actual.isJsonNull();
+
+        if (kind == ComparisonKind.EQ) {
+            if (expected == null)
+                return absent;
+            if (absent)
+                return false;
+            if (actual.isJsonArray()) {
+                return StreamSupport.stream(actual.getAsJsonArray().spliterator(), false)
+                        .anyMatch(el -> el != null && el.isJsonPrimitive() &&
+                                equalsCompiledScalar(el, expected, expectedDecimal, matchingCase));
+            }
+            return equalsCompiledScalar(actual, expected, expectedDecimal, matchingCase);
+        }
+        if (kind == ComparisonKind.NE) {
+            if (expected == null)
+                return !absent;
+            if (absent)
+                return false;
+            if (actual.isJsonArray()) {
+                return StreamSupport.stream(actual.getAsJsonArray().spliterator(), false)
+                        .noneMatch(el -> el != null && el.isJsonPrimitive() &&
+                                equalsCompiledScalar(el, expected, expectedDecimal, matchingCase));
+            }
+            return sameScalarType(actual, expected) &&
+                    !equalsCompiledScalar(actual, expected, expectedDecimal, matchingCase);
+        }
+        if (absent || !actual.isJsonPrimitive())
+            return false;
+
+        Integer order = orderedCompiledScalarComparison(actual, expected, expectedDecimal, expectedInstant);
+        if (order == null)
+            return false;
+        return switch (kind) {
+            case GT -> order > 0;
+            case GE -> order >= 0;
+            case LT -> order < 0;
+            case LE -> order <= 0;
+            default -> false;
+        };
+    }
+
+    private static boolean equalsCompiledScalar(
+            JsonElement actual, Object expected, BigDecimal expectedDecimal, boolean matchingCase) {
+        if (!sameScalarType(actual, expected))
+            return false;
+        if (expected instanceof Number) {
+            BigDecimal rhs = expectedDecimal != null ? expectedDecimal : new BigDecimal(expected.toString());
+            return actual.getAsBigDecimal().compareTo(rhs) == 0;
+        }
+        if (expected instanceof Boolean)
+            return actual.getAsBoolean() == (Boolean) expected;
+        String left = actual.getAsString();
+        String right = String.valueOf(expected);
+        return matchingCase ? left.equals(right) : left.equalsIgnoreCase(right);
+    }
+
+    private static Integer orderedCompiledScalarComparison(
+            JsonElement actual, Object expected, BigDecimal expectedDecimal, Instant expectedInstant) {
+        if (actual.getAsJsonPrimitive().isNumber() &&
+                (expected instanceof Number || expected instanceof String)) {
+            if (expectedDecimal == null)
+                return null;
+            try {
+                return actual.getAsBigDecimal().compareTo(expectedDecimal);
+            } catch (NumberFormatException error) {
+                return null;
+            }
+        }
+        if (expectedInstant != null && actual.getAsJsonPrimitive().isString()) {
+            Instant left = parseRfc3339Instant(actual.getAsString());
+            return left != null ? left.compareTo(expectedInstant) : null;
+        }
+        return null;
+    }
+
+    /**
+     * Returns a deterministic, collision-free canonical key for supported CQL
+     * predicates (preserving operator kind, case-sensitivity, wildcard/escape
+     * settings, property path, and scalar literal type/value), or empty when the
+     * predicate uses unsupported AST nodes.
+     */
+    public static Optional<String> canonicalCacheKey(Filter filter) {
+        if (filter == null || filter == Filter.INCLUDE)
+            return Optional.of("INCLUDE");
+        if (filter == Filter.EXCLUDE)
+            return Optional.of("EXCLUDE");
+        StringBuilder out = new StringBuilder(128);
+        return appendCanonicalKey(filter, out) ? Optional.of(out.toString()) : Optional.empty();
+    }
+
+    private static boolean appendCanonicalKey(Filter filter, StringBuilder out) {
+        if (filter == Filter.INCLUDE) {
+            out.append("INCLUDE");
+            return true;
+        }
+        if (filter == Filter.EXCLUDE) {
+            out.append("EXCLUDE");
+            return true;
+        }
+        if (filter instanceof And and) {
+            out.append("AND(").append(and.getChildren().size()).append(':');
+            for (int i = 0; i < and.getChildren().size(); i++) {
+                if (i > 0)
+                    out.append(',');
+                if (!appendCanonicalKey(and.getChildren().get(i), out))
+                    return false;
+            }
+            out.append(')');
+            return true;
+        }
+        if (filter instanceof Or or) {
+            out.append("OR(").append(or.getChildren().size()).append(':');
+            for (int i = 0; i < or.getChildren().size(); i++) {
+                if (i > 0)
+                    out.append(',');
+                if (!appendCanonicalKey(or.getChildren().get(i), out))
+                    return false;
+            }
+            out.append(')');
+            return true;
+        }
+        if (filter instanceof Not not) {
+            out.append("NOT(");
+            if (!appendCanonicalKey(not.getFilter(), out))
+                return false;
+            out.append(')');
+            return true;
+        }
+        if (filter instanceof PropertyIsLike like) {
+            if (!(like.getExpression() instanceof PropertyName prop))
+                return false;
+            out.append("LIKE(").append(like.isMatchingCase()).append('|');
+            appendLengthPrefixed(out, like.getWildCard());
+            appendLengthPrefixed(out, like.getSingleChar());
+            appendLengthPrefixed(out, like.getEscape());
+            appendLengthPrefixed(out, prop.getPropertyName());
+            appendLengthPrefixed(out, like.getLiteral());
+            out.append(')');
+            return true;
+        }
+        if (filter instanceof BinaryComparisonOperator cmp) {
+            if (!(cmp.getExpression1() instanceof PropertyName prop) ||
+                    !(cmp.getExpression2() instanceof Literal lit))
+                return false;
+            String op;
+            if (cmp instanceof PropertyIsEqualTo)
+                op = "EQ";
+            else if (cmp instanceof PropertyIsNotEqualTo)
+                op = "NE";
+            else if (cmp instanceof PropertyIsGreaterThan)
+                op = "GT";
+            else if (cmp instanceof PropertyIsGreaterThanOrEqualTo)
+                op = "GE";
+            else if (cmp instanceof PropertyIsLessThan)
+                op = "LT";
+            else if (cmp instanceof PropertyIsLessThanOrEqualTo)
+                op = "LE";
+            else
+                return false;
+            out.append(op).append('(').append(cmp.isMatchingCase()).append('|');
+            appendLengthPrefixed(out, prop.getPropertyName());
+            Object val = lit.getValue();
+            if (val == null) {
+                out.append("NULL");
+            } else if (val instanceof Boolean b) {
+                out.append("B:").append(b);
+            } else if (val instanceof Number n) {
+                try {
+                    out.append("N:").append(new BigDecimal(n.toString()).stripTrailingZeros().toPlainString());
+                } catch (NumberFormatException ignored) {
+                    return false;
+                }
+            } else if (val instanceof String s) {
+                out.append("S:");
+                appendLengthPrefixed(out, s);
+            } else {
+                return false;
+            }
+            out.append(')');
+            return true;
+        }
+        return false;
+    }
+
+    private static void appendLengthPrefixed(StringBuilder out, String text) {
+        if (text == null) {
+            out.append("-1#");
+        } else {
+            out.append(text.length()).append('#').append(text);
+        }
     }
 }

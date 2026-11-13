@@ -486,6 +486,91 @@ public class TestArchiveLifecycleInvariants {
     }
 
     @Test
+    public void proactiveParallel9pBatchStagingExecutesAllQueryModesAndCleansUpTempDir() throws Exception {
+        assertTrue(ParquetArchiveReader.is9pFileSystemType("9p"));
+        assertTrue(ParquetArchiveReader.is9pFileSystemType("v9fs"));
+        assertTrue(ParquetArchiveReader.is9pFileSystemType("drvfs"));
+        assertFalse(ParquetArchiveReader.is9pFileSystemType("ext4"));
+        assertFalse(ParquetArchiveReader.is9pFileSystemType(null));
+
+        Path root = temporary.newFolder("wsl9p-proactive-archive").toPath();
+        Path duckTmp = temporary.getRoot().toPath().resolve("wsl9p-proactive-duck-tmp");
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.rootDirectory = root.toString();
+        config.duckDbTemporaryDirectory = duckTmp.toString();
+
+        List<ArchiveGeneration> generations = new ArrayList<>();
+        java.util.Map<UUID, Set<Long>> targetIdsByGen = new java.util.HashMap<>();
+        java.time.Instant baseTime = java.time.Instant.parse("2026-11-06T00:00:00Z");
+        for (int i = 0; i < 12; i++) {
+            Path rel = Path.of("datasets/observations/date=2026-11-06/profile=RAW_GATED/g-" + i + ".parquet");
+            Path file = root.resolve(rel);
+            Files.createDirectories(file.getParent());
+            java.time.Instant t = baseTime.plusSeconds(i * 600L);
+            long obsId = 1000L + i;
+            try (DuckDbResourcePolicy.Session session = DuckDbResourcePolicy.open(config, "test-export");
+                 Statement create = session.connection().createStatement()) {
+                create.execute("CREATE TABLE archive_rows (id_scope INTEGER, id_value BIGINT, datastream_scope INTEGER, " +
+                        "datastream_id BIGINT, foi_scope INTEGER, foi_id BIGINT, phenomenon_time TIMESTAMP, " +
+                        "result_time TIMESTAMP, result_json VARCHAR, archive_version INTEGER, profile VARCHAR)");
+                try (PreparedStatement insert = session.connection().prepareStatement(
+                        "INSERT INTO archive_rows VALUES (1, ?, 1, 10, NULL, NULL, ?, ?, ?, 1, 'RAW_GATED')")) {
+                    insert.setLong(1, obsId);
+                    UtcJdbcTime.setDuckDbInstant(insert, 2, t);
+                    UtcJdbcTime.setDuckDbInstant(insert, 3, t);
+                    insert.setString(4, i % 2 == 0
+                            ? "{\"adjudicatedIdsCount\":1,\"adjudicatedIds\":[\"code:9\"]}"
+                            : "{\"adjudicatedIdsCount\":0,\"adjudicatedIds\":[]}");
+                    insert.executeUpdate();
+                }
+                create.execute("COPY archive_rows TO '" + file.toString().replace("'", "''") + "' (FORMAT PARQUET, COMPRESSION ZSTD)");
+            }
+            ArchiveGeneration gen = new ArchiveGeneration(
+                    UUID.randomUUID(), "RAW_GATED",
+                    t, t.plusSeconds(300),
+                    rel, ArchiveExporter.sha256(file),
+                    1L, obsId, obsId, "SEALED", true, null);
+            generations.add(gen);
+            targetIdsByGen.put(gen.id(), Set.of(obsId));
+        }
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root, config);
+        reader.setForceProactiveLocalStagingForTesting(true);
+
+        org.sensorhub.api.datastore.obs.ObsFilter code9Filter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount>0 AND adjudicatedIds='code:9'")
+                .build();
+        org.sensorhub.api.datastore.obs.ObsFilter allFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .build();
+
+        assertEquals(6L, reader.countCql(generations, code9Filter, null, null, Set.of()));
+        var byGen = reader.countMatchingIdsCqlByGeneration(generations, targetIdsByGen, code9Filter, null, null);
+        assertEquals(6L, byGen.values().stream().mapToLong(Long::longValue).sum());
+        assertEquals(12L, reader.count(generations, allFilter, null, null));
+
+        try (var stream = reader.stream(generations, code9Filter, null, null, 3)) {
+            List<ParquetArchiveReader.ArchivedRow> limited = stream.toList();
+            assertEquals(3, limited.size());
+        }
+        assertEquals(0, reader.getOpenCursorCount());
+
+        List<Long> metadataIds = new ArrayList<>();
+        reader.forEachMetadata(generations, allFilter, null, null, Long.MAX_VALUE,
+                row -> metadataIds.add(row.id()));
+        assertEquals(12, metadataIds.size());
+
+        List<ArchiveGeneration> newer = reader.generationsPotentiallyNewerThanResultTime(
+                generations, baseTime.plusSeconds(11 * 600L));
+        assertEquals(1, newer.size());
+
+        try (var remaining = Files.list(duckTmp)) {
+            List<String> names = remaining.map(p -> p.getFileName().toString()).toList();
+            assertEquals("Only the root lock file may remain after proactive staged batch queries close",
+                    List.of(DuckDbResourcePolicy.ROOT_LOCK_FILE_NAME), names);
+        }
+    }
+
+    @Test
     public void cqlNotEqualsArrayFilterMatchesBothPostgresBuilderAndColdJsonEvaluator() {
         org.sensorhub.api.datastore.obs.ObsFilter filter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
                 .withCQLFilter("adjudicatedIds!='eml-non-threat'")
@@ -504,6 +589,192 @@ public class TestArchiveLifecycleInvariants {
                 filter.getCQLFilter(), "{\"adjudicatedIds\":[]}"));
         assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(
                 filter.getCQLFilter(), "{\"adjudicatedIds\":[\"operator-threat\"]}"));
+    }
+
+    @Test
+    public void compiledJsonCqlMatcherSkipsLargeArraysAndMatchesFullDomSemantics() {
+        List<String> cqlSamples = List.of(
+                "gammaAlarm = true AND startTime >= '2026-11-10T01:00:00Z'",
+                "adjudicatedIdsCount = 0 AND (gammaAlarm = true OR neutronAlarm = true)",
+                "adjudicatedIdsCount > 0 AND adjudicatedIds = 'code:9'",
+                "adjudicatedIds != 'eml-non-threat' AND maxGamma >= 12.5",
+                "nested.status LIKE '%Threat%'");
+        String largeOccupancyJson = "{" +
+                "\"gammaCount\":[[1,2,3,4],[5,6,7,8],[9,10,11,12]]," +
+                "\"neutronCount\":[[0,0,0,0],[0,1,0,0]]," +
+                "\"gammaAlarm\":true,\"neutronAlarm\":false," +
+                "\"maxGamma\":42.75," +
+                "\"startTime\":\"2026-11-10T01:30:00+00:00\"," +
+                "\"adjudicatedIds\":[\"cmd-1\",\"code:9\"]," +
+                "\"nested\":{\"status\":\"Operator Threat Confirmed\"}" +
+                "}";
+        String unadjudicatedImplicitZeroJson = "{" +
+                "\"gammaCount\":[[1,1],[2,2]]," +
+                "\"gammaAlarm\":true,\"neutronAlarm\":false," +
+                "\"maxGamma\":8.0," +
+                "\"startTime\":\"2026-11-10T00:15:00Z\"," +
+                "\"adjudicatedIds\":[]" +
+                "}";
+        List<String> payloads = List.of(
+                largeOccupancyJson,
+                unadjudicatedImplicitZeroJson,
+                "[]",
+                "\"scalar\"");
+
+        for (String cql : cqlSamples) {
+            var filter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                    .withCQLFilter(cql)
+                    .build()
+                    .getCQLFilter();
+            var compiled = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.compileMatcher(filter);
+            for (String payload : payloads) {
+                assertEquals("Mismatch for CQL: " + cql + " payload: " + payload,
+                        org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(filter, payload),
+                        compiled.test(payload));
+            }
+            assertThrows(com.google.gson.JsonSyntaxException.class, () -> compiled.test("{truncated"));
+        }
+    }
+
+    @Test
+    public void timeContainedSummarySpecBoundsPositiveAndNegativeWindowsSafely() {
+        var openLower = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("gammaAlarm = true AND startTime >= '2026-11-10T12:00:00Z'")
+                .build();
+        var spec1 = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                .timeContainedSummarySpec(openLower.getCQLFilter())
+                .orElseThrow();
+        assertEquals("COALESCE(s.gamma_true_count, 0)", spec1.exactExpr());
+        assertEquals(java.time.Instant.parse("2026-11-11T12:00:00Z"), spec1.minContainedWindowStart());
+        org.junit.Assert.assertNull(spec1.maxContainedWindowEnd());
+        assertEquals(Set.of("startTime"), spec1.requiredTimeFields());
+
+        var bareExclusiveUpper = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("startTime < '2026-11-10T12:00:00Z'")
+                .build();
+        var specBare = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                .timeContainedSummarySpec(bareExclusiveUpper.getCQLFilter())
+                .orElseThrow();
+        assertEquals("COALESCE(s.row_count, 0)", specBare.exactExpr());
+        org.junit.Assert.assertNull(specBare.minContainedWindowStart());
+        assertEquals(java.time.Instant.parse("2026-11-09T12:00:00Z"), specBare.maxContainedWindowEnd());
+        assertEquals(Set.of("startTime"), specBare.requiredTimeFields());
+
+        var closedWindow = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount > 0 AND startTime >= '2026-11-01T00:00:00Z' AND endTime <= '2026-11-10T00:00:00Z'")
+                .build();
+        var spec2 = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                .timeContainedSummarySpec(closedWindow.getCQLFilter())
+                .orElseThrow();
+        assertEquals("COALESCE(s.adjudicated_alarm_count, 0)", spec2.exactExpr());
+        assertEquals(java.time.Instant.parse("2026-11-02T00:00:00Z"), spec2.minContainedWindowStart());
+        assertEquals(java.time.Instant.parse("2026-11-09T00:00:00Z"), spec2.maxContainedWindowEnd());
+        assertEquals(Set.of("startTime", "endTime"), spec2.requiredTimeFields());
+
+        var nonSummaryExtra = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount > 0 AND adjudicatedIds = 'code:9' AND startTime >= '2026-11-01T00:00:00Z'")
+                .build();
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                .timeContainedSummarySpec(nonSummaryExtra.getCQLFilter())
+                .isEmpty());
+    }
+
+    @Test
+    public void local9pParquetCacheStagesSinglePassOnColdVerifyPinsHardLinksAndEnforcesLruCap() throws Exception {
+        Path root = temporary.newFolder("archive-9p-cache-root").toPath();
+        Path duckTmp = temporary.getRoot().toPath().resolve("duckdb-9p-cache-tmp");
+        Path localCacheDir = temporary.getRoot().toPath().resolve("local-ext4-stage-cache");
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.rootDirectory = root.toString();
+        config.duckDbTemporaryDirectory = duckTmp.toString();
+
+        java.time.Instant baseTime = java.time.Instant.parse("2026-11-06T00:00:00Z");
+        List<ArchiveGeneration> generations = new ArrayList<>();
+        long totalFileBytes = 0L;
+        for (int i = 0; i < 6; i++) {
+            Path rel = Path.of("datasets/observations/date=2026-11-06/profile=RAW_GATED/c-" + i + ".parquet");
+            Path file = root.resolve(rel);
+            Files.createDirectories(file.getParent());
+            java.time.Instant t = baseTime.plusSeconds(i * 600L);
+            long obsId = 2000L + i;
+            try (DuckDbResourcePolicy.Session session = DuckDbResourcePolicy.open(config, "test-export");
+                 Statement create = session.connection().createStatement()) {
+                create.execute("CREATE TABLE archive_rows (id_scope INTEGER, id_value BIGINT, datastream_scope INTEGER, " +
+                        "datastream_id BIGINT, foi_scope INTEGER, foi_id BIGINT, phenomenon_time TIMESTAMP, " +
+                        "result_time TIMESTAMP, result_json VARCHAR, archive_version INTEGER, profile VARCHAR)");
+                try (PreparedStatement insert = session.connection().prepareStatement(
+                        "INSERT INTO archive_rows VALUES (1, ?, 1, 10, NULL, NULL, ?, ?, ?, 1, 'RAW_GATED')")) {
+                    insert.setLong(1, obsId);
+                    UtcJdbcTime.setDuckDbInstant(insert, 2, t);
+                    UtcJdbcTime.setDuckDbInstant(insert, 3, t);
+                    insert.setString(4, i % 2 == 0
+                            ? "{\"adjudicatedIdsCount\":1,\"adjudicatedIds\":[\"code:9\",\"secondary-inspection\"]}"
+                            : "{\"adjudicatedIdsCount\":1,\"adjudicatedIds\":[\"code:4\"]}");
+                    insert.executeUpdate();
+                }
+                create.execute("COPY archive_rows TO '" + file.toString().replace("'", "''") + "' (FORMAT PARQUET, COMPRESSION ZSTD)");
+            }
+            totalFileBytes += Files.size(file);
+            generations.add(new ArchiveGeneration(
+                    UUID.randomUUID(), "RAW_GATED",
+                    t, t.plusSeconds(300),
+                    rel, ArchiveExporter.sha256(file),
+                    1L, obsId, obsId, "SEALED", true, null));
+        }
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root, config);
+        reader.setLocalStageCacheForTesting(localCacheDir, totalFileBytes * 4L);
+
+        var code9Filter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount > 0 AND adjudicatedIds = 'code:9'")
+                .build();
+        var secondaryFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount > 0 AND adjudicatedIds = 'secondary-inspection'")
+                .build();
+
+        // First cold query: verifyOnceWithAttributes copies each file ONCE and stageAuthorizedObjectsLocally pins via hard link.
+        assertEquals(3L, reader.countCql(generations, code9Filter, null, null, Set.of()));
+        assertEquals("Cold verify+stage must copy each Parquet file exactly once",
+                6L, reader.localStageCacheCopyCountForTesting());
+        assertEquals("Stage step must hit the cache populated by cold verification",
+                6L, reader.localStageCachePinHitCountForTesting());
+
+        // Second query with a distinct CQL filter: 0 new copies, 6 warm pin hits.
+        assertEquals(3L, reader.countCql(generations, secondaryFilter, null, null, Set.of()));
+        assertEquals("Warm query must perform zero additional source copies",
+                6L, reader.localStageCacheCopyCountForTesting());
+        assertEquals(12L, reader.localStageCachePinHitCountForTesting());
+
+        try (var pinEntries = Files.list(localCacheDir.resolve("pins"))) {
+            assertEquals("All ephemeral pin directories must be unlinked after query completion",
+                    0L, pinEntries.count());
+        }
+        try (var duckRemaining = Files.list(duckTmp)) {
+            assertEquals(List.of(DuckDbResourcePolicy.ROOT_LOCK_FILE_NAME),
+                    duckRemaining.map(p -> p.getFileName().toString()).toList());
+        }
+
+        // Tight LRU byte budget (~2 files): trackedBytes never exceeds cap and evicted files re-stage cleanly.
+        long twoFileCap = Math.max(1L, (totalFileBytes / 6L) * 2L);
+        ParquetArchiveReader cappedReader = new ParquetArchiveReader(root, config);
+        cappedReader.setLocalStageCacheForTesting(localCacheDir, twoFileCap);
+        assertEquals(3L, cappedReader.read(generations, code9Filter, null, null, 10L).size());
+        assertTrue("Tracked cache bytes must stay within maxBytes budget",
+                cappedReader.localStageCacheTrackedBytesForTesting() <= twoFileCap);
+
+        // Tampered file must fail checksum verification and never be inserted into the cache.
+        Path corruptRel = Path.of("datasets/observations/date=2026-11-06/profile=RAW_GATED/corrupt.parquet");
+        Path corruptFile = root.resolve(corruptRel);
+        Files.writeString(corruptFile, "corrupted-bytes");
+        String fakeExpectedSha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        ArchiveGeneration corruptGen = new ArchiveGeneration(
+                UUID.randomUUID(), "RAW_GATED",
+                baseTime.plusSeconds(9999), baseTime.plusSeconds(10299),
+                corruptRel, fakeExpectedSha, 1L, 9999L, 9999L, "SEALED", true, null);
+        assertThrows(IllegalStateException.class,
+                () -> reader.read(List.of(corruptGen), code9Filter, null, null, 10L));
+        assertFalse("Corrupted Parquet must never enter local cache objects/",
+                Files.exists(localCacheDir.resolve("objects").resolve(fakeExpectedSha + ".parquet")));
     }
 
     private static void writeSingleObservationParquet(

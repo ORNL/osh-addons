@@ -48,8 +48,8 @@ import java.util.stream.Stream;
 
 public class PostgisCommandStreamStoreImpl extends PostgisStore<QueryBuilderCommandStreamStore> implements ICommandStreamStore {
     private volatile Cache<Long, ICommandStreamInfo> cache = CacheBuilder.newBuilder()
-            .maximumSize(150)
-            .expireAfterAccess(5, TimeUnit.MINUTES)
+            .maximumSize(2048)
+            .expireAfterAccess(30, TimeUnit.MINUTES)
             .build();
     private static final Logger logger = LoggerFactory.getLogger(PostgisCommandStreamStoreImpl.class);
     private final Lock lock = new ReentrantLock();
@@ -205,20 +205,22 @@ public class PostgisCommandStreamStoreImpl extends PostgisStore<QueryBuilderComm
             throw new UnsupportedOperationException("Get operation is not supported with argument != CommandStreamKey key, got=" + o.getClass());
         }
         CommandStreamKey key = (CommandStreamKey) o;
-        ICommandStreamInfo commandStreamInfo = cache.getIfPresent(key.getInternalID().getIdAsLong());
+        long internalId = key.getInternalID().getIdAsLong();
+        ICommandStreamInfo commandStreamInfo = cache.getIfPresent(internalId);
         if (commandStreamInfo == null) {
             lock.lock();
             try {
-                // double lock checking + volatile
+                // Re-check cache after acquiring lock so concurrent callers reuse the loaded schema.
+                commandStreamInfo = cache.getIfPresent(internalId);
                 if (commandStreamInfo == null) {
                     try (Connection connection = this.connectionManager.getConnection()) {
                         try (PreparedStatement preparedStatement = connection.prepareStatement(queryBuilder.selectByIdQuery())) {
-                            preparedStatement.setLong(1, key.getInternalID().getIdAsLong());
+                            preparedStatement.setLong(1, internalId);
                             try (ResultSet resultSet = preparedStatement.executeQuery()) {
                                 if (resultSet.next()) {
                                     String data = resultSet.getString("data");
                                     commandStreamInfo = SerializerUtils.readICommandStreamInfoFromJson(data);
-                                    cache.put(key.getInternalID().getIdAsLong(), commandStreamInfo);
+                                    cache.put(internalId, commandStreamInfo);
                                 }
                             }
                         }
@@ -301,6 +303,7 @@ public class PostgisCommandStreamStoreImpl extends PostgisStore<QueryBuilderComm
                 preparedStatement.setLong(1, key.getInternalID().getIdAsLong());
                 int rows = preparedStatement.executeUpdate();
                 if (rows > 0) {
+                    cache.invalidate(key.getInternalID().getIdAsLong());
                     return data;
                 } else {
                     throw new RuntimeException("Cannot remove ICommandStreamInfo " + data.getName());

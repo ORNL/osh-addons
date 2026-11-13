@@ -56,6 +56,7 @@ import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -3913,14 +3914,25 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             try (ResultSet result = statement.executeQuery(
                     "SELECT column_name, is_nullable FROM information_schema.columns " +
                             "WHERE table_name='oscar_obs_overlay' " +
-                            "AND column_name IN ('store_key','id_scope','generation_id','schema_json') " +
+                            "AND column_name IN ('store_key','id_scope','generation_id','schema_json','schema_sha256') " +
                             "ORDER BY column_name")) {
-                List<String> columns = new ArrayList<>();
+                Map<String, String> nullability = new LinkedHashMap<>();
                 while (result.next()) {
-                    columns.add(result.getString(1));
-                    assertEquals("NO", result.getString(2));
+                    nullability.put(result.getString(1), result.getString(2));
                 }
-                assertEquals(List.of("generation_id", "id_scope", "schema_json", "store_key"), columns);
+                assertEquals(Map.of(
+                        "generation_id", "NO",
+                        "id_scope", "NO",
+                        "schema_json", "YES",
+                        "schema_sha256", "YES",
+                        "store_key", "NO"), nullability);
+            }
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT convalidated FROM pg_constraint " +
+                            "WHERE conrelid='oscar_obs_overlay'::regclass " +
+                            "AND conname='oscar_obs_overlay_schema_present_chk'")) {
+                assertTrue(result.next());
+                assertTrue(result.getBoolean(1));
             }
             for (String table : List.of("oscar_deletion_plan", "oscar_deletion_ledger")) {
                 try (ResultSet result = statement.executeQuery(
@@ -4548,6 +4560,266 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     }
 
     @Test
+    public void unadjudicatedOverlayFilterNeverResurrectsTheOriginal() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-09-01T00:00:00Z");
+        SWEHelper swe = new SWEHelper();
+        var record = swe.createRecord().name("gammaCounts")
+                .addField("gammaAlarm", swe.createBoolean().build())
+                .addField("neutronAlarm", swe.createBoolean().build())
+                .addField("adjudicatedIdsCount", swe.createQuantity().build()).build();
+        var info = new DataStreamInfo.Builder().withName("gammaCounts")
+                .withSystem(new FeatureId(bigId(949), "urn:oscar:test:adjudication-overlay"))
+                .withRecordDescription(record).withRecordEncoding(new TextEncodingImpl()).build();
+        BigId stream = tiered.getDataStreams().add(info).getInternalID();
+        java.util.function.IntFunction<IObsData> observation = count -> {
+            DataBlock block = record.createDataBlock();
+            block.setBooleanValue(0, true);
+            block.setBooleanValue(1, false);
+            block.setDoubleValue(2, count);
+            return new ObsData.Builder().withDataStream(stream).withPhenomenonTime(start.plusSeconds(5))
+                    .withResultTime(start.plusSeconds(5)).withResult(block).build();
+        };
+        BigId original = tiered.add(observation.apply(0));
+        forceReadBackFromStorage();
+        tiered.archiveWindow(start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        tiered.put(original, observation.apply(1));
+        ObsFilter filter = new ObsFilter.Builder().withDataStreams(stream)
+                .withCQLFilter("gammaAlarm = true AND adjudicatedIdsCount = 0").withLimit(15).build();
+        assertEquals("Adjudicated replacement must hide matching original", 0, selectCount(tiered, filter));
+        assertEquals(0, tiered.countMatchingEntries(filter));
+        tiered.put(original, observation.apply(0));
+        try (var rows = tiered.selectEntries(filter)) {
+            var result = rows.toList();
+            assertEquals(1, result.size());
+            assertEquals(original, result.get(0).getKey());
+        }
+        assertEquals(1, tiered.countMatchingEntries(filter));
+    }
+
+    @Test
+    public void dashboardOverlayPrefilterBoundsRowsAndPreservesCount() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-09-01T00:00:00Z");
+        BigId stream = addAlarmDataStream(bigId(948), "gammaCounts");
+        BigId original = tiered.add(alarmObs(stream, start.plusSeconds(5),
+                start.plusSeconds(5), true, false, 42));
+        forceReadBackFromStorage();
+        tiered.archiveWindow(start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        tiered.put(original, alarmObs(stream, start.plusSeconds(5),
+                start.plusSeconds(5), true, false, 43));
+        try (Connection connection = open();
+             PreparedStatement update = connection.prepareStatement(
+                     "UPDATE oscar_obs_overlay SET result_json=result_json || '{\"adjudicatedIdsCount\":0}'::jsonb " +
+                     "WHERE store_key=? AND id_scope=? AND observation_id=?")) {
+            update.setString(1, TABLE);
+            update.setInt(2, DATABASE_NUM);
+            update.setLong(3, original.getIdAsLong());
+            assertEquals(1, update.executeUpdate());
+        }
+        try (Connection connection = open();
+             PreparedStatement insert = connection.prepareStatement(
+                     "INSERT INTO oscar_obs_overlay(store_key,id_scope,observation_id,generation_id,datastream_id,foi_id," +
+                     "phenomenon_time,result_time,result_json,schema_json,schema_sha256) " +
+                     "SELECT store_key,id_scope,observation_id+10000000+i,generation_id,datastream_id,foi_id," +
+                     "phenomenon_time,result_time,result_json || '{\"adjudicatedIdsCount\":1}'::jsonb,schema_json,schema_sha256 " +
+                     "FROM oscar_obs_overlay CROSS JOIN generate_series(1,18000) AS i " +
+                     "WHERE store_key=? AND id_scope=? AND observation_id=?")) {
+            insert.setString(1, TABLE);
+            insert.setInt(2, DATABASE_NUM);
+            insert.setLong(3, original.getIdAsLong());
+            assertEquals(18000, insert.executeUpdate());
+        }
+        ObsFilter filter = new ObsFilter.Builder().withDataStreams(stream)
+                .withCQLFilter("(gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0")
+                .withLimit(15).build();
+        ArchiveCatalog catalog = tiered.getArchiveCatalog();
+        long before = catalog.getOverlayRowsRead();
+        try (var overlays = catalog.streamOverlays(DATABASE_NUM, filter, Set.of(stream.getIdAsLong()), null)) {
+            var rows = overlays.toList();
+            assertEquals(1, rows.size());
+            assertEquals(original.getIdAsLong(), rows.get(0).observation().id());
+        }
+        assertEquals("Only eligible overlays should cross JDBC", 1, catalog.getOverlayRowsRead() - before);
+        assertEquals(1, catalog.countMatchingOverlays(filter, Set.of(stream.getIdAsLong()), null));
+    }
+
+    @Test
+    public void postgresAlarmPrefilterNeverRejectsExactCqlMatches() throws Exception {
+        String[] expressions = {
+            "(gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0",
+            "((gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0) AND (gammaAlarm = true AND neutronAlarm = true)",
+            "gammaAlarm = true AND neutronAlarm = false AND adjudicatedIdsCount = 0",
+            "gammaAlarm = false AND neutronAlarm = true AND adjudicatedIdsCount = 0"
+        };
+        String[] values = {
+            "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":0}",
+            "{\"gammaAlarm\":false,\"neutronAlarm\":true,\"adjudicatedIdsCount\":0.0}",
+            "{\"gammaAlarm\":true,\"neutronAlarm\":true,\"adjudicatedIds\":[]}",
+            "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":null,\"adjudicatedIds\":[]}",
+            "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":1,\"adjudicatedIds\":[\"code:1\"]}",
+            "{\"gammaAlarm\":false,\"neutronAlarm\":false,\"adjudicatedIdsCount\":0}",
+            "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIds\":[\"code:1\"]}",
+            "{\"gammaAlarm\":true,\"neutronAlarm\":false}",
+            "{\"gammaAlarm\":[true],\"neutronAlarm\":[false],\"adjudicatedIdsCount\":[0]}",
+            "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":\"0\"}",
+            "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":-0.0}",
+            "{\"gammaAlarm\":\"true\",\"neutronAlarm\":false,\"adjudicatedIdsCount\":0}",
+            "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":0,\"note\":\"é \\\"quoted\\\"\"}"
+        };
+        try (Connection connection = open()) {
+            for (String expression : expressions) {
+                var filter = new ObsFilter.Builder().withCQLFilter(expression).build().getCQLFilter();
+                StringBuilder sql = new StringBuilder("SELECT true FROM (SELECT ?::jsonb AS data) AS t WHERE true");
+                assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                        .appendPostgresOverlayPrefilter(filter, "data", sql));
+                for (String value : values) {
+                    boolean exact = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(filter, value);
+                    try (PreparedStatement stmt = connection.prepareStatement(sql.toString())) {
+                        stmt.setString(1, value);
+                        try (ResultSet result = stmt.executeQuery()) {
+                            boolean candidate = result.next();
+                            assertTrue(expression + " rejected " + value, !exact || candidate);
+                            if (value.contains("\"adjudicatedIdsCount\":1"))
+                                assertFalse("Adjudicated overlay should be pruned", candidate);
+                        }
+                    }
+                }
+            }
+            var stringZero = new ObsFilter.Builder().withCQLFilter("adjudicatedIdsCount = '0'")
+                    .build().getCQLFilter();
+            assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                    .appendPostgresOverlayPrefilter(stringZero, "data", new StringBuilder()));
+            var unsupported = new ObsFilter.Builder().withCQLFilter("gammaAlarm = true OR maxGamma > 4")
+                    .build().getCQLFilter();
+            assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                    .appendPostgresOverlayPrefilter(unsupported, "data", new StringBuilder()));
+        }
+    }
+
+    @Test
+    public void coalescedConcurrentColdPointReadsAndOverlayBatchWritesPreserveExactnessAndIsolateErrors() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant coldStart = Instant.parse("2026-09-01T12:00:00Z");
+        Instant coldEnd = coldStart.plus(1, ChronoUnit.HOURS);
+        Instant hotStart = coldEnd.plus(1, ChronoUnit.HOURS);
+        BigId streamA = addAlarmDataStream(bigId(946), "gammaCounts");
+        BigId streamB = addAlarmDataStream(bigId(947), "gammaCounts");
+
+        List<BigId> coldKeys = new ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            BigId stream = (i % 2 == 0) ? streamA : streamB;
+            coldKeys.add(tiered.add(alarmObs(stream, coldStart.plusSeconds(10 + i),
+                    coldStart.plusSeconds(10 + i), true, false, 100.0 + i)));
+        }
+        forceReadBackFromStorage();
+        ArchiveGeneration gen = tiered.archiveWindow(coldStart, coldEnd, "RAW_GATED").orElseThrow();
+        tiered.maintainArchiveLifecycle();
+        ageGeneration(gen.id());
+        archiveConfig.deleteHotAfterArchive = true;
+        tiered.maintainArchiveLifecycle();
+        for (BigId coldKey : coldKeys)
+            assertFalse("Cold base must be evicted from hot table before coalescer test",
+                    hotRowExists(coldKey.getIdAsLong()));
+
+        List<BigId> hotKeys = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            BigId stream = (i % 2 == 0) ? streamA : streamB;
+            hotKeys.add(tiered.add(alarmObs(stream, hotStart.plusSeconds(10 + i),
+                    hotStart.plusSeconds(10 + i), true, false, 200.0 + i)));
+        }
+        forceReadBackFromStorage();
+
+        List<BigId> allKeys = new ArrayList<>(coldKeys);
+        allKeys.addAll(hotKeys);
+        BigId missingKey = BigId.fromLong(DATABASE_NUM, 999_999_999L);
+
+        int workerCount = allKeys.size() + 1;
+        java.util.concurrent.CyclicBarrier startGate = new java.util.concurrent.CyclicBarrier(workerCount);
+        ExecutorService pool = Executors.newFixedThreadPool(workerCount);
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < allKeys.size(); i++) {
+                final int index = i;
+                final BigId key = allKeys.get(i);
+                futures.add(pool.submit(() -> {
+                    startGate.await(10, TimeUnit.SECONDS);
+                    IObsData existing = tiered.get(key);
+                    assertNotNull("Concurrent get must load observation " + key, existing);
+                    IObsData updated = alarmObs(existing.getDataStreamID(),
+                            existing.getPhenomenonTime(), existing.getResultTime(),
+                            false, true, 500.0 + index);
+                    assertNotNull(tiered.put(key, updated));
+                    return null;
+                }));
+            }
+            Future<?> missingPutFuture = pool.submit(() -> {
+                startGate.await(10, TimeUnit.SECONDS);
+                assertThrows("Missing key must fail only for its caller",
+                        UnsupportedOperationException.class,
+                        () -> tiered.put(missingKey, alarmObs(streamA, hotStart.plusSeconds(99),
+                                hotStart.plusSeconds(99), false, false, 1.0)));
+                return null;
+            });
+
+            for (Future<?> future : futures)
+                future.get(30, TimeUnit.SECONDS);
+            missingPutFuture.get(30, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+            pool.awaitTermination(10, TimeUnit.SECONDS);
+        }
+
+        for (int i = 0; i < allKeys.size(); i++) {
+            IObsData loaded = tiered.get(allKeys.get(i));
+            assertNotNull(loaded);
+            assertFalse(loaded.getResult().getBooleanValue(0));
+            assertTrue(loaded.getResult().getBooleanValue(1));
+            assertEquals(500.0 + i, loaded.getResult().getDoubleValue(2), 1e-6);
+        }
+
+        // Verify schema_sha256 deduplication in oscar_obs_overlay and legacy backfill migration
+        try (Connection conn = open()) {
+            assertEquals((long) coldKeys.size(), queryLong(conn,
+                    "SELECT count(*) FROM oscar_obs_overlay WHERE store_key='" + TABLE +
+                            "' AND schema_json IS NULL AND schema_sha256 IS NOT NULL"));
+            assertEquals(2L, queryLong(conn,
+                    "SELECT count(DISTINCT schema_sha256) FROM oscar_obs_overlay WHERE store_key='" + TABLE + "'"));
+            // Simulate a legacy pre-dedup row with inline schema_json and null schema_sha256
+            long firstColdId = coldKeys.get(0).getIdAsLong();
+            try (PreparedStatement revert = conn.prepareStatement(
+                    "UPDATE oscar_obs_overlay o SET schema_json = b.schema_json, schema_sha256 = NULL " +
+                            "FROM oscar_archive_schema_blob b " +
+                            "WHERE o.store_key=? AND o.observation_id=? AND b.schema_sha256=o.schema_sha256")) {
+                revert.setString(1, TABLE);
+                revert.setLong(2, firstColdId);
+                assertEquals(1, revert.executeUpdate());
+            }
+            assertEquals(1, tiered.getArchiveCatalog().migrateLegacyOverlaySchemas(100));
+            assertEquals(0L, queryLong(conn,
+                    "SELECT count(*) FROM oscar_obs_overlay WHERE store_key='" + TABLE + "' AND schema_json IS NOT NULL"));
+        }
+
+        // Verify putAll across mixed cold-overlaid and hot keys
+        Map<BigId, IObsData> batchUpdates = new LinkedHashMap<>();
+        for (int i = 0; i < allKeys.size(); i++) {
+            BigId key = allKeys.get(i);
+            IObsData existing = tiered.get(key);
+            batchUpdates.put(key, alarmObs(existing.getDataStreamID(),
+                    existing.getPhenomenonTime(), existing.getResultTime(),
+                    true, true, 900.0 + i));
+        }
+        tiered.putAll(batchUpdates);
+
+        ObsFilter bothAlarms = new ObsFilter.Builder()
+                .withDataStreams(streamA, streamB)
+                .withCQLFilter("gammaAlarm = true AND neutronAlarm = true")
+                .build();
+        assertEquals((long) allKeys.size(), tiered.countMatchingEntries(bothAlarms));
+        assertEquals((long) allKeys.size(), selectCount(tiered, bothAlarms));
+    }
+
+    @Test
     public void directTieredCountMatchesSelectEntriesAcrossOverlapOverlaysTombstonesAndCql() throws Exception {
         OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
         Instant coldStart = Instant.parse("2026-09-02T00:00:00Z");
@@ -5126,6 +5398,125 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         } finally {
             Files.move(hiddenParquetFile, parquetFile);
         }
+
+        // Verify mutated-generation summary inclusion-exclusion across advancing resultTime windows
+        // and when an additional cold observation in the same generation is overlaid.
+        ObsFilter boundedGamma1 = new ObsFilter.Builder()
+                .withDataStreams(occStream)
+                .withPhenomenonTimeDuring(base.minus(1, ChronoUnit.HOURS), base.plus(2, ChronoUnit.HOURS))
+                .withResultTimeDuring(Instant.EPOCH, base.plus(2, ChronoUnit.HOURS))
+                .withCQLFilter("gammaAlarm = true")
+                .build();
+        ObsFilter boundedGamma2 = new ObsFilter.Builder()
+                .withDataStreams(occStream)
+                .withPhenomenonTimeDuring(base.minus(1, ChronoUnit.HOURS), base.plus(3, ChronoUnit.HOURS))
+                .withResultTimeDuring(Instant.EPOCH, base.plus(3, ChronoUnit.HOURS))
+                .withCQLFilter("gammaAlarm = true")
+                .build();
+        assertEquals(1L, tiered.countMatchingEntries(boundedGamma1));
+        assertEquals(1L, tiered.countMatchingEntries(boundedGamma2));
+        tiered.put(occ1, alarmObs(occStream, base.plusSeconds(10), base.plusSeconds(10), true, false, 95.0));
+        assertEquals(2L, tiered.countMatchingEntries(boundedGamma2));
+        assertEquals(1L, tiered.countMatchingEntries(neutronAlarmFilter));
+
+        // Verify bounded selectEntries(limit=15) prunes mutated generations when exact - mutatedBaseMatches == 0,
+        // including multi-shard clusters sharing the same 30-minute window.
+        BigId occ3 = tiered.add(alarmObs(occStream, base.plusSeconds(30), base.plusSeconds(30), true, false, 180.0));
+        forceReadBackFromStorage();
+        ArchiveGeneration gen2 = tiered.archiveWindow(
+                base, base.plus(30, ChronoUnit.MINUTES), "RAW_GATED").orElseThrow();
+        tiered.maintainArchiveLifecycle();
+        ageGeneration(gen2.id());
+        tiered.maintainArchiveLifecycle();
+
+        tiered.put(occ1, alarmObs(occStream, base.plusSeconds(10), base.plusSeconds(10), false, false, 95.0));
+        tiered.put(occ2, alarmObs(occStream, base.plusSeconds(20), base.plusSeconds(20), false, false, 155.0));
+        ObsFilter boundedGammaPage = ObsFilter.Builder.from(boundedGamma2).withLimit(15).build();
+        assertEquals("Unmutated occ3 in second same-window shard must still be returned",
+                1L, selectCount(tiered, boundedGammaPage));
+        tiered.put(occ3, alarmObs(occStream, base.plusSeconds(30), base.plusSeconds(30), false, false, 180.0));
+        assertEquals(0L, selectCount(tiered, boundedGammaPage));
+        assertEquals(0L, selectCount(tiered, boundedGammaPage));
+        assertEquals(0L, tiered.countMatchingEntries(boundedGamma2));
+    }
+
+    @Test
+    public void timeContainedSummarySummarizesInteriorOccupancyWindowsInPostgres() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        SWEHelper swe = new SWEHelper();
+        var timedOccupancyRecord = swe.createRecord().name("gammaCounts")
+                .addField("startTime", swe.createTime().asSamplingTimeIsoUTC().build())
+                .addField("endTime", swe.createTime().asSamplingTimeIsoUTC().build())
+                .addField("gammaAlarm", swe.createBoolean().build())
+                .addField("neutronAlarm", swe.createBoolean().build())
+                .addField("maxGamma", swe.createQuantity().build())
+                .build();
+        BigId timedStream = postgisObsStore.getDataStreams().add(new DataStreamInfo.Builder()
+                .withName("gammaCounts")
+                .withSystem(new FeatureId(bigId(987), "urn:oscar:test:timed-occupancy:987"))
+                .withRecordDescription(timedOccupancyRecord)
+                .withRecordEncoding(new TextEncodingImpl())
+                .build()).getInternalID();
+        BigId untimedStream = addAlarmDataStream(bigId(988), "gammaCounts");
+
+        Instant day0 = Instant.parse("2026-10-01T00:00:00Z");
+        Instant day3 = day0.plus(3, ChronoUnit.DAYS);
+        Instant day6 = day0.plus(6, ChronoUnit.DAYS);
+
+        for (Instant w : List.of(day0, day3, day6)) {
+            DataBlock b = timedOccupancyRecord.createDataBlock();
+            b.setDoubleValue(0, w.plusSeconds(10).getEpochSecond());
+            b.setDoubleValue(1, w.plusSeconds(20).getEpochSecond());
+            b.setBooleanValue(2, true);
+            b.setBooleanValue(3, false);
+            b.setDoubleValue(4, 120.0);
+            tiered.add(new ObsData.Builder()
+                    .withDataStream(timedStream)
+                    .withPhenomenonTime(w.plusSeconds(10))
+                    .withResultTime(w.plusSeconds(20))
+                    .withResult(b)
+                    .build());
+            tiered.add(alarmObs(untimedStream, w.plusSeconds(15), w.plusSeconds(15), true, false, 99.0));
+        }
+        forceReadBackFromStorage();
+
+        ArchiveGeneration g0 = tiered.archiveWindow(day0, day0.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        ArchiveGeneration g3 = tiered.archiveWindow(day3, day3.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        ArchiveGeneration g6 = tiered.archiveWindow(day6, day6.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        try (Connection connection = open();
+             PreparedStatement purgeHot = connection.prepareStatement(
+                     "DELETE FROM " + TABLE + " WHERE datastreamid IN (?, ?)")) {
+            purgeHot.setLong(1, timedStream.getIdAsLong());
+            purgeHot.setLong(2, untimedStream.getIdAsLong());
+            assertEquals(6, purgeHot.executeUpdate());
+        }
+
+        // g3 ([day3, day3+1h]) is strictly inside [day0 + 24h, day6 - 24h] -> summarized directly in PostgreSQL!
+        ObsFilter interiorRangeFilter = new ObsFilter.Builder()
+                .withDataStreams(timedStream)
+                .withCQLFilter("gammaAlarm = true AND startTime >= '" + day0 + "' AND endTime <= '" + day6.plus(1, ChronoUnit.HOURS) + "'")
+                .build();
+        var summarySpec = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                .summaryCounterSpec(interiorRangeFilter.getCQLFilter()).orElseThrow();
+        var timeContainedSpec = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                .timeContainedSummarySpec(interiorRangeFilter.getCQLFilter()).orElseThrow();
+        var timedSummary = tiered.getArchiveCatalog().summarizeColdCandidates(
+                List.of(g0, g3, g6), null, null, Set.of(timedStream.getIdAsLong()), Set.of(),
+                summarySpec, timeContainedSpec);
+        assertEquals("Interior generation g3 must be counted directly in PostgreSQL",
+                1L, timedSummary.summarizedCount());
+        assertEquals("Only boundary generations g0 and g6 should remain for DuckDB scan",
+                Set.of(g0.id(), g6.id()),
+                timedSummary.remainingCandidates().stream().map(ArchiveGeneration::id).collect(java.util.stream.Collectors.toSet()));
+        assertEquals(3L, tiered.countMatchingEntries(interiorRangeFilter));
+        assertEquals(3L, selectCount(tiered, interiorRangeFilter));
+
+        // Untimed datastream lacking startTime/endTime schema fields must NOT be time-summarized.
+        var untimedSummary = tiered.getArchiveCatalog().summarizeColdCandidates(
+                List.of(g0, g3, g6), null, null, Set.of(untimedStream.getIdAsLong()), Set.of(),
+                summarySpec, timeContainedSpec);
+        assertEquals(0L, untimedSummary.summarizedCount());
+        assertEquals(3, untimedSummary.remainingCandidates().size());
     }
 
     private static String toPostgresPositionalSql(String jdbcSql) {

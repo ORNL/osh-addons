@@ -55,8 +55,16 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
 
     protected void init(PostgisCommandStoreImpl commandStore, String url, String dbName, String login, String password) {
         super.init(url, dbName, login, password, new String[]{
-                queryBuilder.createTableQuery()
+                queryBuilder.createTableQuery(),
+                queryBuilder.createCommandReportTimeIndexQuery()
         });
+        // PostgisStore.init runs creation scripts only for new tables. Existing
+        // deployments also need the lookup index after an upgrade.
+        try (Connection connection = connectionManager.getConnection()) {
+            PostgisUtils.executeQueries(connection, new String[]{queryBuilder.createCommandReportTimeIndexQuery()});
+        } catch (SQLException error) {
+            throw new IllegalStateException("Cannot create command status lookup index", error);
+        }
         this.commandStore = commandStore;
         queryBuilder.linkTo(this.commandStore);
         queryBuilder.linkTo(this.commandStore.getCommandStreams());
@@ -98,13 +106,12 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
 
             BigId id = BigId.fromLong(idScope, resultSet.getLong("id"));
             boolean noFields = fields != null && !fields.isEmpty();
-            BigId commandStreamId = null;
+            BigId commandId = null;
             if (!noFields || fields.contains(COMMAND_ID)) {
                 long commandIdAsLong = resultSet.getLong(String.valueOf(COMMAND_ID));
                 if (!resultSet.wasNull()) {
-                    var commandId = BigId.fromLong(idScope, commandIdAsLong);
+                    commandId = BigId.fromLong(idScope, commandIdAsLong);
                     cmdStatusBuilder.withCommand(commandId);
-                    commandStreamId = commandStore.get(commandId).getCommandStreamID();
                 }
             }
 
@@ -140,6 +147,7 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
             String resultJson = resultSet.getString("result");
             if (!resultSet.wasNull() && resultJson != null && !resultJson.isBlank()) {
                 ICommandResult cmdResult;
+                BigId commandStreamId = commandId != null ? commandStore.getCommandStreamId(commandId) : null;
                 if (commandStreamId != null) {
                     ICommandStreamInfo commandStreamInfo = commandStore.getCommandStreams().get(new CommandStreamKey(commandStreamId));
                     cmdResult = SerializerUtils.readICommandResultJson(resultJson, commandStreamInfo);
@@ -160,9 +168,32 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
 
     protected ICommandStreamInfo getContext(ICommandStatus status) {
         var cmdId = status.getCommandID();
-        var cmdStreamId = commandStore.get(cmdId).getCommandStreamID();
+        var cmdStreamId = cmdId != null ? commandStore.getCommandStreamId(cmdId) : null;
+        if (cmdStreamId == null) {
+            return null;
+        }
         var cmdStreamKey = new CommandStreamKey(cmdStreamId);
         return commandStore.getCommandStreams().get(cmdStreamKey);
+    }
+
+    private PGobject serializeResultJson(ICommandStatus rec) throws SQLException, IOException {
+        if (rec.getResult() == null) {
+            return null;
+        }
+        ICommandResult result = rec.getResult();
+        String objectAsJson;
+        if (result.getInlineRecords() != null && !result.getInlineRecords().isEmpty()) {
+            ICommandStreamInfo csInfo = getContext(rec);
+            objectAsJson = csInfo != null
+                    ? SerializerUtils.writeICommandResultJson(result, csInfo)
+                    : SerializerUtils.writeICommandResultJson(result);
+        } else {
+            objectAsJson = SerializerUtils.writeICommandResultJson(result);
+        }
+        PGobject jsonObject = new PGobject();
+        jsonObject.setType("json");
+        jsonObject.setValue(objectAsJson);
+        return jsonObject;
     }
 
     protected PGobject createPGObjectExecTime(TimeExtent timeExtent) throws SQLException {
@@ -190,6 +221,12 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
 
     @Override
     public BigId add(ICommandStatus rec) {
+        final PGobject jsonObject;
+        try {
+            jsonObject = serializeResultJson(rec);
+        } catch (Exception e) {
+            throw new RuntimeException("Cannot insert command", e);
+        }
         try (Connection connection1 = this.connectionManager.getConnection()) {
             try (PreparedStatement preparedStatement = connection1.prepareStatement(queryBuilder.insertCommandQuery(), Statement.RETURN_GENERATED_KEYS)) {
                 // command ID
@@ -219,23 +256,7 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
                 }
 
                 // command result
-
-                if (rec.getResult() != null) {
-
-                    String objectAsJson;
-                    // Use context to serialize inline records
-                    ICommandResult result = rec.getResult();
-                    if (result.getInlineRecords() != null && !result.getInlineRecords().isEmpty()) {
-                        ICommandStreamInfo csInfo = getContext(rec);
-                        objectAsJson = SerializerUtils.writeICommandResultJson(result, csInfo);
-                    } else {
-                        objectAsJson = SerializerUtils.writeICommandResultJson(result);
-                    }
-
-                    PGobject jsonObject = new PGobject();
-                    jsonObject.setType("json");
-                    jsonObject.setValue(objectAsJson);
-
+                if (jsonObject != null) {
                     preparedStatement.setObject(7, jsonObject);
                 } else {
                     preparedStatement.setNull(7, Types.OTHER);
@@ -282,15 +303,18 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
             throw new UnsupportedOperationException("Get operation is not supported with argument != BigId key, got=" + o.getClass());
         }
         BigId key = (BigId) o;
-        try (Connection connection = this.connectionManager.getConnection()) {
-            try (PreparedStatement preparedStatement = connection.prepareStatement(queryBuilder.selectByIdQuery())) {
-                preparedStatement.setLong(1, key.getIdAsLong());
-                ResultSet resultSet = preparedStatement.executeQuery();
+        CommandStatus.CommandStatusBuilder<?, ?> cmdStatusBuilder = null;
+        long cmdId = 0L;
+        String resultJson = null;
+        try (Connection connection = this.connectionManager.getConnection();
+             PreparedStatement preparedStatement = connection.prepareStatement(queryBuilder.selectByIdQuery())) {
+            preparedStatement.setLong(1, key.getIdAsLong());
+            try (ResultSet resultSet = preparedStatement.executeQuery()) {
                 if (resultSet.next()) {
-                    CommandStatus.CommandStatusBuilder<?, ?> cmdStatusBuilder = new CommandStatus.Builder();
+                    cmdStatusBuilder = new CommandStatus.Builder();
 
                     // command ID
-                    long cmdId = resultSet.getLong(String.valueOf(COMMAND_ID));
+                    cmdId = resultSet.getLong(String.valueOf(COMMAND_ID));
                     cmdStatusBuilder.withCommand(new BigIdLong(commandStore.idScope, cmdId));
 
                     // progress
@@ -319,28 +343,34 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
                         cmdStatusBuilder.withMessage(message);
                     }
 
-                    String resultJson = resultSet.getString("result");
-                    if (!resultSet.wasNull() && resultJson != null && !resultJson.isBlank()) {
-                        ICommandResult cmdResult;
-                        var cmd = commandStore.get(new BigIdLong(commandStore.idScope, cmdId));
-                        if (cmd != null && cmd.getCommandStreamID() != null) {
-                            ICommandStreamInfo commandStreamInfo = commandStore.getCommandStreams().get(new CommandStreamKey(cmd.getCommandStreamID()));
-                            cmdResult = SerializerUtils.readICommandResultJson(resultJson, commandStreamInfo);
-                        } else {
-                            cmdResult = SerializerUtils.readICommandResultJson(resultJson);
-                        }
-                        cmdStatusBuilder.withResult(cmdResult);
+                    String rawResult = resultSet.getString("result");
+                    if (!resultSet.wasNull()) {
+                        resultJson = rawResult;
                     }
-
-                    return cmdStatusBuilder.build();
                 }
-            } catch (IOException e) {
-                throw new RuntimeException(e);
             }
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
-        return null;
+        if (cmdStatusBuilder == null) {
+            return null;
+        }
+        if (resultJson != null && !resultJson.isBlank()) {
+            try {
+                ICommandResult cmdResult;
+                BigId cmdStreamId = commandStore.getCommandStreamId(new BigIdLong(commandStore.idScope, cmdId));
+                if (cmdStreamId != null) {
+                    ICommandStreamInfo commandStreamInfo = commandStore.getCommandStreams().get(new CommandStreamKey(cmdStreamId));
+                    cmdResult = SerializerUtils.readICommandResultJson(resultJson, commandStreamInfo);
+                } else {
+                    cmdResult = SerializerUtils.readICommandResultJson(resultJson);
+                }
+                cmdStatusBuilder.withResult(cmdResult);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        return cmdStatusBuilder.build();
     }
 
     @Override
@@ -354,8 +384,10 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
                     "Adjudication status records are immutable and cannot be modified; append a new adjudication record instead");
         }
 
-        try (Connection connection = this.connectionManager.getConnection()) {
-            try (PreparedStatement preparedStatement = connection.prepareStatement(queryBuilder.updateByIdQuery())) {
+        try {
+            PGobject jsonObject = serializeResultJson(rec);
+            try (Connection connection = this.connectionManager.getConnection();
+                 PreparedStatement preparedStatement = connection.prepareStatement(queryBuilder.updateByIdQuery())) {
                 // command ID
                 preparedStatement.setLong(1, rec.getCommandID().getIdAsLong());
 
@@ -383,23 +415,7 @@ public class PostgisCommandStatusStore extends PostgisStore<QueryBuilderCommandS
                 }
 
                 // command result
-
-                if (rec.getResult() != null) {
-
-                    String objectAsJson;
-                    // Use context to serialize inline records
-                    ICommandResult result = rec.getResult();
-                    if (result.getInlineRecords() != null && !result.getInlineRecords().isEmpty()) {
-                        ICommandStreamInfo csInfo = getContext(rec);
-                        objectAsJson = SerializerUtils.writeICommandResultJson(result, csInfo);
-                    } else {
-                        objectAsJson = SerializerUtils.writeICommandResultJson(result);
-                    }
-
-                    PGobject jsonObject = new PGobject();
-                    jsonObject.setType("json");
-                    jsonObject.setValue(objectAsJson);
-
+                if (jsonObject != null) {
                     preparedStatement.setObject(7, jsonObject);
                 } else {
                     preparedStatement.setNull(7, Types.OTHER);

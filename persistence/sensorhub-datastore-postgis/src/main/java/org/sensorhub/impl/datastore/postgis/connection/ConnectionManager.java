@@ -103,7 +103,9 @@ public class ConnectionManager {
 
     public Connection getConnection() {
         try {
-            return CancellableConnectionScope.track(hikariDataSourceInstance.getConnection());
+            Connection connection = hikariDataSourceInstance.getConnection();
+            return CancellableConnectionScope.track(
+                    connection, () -> hikariDataSourceInstance.evictConnection(connection));
         } catch (CancellationException ex) {
             throw ex;
         } catch (Exception ex) {
@@ -139,6 +141,14 @@ public class ConnectionManager {
      */
     public static void throwIfCancellableOperationCancelled() {
         CancellableConnectionScope.throwIfCancellationRequested();
+    }
+
+    public static Runnable captureCancellableOperationCheck() {
+        return CancellableConnectionScope.captureCancellationCheck();
+    }
+
+    public static boolean hasActiveCancellableOperation() {
+        return CancellableConnectionScope.isActive();
     }
 
     public void addBatch(String sqlQuery) {

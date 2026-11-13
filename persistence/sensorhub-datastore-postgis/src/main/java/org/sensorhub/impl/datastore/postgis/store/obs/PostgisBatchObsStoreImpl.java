@@ -32,6 +32,7 @@ public class PostgisBatchObsStoreImpl extends PostgisObsStoreImpl {
     // keeps deterministic insertion order and the first allocated row ID.
     private final Map<ObservationNaturalKey, PreparedObservation> pending =
             new LinkedHashMap<>(BATCH_SIZE);
+    private final Set<Long> pendingIds = new HashSet<>();
     private final Map<Long, Instant> phenomenonHighWaterByDataStream = new HashMap<>();
     private final Set<Long> initializedHighWaterDataStreams = new HashSet<>();
 
@@ -104,6 +105,7 @@ public class PostgisBatchObsStoreImpl extends PostgisObsStoreImpl {
                     }
                 }
                 pending.put(naturalKey, snapshot);
+                pendingIds.add(snapshot.id);
                 advanceHighWater(snapshot);
                 if (pending.size() >= BATCH_SIZE)
                     flushPendingLocked();
@@ -141,11 +143,37 @@ public class PostgisBatchObsStoreImpl extends PostgisObsStoreImpl {
         try {
             // Preserve map semantics: a just-added observation must be visible
             // before get/remove attempts to return its previous value.
-            commit();
+            if (o instanceof BigId id)
+                flushPendingForIds(List.of(id.getIdAsLong()));
+            else
+                commit();
         } catch (DataStoreException e) {
             throw new IllegalStateException("Cannot flush observations before remove", e);
         }
         return super.remove(o);
+    }
+
+    protected void flushPendingForIds(java.util.Collection<Long> observationIds) throws DataStoreException {
+        if (observationIds == null || observationIds.isEmpty())
+            return;
+        pendingLock.lock();
+        try {
+            if (pendingIds.isEmpty())
+                return;
+            boolean intersects = false;
+            for (Long id : observationIds) {
+                if (id != null && pendingIds.contains(id)) {
+                    intersects = true;
+                    break;
+                }
+            }
+            if (!intersects)
+                return;
+            flushPendingLocked();
+        } finally {
+            pendingLock.unlock();
+        }
+        super.commit();
     }
 
     @Override
@@ -178,6 +206,7 @@ public class PostgisBatchObsStoreImpl extends PostgisObsStoreImpl {
                 reconcileProtectedObservations(connection, pending.values());
                 connection.commit();
                 pending.clear();
+                pendingIds.clear();
                 logger.debug("Committed observation batch");
             } catch (Exception e) {
                 connection.rollback();
@@ -223,33 +252,39 @@ public class PostgisBatchObsStoreImpl extends PostgisObsStoreImpl {
     private void flushIndividuallyAfterConflict(Connection connection, Exception batchFailure) throws Exception {
         List<PreparedObservation> snapshot = new ArrayList<>(pending.values());
         ObservationConflictException firstConflict = null;
-        for (PreparedObservation observation : snapshot) {
-            try {
-                beforeObservationWrite(connection, List.of(observation));
-                try (PreparedStatement statement = connection.prepareStatement(preparedObservationUpsertQuery())) {
-                    bindPreparedObservation(statement, observation);
-                    statement.executeUpdate();
+        try {
+            for (PreparedObservation observation : snapshot) {
+                try {
+                    beforeObservationWrite(connection, List.of(observation));
+                    try (PreparedStatement statement = connection.prepareStatement(preparedObservationUpsertQuery())) {
+                        bindPreparedObservation(statement, observation);
+                        statement.executeUpdate();
+                    }
+                    Set<Long> protectedIds = reconcileProtectedObservations(
+                            connection, List.of(observation));
+                    if (!protectedIds.contains(observation.id))
+                        validateInsertOutcomes(connection, List.of(observation));
+                    connection.commit();
+                    pending.remove(ObservationNaturalKey.of(observation));
+                } catch (ObservationConflictException conflict) {
+                    connection.rollback();
+                    pending.remove(ObservationNaturalKey.of(observation));
+                    if (firstConflict == null)
+                        firstConflict = conflict;
+                    else
+                        firstConflict.addSuppressed(conflict);
+                } catch (Exception transientFailure) {
+                    connection.rollback();
+                    transientFailure.addSuppressed(batchFailure);
+                    if (firstConflict != null)
+                        transientFailure.addSuppressed(firstConflict);
+                    throw transientFailure;
                 }
-                Set<Long> protectedIds = reconcileProtectedObservations(
-                        connection, List.of(observation));
-                if (!protectedIds.contains(observation.id))
-                    validateInsertOutcomes(connection, List.of(observation));
-                connection.commit();
-                pending.remove(ObservationNaturalKey.of(observation));
-            } catch (ObservationConflictException conflict) {
-                connection.rollback();
-                pending.remove(ObservationNaturalKey.of(observation));
-                if (firstConflict == null)
-                    firstConflict = conflict;
-                else
-                    firstConflict.addSuppressed(conflict);
-            } catch (Exception transientFailure) {
-                connection.rollback();
-                transientFailure.addSuppressed(batchFailure);
-                if (firstConflict != null)
-                    transientFailure.addSuppressed(firstConflict);
-                throw transientFailure;
             }
+        } finally {
+            pendingIds.clear();
+            for (PreparedObservation remaining : pending.values())
+                pendingIds.add(remaining.id);
         }
         if (firstConflict != null) {
             firstConflict.addSuppressed(batchFailure);

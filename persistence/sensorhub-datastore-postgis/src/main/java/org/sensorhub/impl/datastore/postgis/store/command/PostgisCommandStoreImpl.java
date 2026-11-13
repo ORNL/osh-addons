@@ -14,6 +14,8 @@
 
 package org.sensorhub.impl.datastore.postgis.store.command;
 
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import net.opengis.swe.v20.DataBlock;
 import org.postgresql.util.PGobject;
 import org.sensorhub.api.command.CommandData;
@@ -35,6 +37,7 @@ import org.vast.data.DataBlockByte;
 
 import java.sql.*;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
@@ -48,6 +51,10 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
 
     protected PostgisCommandStreamStoreImpl commandStreamStore;
     protected PostgisCommandStatusStore commandStatusStore;
+    private final Cache<Long, BigId> commandStreamByCommandId = CacheBuilder.newBuilder()
+            .maximumSize(16_384)
+            .expireAfterAccess(30, TimeUnit.MINUTES)
+            .build();
 
     public PostgisCommandStoreImpl(String url, String dbName, String login, String password,
                                    int idScope, IdProviderType dsIdProviderType, boolean useBatch) {
@@ -157,11 +164,40 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
         return command != null && isImmutableCommandStream(command.getCommandStreamID());
     }
 
+    public BigId getCommandStreamId(BigId commandId) {
+        if (commandId == null) {
+            return null;
+        }
+        long internalId = commandId.getIdAsLong();
+        BigId cached = commandStreamByCommandId.getIfPresent(internalId);
+        if (cached != null) {
+            return cached;
+        }
+        String sql = "SELECT " + COMMANDSTREAM_ID + " FROM " + queryBuilder.getStoreTableName() + " WHERE id = ?";
+        try (Connection connection = this.connectionManager.getConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, internalId);
+            try (ResultSet rs = statement.executeQuery()) {
+                if (rs.next()) {
+                    long streamId = rs.getLong(1);
+                    if (!rs.wasNull()) {
+                        BigId resolved = BigId.fromLong(idScope, streamId);
+                        commandStreamByCommandId.put(internalId, resolved);
+                        return resolved;
+                    }
+                }
+            }
+            return null;
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     public boolean isImmutableCommandId(BigId commandId) {
         if (commandId == null) {
             return false;
         }
-        return isImmutableCommand(this.get(commandId));
+        return isImmutableCommandStream(getCommandStreamId(commandId));
     }
     @Override
     public Stream<Entry<BigId, ICommandData>> selectEntries(CommandFilter filter, Set<CommandField> fields) {
@@ -245,14 +281,24 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
     @Override
     public BigId add(ICommandData cmd) {
         CommandStreamKey commandStreamKey = new CommandStreamKey(cmd.getCommandStreamID());
-        if (!commandStreamStore.containsKey(commandStreamKey))
+        ICommandStreamInfo commandStreamInfo = commandStreamStore.get(commandStreamKey);
+        if (commandStreamInfo == null)
             throw new IllegalStateException("Unknown commandStream" + cmd.getCommandStreamID());
+
+        PGobject jsonObject = new PGobject();
+        jsonObject.setType("json");
+        try {
+            jsonObject.setValue(SerializerUtils.writeDataBlockToJson(commandStreamInfo.getRecordStructure(),
+                    commandStreamInfo.getRecordEncoding(), cmd.getParams()));
+        } catch (SQLException e) {
+            throw new RuntimeException("Cannot insert command", e);
+        }
 
         try (Connection connection1 = this.connectionManager.getConnection()) {
             try (PreparedStatement preparedStatement = connection1.prepareStatement(queryBuilder.insertCommandQuery(), Statement.RETURN_GENERATED_KEYS)) {
 
                 // insert DataStreamId
-                preparedStatement.setLong(1,commandStreamKey.getInternalID().getIdAsLong());
+                preparedStatement.setLong(1, commandStreamKey.getInternalID().getIdAsLong());
 
                 // insert sendId if any
                 if (cmd.getSenderID() != null && !cmd.getSenderID().isEmpty()) {
@@ -270,17 +316,10 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
 
                 // insert issueTime as timestamp
                 if (cmd.getIssueTime() != null) {
-                    preparedStatement.setTimestamp(4, Timestamp.from(cmd.getIssueTime()),UTC_LOCAL);
+                    preparedStatement.setTimestamp(4, Timestamp.from(cmd.getIssueTime()), UTC_LOCAL);
                 } else {
                     preparedStatement.setNull(4, Types.TIMESTAMP_WITH_TIMEZONE);
                 }
-
-                // insert DataBlock
-                PGobject jsonObject = new PGobject();
-                jsonObject.setType("json");
-                ICommandStreamInfo commandStreamInfo = commandStreamStore.get(new CommandStreamKey(cmd.getCommandStreamID()));
-                jsonObject.setValue(SerializerUtils.writeDataBlockToJson(commandStreamInfo.getRecordStructure(),
-                        commandStreamInfo.getRecordEncoding(), cmd.getParams()));
 
                 preparedStatement.setObject(5, jsonObject);
 
@@ -291,6 +330,7 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
                         if (rs.next()) {
                             generatedKey = rs.getLong(1);
                         }
+                        commandStreamByCommandId.put(generatedKey, commandStreamKey.getInternalID());
                         return BigId.fromLong(idScope, generatedKey);
                     }
                 } else {
@@ -328,6 +368,7 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
                     CommandData.Builder cmdDataBuilder = new CommandData.Builder();
 
                     BigId commandStreamId = BigId.fromLong(idScope,resultSet.getLong(String.valueOf(COMMANDSTREAM_ID)));
+                    commandStreamByCommandId.put(key.getIdAsLong(), commandStreamId);
                     cmdDataBuilder = cmdDataBuilder.withCommandStream(commandStreamId);
 
                     long foiId = resultSet.getLong(String.valueOf(FOI_ID));
@@ -397,6 +438,7 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
 
                 int rows = preparedStatement.executeUpdate();
                 if (rows > 0) {
+                    commandStreamByCommandId.put(key.getIdAsLong(), value.getCommandStreamID());
                     return value;
                 } else {
                     throw new RuntimeException("Cannot insert obs ");
@@ -426,6 +468,7 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
+        commandStreamByCommandId.invalidate(key.getIdAsLong());
         return data;
     }
 
@@ -437,7 +480,9 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
                         "Adjudication command records are immutable and cannot be deleted");
             }
         }
-        return ICommandStore.super.removeEntries(filter);
+        long removed = ICommandStore.super.removeEntries(filter);
+        commandStreamByCommandId.invalidateAll();
+        return removed;
     }
 
     /**
@@ -492,7 +537,19 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
         } catch (SQLException e) {
             logger.warn("Failed to purge transient commands older than {}", cutoff, e);
         }
+        if (deletedCommands > 0) {
+            commandStreamByCommandId.invalidateAll();
+        }
         return deletedCommands;
+    }
+
+    @Override
+    public void clear() {
+        try {
+            super.clear();
+        } finally {
+            commandStreamByCommandId.invalidateAll();
+        }
     }
 
     @Override
