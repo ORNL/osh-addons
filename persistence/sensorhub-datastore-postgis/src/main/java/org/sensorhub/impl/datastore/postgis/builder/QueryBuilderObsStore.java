@@ -552,6 +552,14 @@ public class QueryBuilderObsStore extends QueryBuilder {
             ObsFilter filter,
             Set<IObsStore.ObsField> fields,
             boolean parentTableOnly) {
+        return createParameterizedLatestResultPerDataStreamQuery(filter, fields, parentTableOnly, null);
+    }
+
+    public ParameterizedQuery createParameterizedLatestResultPerDataStreamQuery(
+            ObsFilter filter,
+            Set<IObsStore.ObsField> fields,
+            boolean parentTableOnly,
+            java.util.function.Function<String, String> candidatePredicateByAlias) {
         if (!supportsLatestResultPerDataStreamQuery(filter)) {
             throw new IllegalArgumentException("Filter is not eligible for the latest-result-per-stream query");
         }
@@ -589,6 +597,8 @@ public class QueryBuilderObsStore extends QueryBuilder {
         }
 
         String relation = (parentTableOnly ? "ONLY " : "") + this.getStoreTableName();
+        String nonNullExtra = candidatePredicateByAlias == null ? null : candidatePredicateByAlias.apply("non_null");
+        String nullOnlyExtra = candidatePredicateByAlias == null ? null : candidatePredicateByAlias.apply("null_only");
         StringBuilder sql = new StringBuilder("SELECT ")
                 .append(selectedColumns)
                 .append(" FROM unnest(ARRAY[")
@@ -597,16 +607,22 @@ public class QueryBuilderObsStore extends QueryBuilder {
                 .append(" CROSS JOIN LATERAL (SELECT candidate.* FROM ((SELECT non_null.* FROM ")
                 .append(relation)
                 .append(" non_null WHERE non_null.dataStreamID = requested.dataStreamID")
-                .append(" AND non_null.").append(timeColumn).append(" IS NOT NULL")
-                .append(" ORDER BY non_null.").append(timeColumn).append(" DESC, non_null.id DESC")
+                .append(" AND non_null.").append(timeColumn).append(" IS NOT NULL");
+        if (nonNullExtra != null && !nonNullExtra.isBlank()) {
+            sql.append(" AND (").append(nonNullExtra).append(')');
+        }
+        sql.append(" ORDER BY non_null.").append(timeColumn).append(" DESC, non_null.id DESC")
                 // IteratorResultSet detects an outer LIMIT textually when it
                 // decides whether to add paging. FETCH keeps this inner bound
                 // from being mistaken for the caller's outer result limit.
                 .append(" FETCH FIRST 1 ROW ONLY) UNION ALL (SELECT null_only.* FROM ")
                 .append(relation)
                 .append(" null_only WHERE null_only.dataStreamID = requested.dataStreamID")
-                .append(" AND null_only.").append(timeColumn).append(" IS NULL")
-                .append(" ORDER BY null_only.id DESC FETCH FIRST 1 ROW ONLY)) candidate")
+                .append(" AND null_only.").append(timeColumn).append(" IS NULL");
+        if (nullOnlyExtra != null && !nullOnlyExtra.isBlank()) {
+            sql.append(" AND (").append(nullOnlyExtra).append(')');
+        }
+        sql.append(" ORDER BY null_only.id DESC FETCH FIRST 1 ROW ONLY)) candidate")
                 .append(" ORDER BY candidate.").append(timeColumn).append(" DESC NULLS LAST, candidate.id DESC")
                 .append(" FETCH FIRST 1 ROW ONLY) latest")
                 .append(" ORDER BY latest.phenomenonTime ")

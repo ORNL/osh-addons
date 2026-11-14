@@ -51,7 +51,23 @@ public class TestTieredArchiveConfiguration {
         assertTrue(config.outputNames.contains("report"));
         assertTrue(config.outputNames.contains("connectionStatus"));
         assertTrue(config.outputNames.contains("occupancyStatus"));
+        assertTrue(config.outputNames.contains("vehicleOcr"));
+        assertEquals(22, config.outputNames.size());
         assertFalse(config.outputNames.contains("sensorLocation"));
+    }
+
+    @Test
+    public void persistedTwentyOneOutputListUpgradesToIncludeVehicleOcrOnValidate() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.outputNames = new java.util.ArrayList<>(java.util.List.of(
+                "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
+                "speed", "backgroundReport", "foregroundReport", "status",
+                "emlContextual", "emlScanContextual", "emlAnalysis",
+                "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
+                "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary"));
+        config.validate();
+        assertEquals(22, config.outputNames.size());
+        assertTrue(config.outputNames.contains("vehicleOcr"));
     }
 
     @Test

@@ -167,6 +167,18 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
 
     protected Stream<Entry<BigId, IObsData>> selectEntries(
             ObsFilter filter, Set<ObsField> fields, boolean parentTableOnly, int initialPageSize) {
+        return selectEntries(filter, fields, parentTableOnly, initialPageSize, null);
+    }
+
+    protected Stream<Entry<BigId, IObsData>> selectLatestPerDataStreamEntries(
+            ObsFilter filter, Set<ObsField> fields, boolean parentTableOnly, int initialPageSize,
+            java.util.function.Function<String, String> candidatePredicateByAlias) {
+        return selectEntries(filter, fields, parentTableOnly, initialPageSize, candidatePredicateByAlias);
+    }
+
+    private Stream<Entry<BigId, IObsData>> selectEntries(
+            ObsFilter filter, Set<ObsField> fields, boolean parentTableOnly, int initialPageSize,
+            java.util.function.Function<String, String> latestCandidatePredicateByAlias) {
         Set<ObsField> requestedFields = fields == null || fields.isEmpty()
                 ? null : Set.copyOf(fields);
         boolean projectAfterPredicate = filter.getValuePredicate() != null && requestedFields != null;
@@ -195,7 +207,7 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
         ParameterizedQuery query;
         if (queryBuilder.supportsLatestResultPerDataStreamQuery(queryFilter)) {
             query = queryBuilder.createParameterizedLatestResultPerDataStreamQuery(
-                    queryFilter, queryFields, parentTableOnly);
+                    queryFilter, queryFields, parentTableOnly, latestCandidatePredicateByAlias);
         } else if (latestSelection) {
             // DISTINCT ON relies on its inner ORDER BY. The outer keyset still
             // supplies the final stable page order.

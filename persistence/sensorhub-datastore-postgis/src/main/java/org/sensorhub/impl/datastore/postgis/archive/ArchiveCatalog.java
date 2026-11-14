@@ -565,8 +565,17 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_tombstone DROP CONSTRAINT IF EXISTS oscar_tombstone_observation_owner_check");
                 statement.execute("ALTER TABLE oscar_tombstone ADD CONSTRAINT oscar_tombstone_observation_owner_check " +
                         "CHECK (subject_type <> 'OBSERVATION' OR generation_id IS NOT NULL)");
+                statement.execute("ALTER TABLE oscar_tombstone ADD COLUMN IF NOT EXISTS datastream_id bigint");
+                statement.execute("UPDATE oscar_tombstone tombstone SET datastream_id=overlay_row.datastream_id " +
+                        "FROM oscar_obs_overlay overlay_row " +
+                        "WHERE tombstone.datastream_id IS NULL AND tombstone.subject_type='OBSERVATION' " +
+                        "AND tombstone.store_key=overlay_row.store_key AND tombstone.id_scope=overlay_row.id_scope " +
+                        "AND tombstone.subject_id=overlay_row.observation_id::text");
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_tombstone_generation_idx " +
                         "ON oscar_tombstone(generation_id) WHERE subject_type='OBSERVATION'");
+                statement.execute("CREATE INDEX IF NOT EXISTS oscar_tombstone_datastream_idx " +
+                        "ON oscar_tombstone(store_key, id_scope, datastream_id) " +
+                        "WHERE subject_type='OBSERVATION' AND generation_id IS NOT NULL");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_media_manifest (" +
                         "event_id text NOT NULL, camera_uid text NOT NULL, lane_uid text NOT NULL, manifest_path text NOT NULL, " +
                         "state text NOT NULL, source_sha256 text, policy_version integer NOT NULL, legal_hold boolean NOT NULL DEFAULT false, " +
@@ -2862,8 +2871,9 @@ public final class ArchiveCatalog {
                 "WHERE generation.id=tombstone.generation_id AND generation.store_key=tombstone.store_key " +
                 "AND generation.id_scope=tombstone.id_scope AND generation.state IN ('ACTIVE','SEALED'))" +
                 (filterStreams
-                        ? " AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
-                        "WHERE s.generation_id=tombstone.generation_id AND s.datastream_id=ANY (?::bigint[]))"
+                        ? " AND (tombstone.datastream_id=ANY (?::bigint[]) OR " +
+                        "(tombstone.datastream_id IS NULL AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
+                        "WHERE s.generation_id=tombstone.generation_id AND s.datastream_id=ANY (?::bigint[]))))"
                         : "") +
                 ")";
         try (Connection connection = connections.open()) {
@@ -2878,8 +2888,10 @@ public final class ArchiveCatalog {
                     statement.setArray(p++, streamArray);
                 statement.setString(p++, storeKey);
                 statement.setInt(p++, idScope);
-                if (streamArray != null)
+                if (streamArray != null) {
+                    statement.setArray(p++, streamArray);
                     statement.setArray(p, streamArray);
+                }
                 try (ResultSet result = statement.executeQuery()) {
                     return result.next()
                             ? new MutationCounts(result.getLong(1), result.getLong(2))
@@ -2923,9 +2935,16 @@ public final class ArchiveCatalog {
                 "AND g.store_key=latest.store_key AND g.id_scope=latest.id_scope " +
                 "AND g.state IN ('ACTIVE','SEALED') " +
                 "AND NOT EXISTS (SELECT 1 FROM oscar_tombstone tombstone " +
+                "JOIN oscar_archive_generation tg ON tg.id=tombstone.generation_id " +
                 "WHERE tombstone.store_key=latest.store_key AND tombstone.id_scope=latest.id_scope " +
                 "AND tombstone.subject_type='OBSERVATION' AND tombstone.subject_id=latest.observation_id::text " +
-                "AND tombstone.generation_id IS NOT NULL) " +
+                "AND tg.store_key=tombstone.store_key AND tg.id_scope=tombstone.id_scope " +
+                "AND tg.state IN ('ACTIVE','SEALED')) " +
+                "AND (overlay_row.observation_id IS NULL OR (" +
+                "(latest.phenomenon_time IS NULL OR (overlay_row.phenomenon_time IS NOT NULL " +
+                "AND overlay_row.phenomenon_time >= latest.phenomenon_time)) " +
+                "AND (latest.result_time IS NULL OR (overlay_row.result_time IS NOT NULL " +
+                "AND overlay_row.result_time >= latest.result_time)))) " +
                 "AND NOT EXISTS (SELECT 1 FROM oscar_archive_schema s2 " +
                 "JOIN oscar_archive_generation g2 ON g2.id=s2.generation_id " +
                 "WHERE g2.store_key=latest.store_key AND g2.id_scope=latest.id_scope " +
@@ -3861,6 +3880,166 @@ public final class ArchiveCatalog {
         }
     }
 
+    /**
+     * Returns mutated (overlaid or tombstoned) observation IDs within
+     * {@code generationIds} that may belong to {@code dataStreams} (or all
+     * streams when {@code null}). Legacy tombstones with {@code datastream_id IS NULL}
+     * are conservatively included so exact exclusion holds before/without backfill.
+     */
+    public Set<Long> mutatedObservationIdsInGenerations(
+            Collection<UUID> generationIds, Set<Long> dataStreams) {
+        if (generationIds == null || generationIds.isEmpty() ||
+                (dataStreams != null && dataStreams.isEmpty()))
+            return Set.of();
+        boolean filterStreams = dataStreams != null;
+        String sql = "WITH target_gen(id) AS (SELECT unnest(?::uuid[])) " +
+                "SELECT overlay_row.observation_id " +
+                "FROM oscar_obs_overlay overlay_row " +
+                "JOIN target_gen tg ON tg.id=overlay_row.generation_id " +
+                "JOIN oscar_archive_generation generation ON generation.id=overlay_row.generation_id " +
+                "WHERE overlay_row.store_key=? AND overlay_row.id_scope=? " +
+                "AND generation.store_key=overlay_row.store_key AND generation.id_scope=overlay_row.id_scope " +
+                "AND generation.state IN ('ACTIVE','SEALED')" +
+                (filterStreams ? " AND overlay_row.datastream_id=ANY (?::bigint[])" : "") +
+                " UNION " +
+                "SELECT tombstone.subject_id::bigint " +
+                "FROM oscar_tombstone tombstone " +
+                "JOIN target_gen tg ON tg.id=tombstone.generation_id " +
+                "JOIN oscar_archive_generation generation ON generation.id=tombstone.generation_id " +
+                "WHERE tombstone.store_key=? AND tombstone.id_scope=? " +
+                "AND tombstone.subject_type='OBSERVATION' AND tombstone.subject_id ~ '^[0-9]+$' " +
+                "AND generation.store_key=tombstone.store_key AND generation.id_scope=tombstone.id_scope " +
+                "AND generation.state IN ('ACTIVE','SEALED')" +
+                (filterStreams ? " AND (tombstone.datastream_id IS NULL OR tombstone.datastream_id=ANY (?::bigint[]))" : "");
+        Set<Long> mutated = new HashSet<>();
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            java.sql.Array genArray = connection.createArrayOf("uuid", generationIds.toArray());
+            java.sql.Array streamArray = filterStreams
+                    ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
+                    : null;
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                int p = 1;
+                statement.setArray(p++, genArray);
+                statement.setString(p++, storeKey);
+                statement.setInt(p++, idScope);
+                if (streamArray != null)
+                    statement.setArray(p++, streamArray);
+                statement.setString(p++, storeKey);
+                statement.setInt(p++, idScope);
+                if (streamArray != null)
+                    statement.setArray(p, streamArray);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next())
+                        mutated.add(result.getLong(1));
+                }
+            } finally {
+                genArray.free();
+                if (streamArray != null)
+                    streamArray.free();
+            }
+            return mutated;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot resolve mutated observation IDs in generations", e);
+        }
+    }
+
+    public record LegacyTombstoneTarget(long observationId, UUID generationId) {}
+
+    public List<LegacyTombstoneTarget> loadObservationTombstonesMissingDataStream(int limit) {
+        if (limit <= 0)
+            return List.of();
+        String sql = "SELECT tombstone.subject_id::bigint, tombstone.generation_id " +
+                "FROM oscar_tombstone tombstone " +
+                "JOIN oscar_archive_generation g ON g.id=tombstone.generation_id " +
+                "WHERE tombstone.store_key=? AND tombstone.id_scope=? " +
+                "AND tombstone.subject_type='OBSERVATION' AND tombstone.datastream_id IS NULL " +
+                "AND tombstone.subject_id ~ '^[0-9]+$' " +
+                "AND g.store_key=tombstone.store_key AND g.id_scope=tombstone.id_scope " +
+                "AND g.state IN ('ACTIVE','SEALED') " +
+                "ORDER BY tombstone.deleted_at DESC LIMIT ?";
+        List<LegacyTombstoneTarget> targets = new ArrayList<>();
+        try (Connection connection = connections.open();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            connection.setReadOnly(true);
+            statement.setString(1, storeKey);
+            statement.setInt(2, idScope);
+            statement.setInt(3, limit);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    targets.add(new LegacyTombstoneTarget(
+                            result.getLong(1), result.getObject(2, UUID.class)));
+                }
+            }
+            return targets;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect legacy observation tombstones", e);
+        }
+    }
+
+    public Map<UUID, ArchiveGeneration> activeOrSealedGenerationsByIds(Collection<UUID> generationIds) {
+        if (generationIds == null || generationIds.isEmpty())
+            return Map.of();
+        String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
+                "FROM oscar_archive_generation g " +
+                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                "AND g.id=ANY (?::uuid[])";
+        Map<UUID, ArchiveGeneration> byId = new HashMap<>();
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            java.sql.Array genArray = connection.createArrayOf("uuid", generationIds.toArray());
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, storeKey);
+                statement.setInt(2, idScope);
+                statement.setArray(3, genArray);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next()) {
+                        ArchiveGeneration gen = readGeneration(result);
+                        byId.put(gen.id(), gen);
+                    }
+                }
+            } finally {
+                genArray.free();
+            }
+            return byId;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot load archive generations by ID", e);
+        }
+    }
+
+    public void updateTombstoneDataStreams(Map<Long, Long> dataStreamByObservationId) {
+        if (dataStreamByObservationId == null || dataStreamByObservationId.isEmpty())
+            return;
+        try (Connection connection = connections.open()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try (PreparedStatement update = connection.prepareStatement(
+                    "UPDATE oscar_tombstone SET datastream_id=? " +
+                            "WHERE store_key=? AND id_scope=? AND subject_type='OBSERVATION' " +
+                            "AND subject_id=? AND datastream_id IS NULL")) {
+                for (Map.Entry<Long, Long> entry : dataStreamByObservationId.entrySet()) {
+                    if (entry.getKey() == null || entry.getValue() == null)
+                        continue;
+                    update.setLong(1, entry.getValue());
+                    update.setString(2, storeKey);
+                    update.setInt(3, idScope);
+                    update.setString(4, Long.toString(entry.getKey()));
+                    update.addBatch();
+                }
+                update.executeBatch();
+                connection.commit();
+            } catch (Exception error) {
+                connection.rollback();
+                throw error;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot backfill observation tombstone datastream IDs", e);
+        }
+    }
+
     private String buildOverlayQuerySql(String projection, ObsFilter filter,
                                         Set<Long> dataStreams, Set<Long> fois,
                                         List<QueryParameter> parameters) {
@@ -4238,6 +4417,13 @@ public final class ArchiveCatalog {
                                      UUID generationId, String reason, String policy,
                                      ActiveRemovalHolds holds)
             throws SQLException {
+        return tombstoneIfAbsent(connection, observationId, generationId, null, reason, policy, holds);
+    }
+
+    public boolean tombstoneIfAbsent(Connection connection, long observationId,
+                                     UUID generationId, Long dataStreamId, String reason, String policy,
+                                     ActiveRemovalHolds holds)
+            throws SQLException {
         if (connection == null)
             throw new IllegalArgumentException("A transaction connection is required");
         if (generationId == null)
@@ -4245,8 +4431,8 @@ public final class ArchiveCatalog {
         requireTransaction(connection);
         requireRemovalAllowed(holds, observationId, generationId);
         try (PreparedStatement statement = connection.prepareStatement(
-                "INSERT INTO oscar_tombstone(store_key, id_scope, subject_type, subject_id, generation_id, reason, policy) " +
-                        "SELECT ?, ?, 'OBSERVATION', ?, generation.id, ?, ? " +
+                "INSERT INTO oscar_tombstone(store_key, id_scope, subject_type, subject_id, generation_id, datastream_id, reason, policy) " +
+                        "SELECT ?, ?, 'OBSERVATION', ?, generation.id, ?, ?, ? " +
                         "FROM oscar_archive_generation generation WHERE generation.id=? " +
                         "AND generation.store_key=? AND generation.id_scope=? " +
                         "AND generation.state IN ('ACTIVE','SEALED') " +
@@ -4254,11 +4440,15 @@ public final class ArchiveCatalog {
             statement.setString(1, storeKey);
             statement.setInt(2, idScope);
             statement.setString(3, Long.toString(observationId));
-            statement.setString(4, reason);
-            statement.setString(5, policy);
-            statement.setObject(6, generationId);
-            statement.setString(7, storeKey);
-            statement.setInt(8, idScope);
+            if (dataStreamId == null)
+                statement.setNull(4, Types.BIGINT);
+            else
+                statement.setLong(4, dataStreamId);
+            statement.setString(5, reason);
+            statement.setString(6, policy);
+            statement.setObject(7, generationId);
+            statement.setString(8, storeKey);
+            statement.setInt(9, idScope);
             int inserted = statement.executeUpdate();
             if (inserted == 1) {
                 deleteFromLatestIfPresent(connection, observationId);

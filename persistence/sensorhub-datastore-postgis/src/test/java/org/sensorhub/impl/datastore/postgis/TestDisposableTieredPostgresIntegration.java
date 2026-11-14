@@ -5519,6 +5519,147 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertEquals(3, untimedSummary.remainingCandidates().size());
     }
 
+    @Test
+    public void unrelatedStreamTombstonesAndLegacyBackfillKeepLatestPushdownScoped() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        BigId streamA = addAlarmDataStream(bigId(1101), "gammaCounts");
+        BigId streamB = addAlarmDataStream(bigId(1102), "gammaCounts");
+        Instant base = Instant.parse("2026-10-10T00:00:00Z");
+
+        tiered.add(alarmObs(streamA, base.plusSeconds(10), base.plusSeconds(11), false, false, 10.0));
+        BigId streamALatestId = tiered.add(alarmObs(streamA, base.plusSeconds(20), base.plusSeconds(21), false, false, 20.0));
+        tiered.add(alarmObs(streamB, base.plusSeconds(15), base.plusSeconds(16), false, false, 100.0));
+        tiered.add(alarmObs(streamB, base.plusSeconds(25), base.plusSeconds(26), false, false, 200.0));
+        forceReadBackFromStorage();
+
+        tiered.archiveWindow(base, base.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        try (Connection connection = open();
+             PreparedStatement purgeHot = connection.prepareStatement(
+                     "DELETE FROM " + TABLE + " WHERE datastreamid IN (?, ?)")) {
+            purgeHot.setLong(1, streamA.getIdAsLong());
+            purgeHot.setLong(2, streamB.getIdAsLong());
+            assertEquals(4, purgeHot.executeUpdate());
+        }
+
+        // Delete all cold observations on streamB via removeEntries (exercising findArchiveOwner datastream_id persistence).
+        long removedOnB = tiered.removeEntries(new ObsFilter.Builder().withDataStreams(streamB).build());
+        assertEquals(2L, removedOnB);
+
+        var breakdownA = tiered.getArchiveCatalog().countObservationMutationBreakdown(Set.of(streamA.getIdAsLong()));
+        assertEquals("Tombstones on streamB must not pollute mutation count for streamA", 0L, breakdownA.total());
+        var breakdownB = tiered.getArchiveCatalog().countObservationMutationBreakdown(Set.of(streamB.getIdAsLong()));
+        assertEquals(2L, breakdownB.tombstoneCount());
+
+        // Simulate legacy pre-upgrade tombstones with datastream_id IS NULL and verify lifecycle backfill restores scoping.
+        try (Connection connection = open();
+             PreparedStatement clearDs = connection.prepareStatement(
+                     "UPDATE oscar_tombstone SET datastream_id = NULL WHERE store_key = ? AND subject_type = 'OBSERVATION'")) {
+            clearDs.setString(1, TABLE);
+            assertEquals(2, clearDs.executeUpdate());
+        }
+        assertEquals("Before backfill, shared-generation NULL datastream_id conservatively counts",
+                2L, tiered.getArchiveCatalog().countObservationMutationBreakdown(Set.of(streamA.getIdAsLong())).tombstoneCount());
+
+        tiered.maintainArchiveLifecycle();
+        assertEquals("After backfill from cold Parquet metadata, streamA mutation count returns to 0",
+                0L, tiered.getArchiveCatalog().countObservationMutationBreakdown(Set.of(streamA.getIdAsLong())).total());
+
+        try (var latestRes = tiered.selectEntries(new ObsFilter.Builder()
+                .withDataStreams(streamA, streamB)
+                .withLatestResult()
+                .build())) {
+            var rows = latestRes.toList();
+            assertEquals(1, rows.size());
+            assertEquals(streamALatestId, rows.get(0).getKey());
+            assertEquals(20.0, rows.get(0).getValue().getResult().getDoubleValue(2), 1e-6);
+        }
+        try (var latestPhen = tiered.selectEntries(new ObsFilter.Builder()
+                .withDataStreams(streamA, streamB)
+                .withPhenomenonTime()
+                .withLatestTime()
+                .done()
+                .build())) {
+            var rows = latestPhen.toList();
+            assertEquals(1, rows.size());
+            assertEquals(streamALatestId, rows.get(0).getKey());
+        }
+    }
+
+    @Test
+    public void latestPushdownHandlesHotAndColdTombstonesAndOverlaysExact() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        BigId coldStream = addAlarmDataStream(bigId(1103), "gammaCounts");
+        BigId hotStream = addAlarmDataStream(bigId(1104), "gammaCounts");
+        Instant base = Instant.parse("2026-10-11T00:00:00Z");
+
+        BigId c1 = tiered.add(alarmObs(coldStream, base.plusSeconds(10), base.plusSeconds(10), false, false, 10.0));
+        BigId c2 = tiered.add(alarmObs(coldStream, base.plusSeconds(20), base.plusSeconds(20), false, false, 20.0));
+        BigId c3 = tiered.add(alarmObs(coldStream, base.plusSeconds(30), base.plusSeconds(30), false, false, 30.0));
+
+        BigId h1 = tiered.add(alarmObs(hotStream, base.plusSeconds(100), base.plusSeconds(100), false, false, 100.0));
+        BigId h2 = tiered.add(alarmObs(hotStream, base.plusSeconds(110), base.plusSeconds(110), false, false, 110.0));
+        BigId h3 = tiered.add(alarmObs(hotStream, base.plusSeconds(120), base.plusSeconds(120), false, false, 120.0));
+        forceReadBackFromStorage();
+
+        tiered.archiveWindow(base, base.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        // Purge only coldStream from hot table so coldStream exercises pure cold Parquet while hotStream exercises overlap/hot LATERAL.
+        try (Connection connection = open();
+             PreparedStatement purgeColdStream = connection.prepareStatement(
+                     "DELETE FROM " + TABLE + " WHERE datastreamid = ?")) {
+            purgeColdStream.setLong(1, coldStream.getIdAsLong());
+            assertEquals(3, purgeColdStream.executeUpdate());
+        }
+
+        // 1. Delete newest cold observation (c3) and newest hot observation (h3) -> c2 and h2 must win.
+        assertNotNull(tiered.remove(c3));
+        assertNotNull(tiered.remove(h3));
+
+        assertLatestPerStreamEquals(tiered, coldStream, hotStream, c2, 20.0, h2, 110.0);
+
+        // 2. Overlay c1 forward to t+40s (40.0) and regress h2 backward to t+90s (90.0) -> c1 (40.0) and h1 (100.0) must win!
+        tiered.put(c1, alarmObs(coldStream, base.plusSeconds(40), base.plusSeconds(40), false, false, 40.0));
+        tiered.put(h2, alarmObs(hotStream, base.plusSeconds(90), base.plusSeconds(90), false, false, 90.0));
+
+        assertLatestPerStreamEquals(tiered, coldStream, hotStream, c1, 40.0, h1, 100.0);
+
+        // 3. Delete overlaid c1 and overlay h1 forward to t+150s (150.0) -> c2 (20.0) and h1 (150.0) must win!
+        assertNotNull(tiered.remove(c1));
+        tiered.put(h1, alarmObs(hotStream, base.plusSeconds(150), base.plusSeconds(150), false, false, 150.0));
+
+        assertLatestPerStreamEquals(tiered, coldStream, hotStream, c2, 20.0, h1, 150.0);
+    }
+
+    private static void assertLatestPerStreamEquals(
+            OscarTieredObsStore tiered, BigId stream1, BigId stream2,
+            BigId expectedId1, double expectedVal1, BigId expectedId2, double expectedVal2) {
+        try (var s = tiered.selectEntries(new ObsFilter.Builder()
+                .withDataStreams(stream1, stream2)
+                .withLatestResult()
+                .build())) {
+            Map<Long, Map.Entry<BigId, IObsData>> byStream = s.collect(Collectors.toMap(
+                    e -> e.getValue().getDataStreamID().getIdAsLong(), e -> e));
+            assertEquals(2, byStream.size());
+            assertEquals(expectedId1, byStream.get(stream1.getIdAsLong()).getKey());
+            assertEquals(expectedVal1, byStream.get(stream1.getIdAsLong()).getValue().getResult().getDoubleValue(2), 1e-6);
+            assertEquals(expectedId2, byStream.get(stream2.getIdAsLong()).getKey());
+            assertEquals(expectedVal2, byStream.get(stream2.getIdAsLong()).getValue().getResult().getDoubleValue(2), 1e-6);
+        }
+        try (var s = tiered.selectEntries(new ObsFilter.Builder()
+                .withDataStreams(stream1, stream2)
+                .withPhenomenonTime()
+                .withLatestTime()
+                .done()
+                .build())) {
+            Map<Long, Map.Entry<BigId, IObsData>> byStream = s.collect(Collectors.toMap(
+                    e -> e.getValue().getDataStreamID().getIdAsLong(), e -> e));
+            assertEquals(2, byStream.size());
+            assertEquals(expectedId1, byStream.get(stream1.getIdAsLong()).getKey());
+            assertEquals(expectedVal1, byStream.get(stream1.getIdAsLong()).getValue().getResult().getDoubleValue(2), 1e-6);
+            assertEquals(expectedId2, byStream.get(stream2.getIdAsLong()).getKey());
+            assertEquals(expectedVal2, byStream.get(stream2.getIdAsLong()).getValue().getResult().getDoubleValue(2), 1e-6);
+        }
+    }
+
     private static String toPostgresPositionalSql(String jdbcSql) {
         StringBuilder out = new StringBuilder();
         int index = 1;

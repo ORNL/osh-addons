@@ -1021,6 +1021,70 @@ public class TestParquetArchiveReader {
                 () -> reader.countCql(generations, fullRangeFault, null, null, Set.of()));
     }
 
+    @Test
+    public void latestStreamExcludesMutatedRowsBeforePerStreamRankingAndAdvancesToOlderCluster() throws Exception {
+        Path root = temporary.newFolder("latest-mutated-pushdown").toPath();
+        Files.createDirectories(root.resolve("datasets/observations/date=2026-01-01/profile=RAW_GATED"));
+
+        Instant olderStart = Instant.parse("2026-01-01T00:00:00Z");
+        Instant olderEnd = Instant.parse("2026-01-01T01:00:00Z");
+        ArchiveGeneration rawOlder = writeGeneration(root,
+                "datasets/observations/date=2026-01-01/profile=RAW_GATED/older.parquet",
+                new TestRow[]{
+                        new TestRow(10L, 100L, "2026-01-01T00:10:00Z"),
+                        new TestRow(20L, 200L, "2026-01-01T00:20:00Z")
+                });
+        ArchiveGeneration older = new ArchiveGeneration(
+                rawOlder.id(), "RAW_GATED", olderStart, olderEnd, rawOlder.objectPath(),
+                rawOlder.sha256(), rawOlder.rowCount(), 10L, 20L, "SEALED", true);
+
+        Instant newerStart = Instant.parse("2026-01-01T01:00:00Z");
+        Instant newerEnd = Instant.parse("2026-01-01T02:00:00Z");
+        ArchiveGeneration rawNewer = writeGeneration(root,
+                "datasets/observations/date=2026-01-01/profile=RAW_GATED/newer.parquet",
+                new TestRow[]{
+                        new TestRow(11L, 100L, "2026-01-01T01:10:00Z"),
+                        new TestRow(12L, 100L, "2026-01-01T01:20:00Z"),
+                        new TestRow(21L, 200L, "2026-01-01T01:15:00Z")
+                });
+        ArchiveGeneration newer = new ArchiveGeneration(
+                rawNewer.id(), "RAW_GATED", newerStart, newerEnd, rawNewer.objectPath(),
+                rawNewer.sha256(), rawNewer.rowCount(), 11L, 21L, "SEALED", true);
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+        ObsFilter latestResult = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(4, 100L), BigId.fromLong(4, 200L))
+                .withLatestResult()
+                .build();
+
+        // Stream 100's newest row (12) and stream 200's only row in newer cluster (21) are mutated:
+        // stream 100 must promote row 11 in newer cluster; stream 200 must advance to older cluster row 20.
+        try (Stream<ParquetArchiveReader.ArchivedRow> s = reader.stream(
+                List.of(older, newer), latestResult, Set.of(100L, 200L), null, Long.MAX_VALUE,
+                clusterIds -> clusterIds.contains(newer.id()) ? Set.of(12L, 21L) : Set.of())) {
+            var rows = s.toList();
+            assertEquals(2, rows.size());
+            assertEquals(Set.of(11L, 20L),
+                    rows.stream().map(r -> r.observation().id()).collect(java.util.stream.Collectors.toSet()));
+        }
+
+        // Also exercise the > 4096 mutated IDs Java-side exclusion path.
+        Set<Long> hugeMutated = new java.util.HashSet<>();
+        for (long synthetic = 10_000L; synthetic < 14_105L; synthetic++) {
+            hugeMutated.add(synthetic);
+        }
+        hugeMutated.add(12L);
+        hugeMutated.add(21L);
+        try (Stream<ParquetArchiveReader.ArchivedRow> s = reader.stream(
+                List.of(older, newer), latestResult, Set.of(100L, 200L), null, Long.MAX_VALUE,
+                clusterIds -> clusterIds.contains(newer.id()) ? hugeMutated : Set.of())) {
+            var rows = s.toList();
+            assertEquals(2, rows.size());
+            assertEquals(Set.of(11L, 20L),
+                    rows.stream().map(r -> r.observation().id()).collect(java.util.stream.Collectors.toSet()));
+        }
+    }
+
     private record TestRow(long id, long dataStreamId, String time, String resultJson) {
         private TestRow(long id, long dataStreamId, String time) {
             this(id, dataStreamId, time, "{\"value\":" + id + "}");

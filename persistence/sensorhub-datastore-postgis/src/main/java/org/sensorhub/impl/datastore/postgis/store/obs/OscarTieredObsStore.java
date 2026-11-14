@@ -95,6 +95,8 @@ import java.util.stream.StreamSupport;
  * Parquet generations are merged transparently with mutation overlays and tombstones.
  */
 public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
+    private static final org.slf4j.Logger LOG =
+            org.slf4j.LoggerFactory.getLogger(OscarTieredObsStore.class);
     private static final Instant MIN_ARCHIVE_TIME = Instant.parse("1000-01-01T00:00:00Z");
     private static final Instant MAX_ARCHIVE_TIME = Instant.parse("3000-01-01T00:00:00Z");
     private static final Duration MINIMUM_ARCHIVE_WINDOW = Duration.ofSeconds(1);
@@ -173,6 +175,9 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             this.archiveLifecycle = new ArchiveLifecycleManager(connectionManager::getConnection, archiveCatalog,
                     archiveConfig, dataStoreName);
             this.archiveReader = new ParquetArchiveReader(Path.of(archiveConfig.rootDirectory), archiveConfig);
+            if (archiveConfig.enabled) {
+                backfillLegacyTombstoneDataStreams(2_000);
+            }
             if (archiveConfig.isParquetPrimary()) {
                 this.immutableStage = new ImmutableObservationStageManager(
                         connectionManager::getConnection, archiveCatalog, archiveConfig,
@@ -259,6 +264,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             immutableStage.retireVerifiedPartitions();
         archiveCatalog.backfillGenerationSummariesBatch(Path.of(archiveConfig.rootDirectory), 100);
         archiveCatalog.migrateLegacyOverlaySchemas(250);
+        backfillLegacyTombstoneDataStreams(500);
         long now = System.currentTimeMillis();
         long previous = lastMutableReindexEpochMillis.get();
         if (now - previous >= MUTABLE_INDEX_REINDEX_INTERVAL.toMillis() &&
@@ -868,6 +874,12 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     ObsFilter.Builder.from(related.filter()).withLimit(Long.MAX_VALUE).build();
             boolean parentTableOnly = isAllMutableOnlyDataStreams(related.dataStreams());
             int initialHotPageSize = adaptiveInitialPageSize(filter.getLimit());
+            if (queryBuilder.supportsLatestResultPerDataStreamQuery(unbounded)) {
+                Stream<Entry<BigId, IObsData>> hot = selectLatestPerDataStreamEntries(
+                        unbounded, fields, parentTableOnly, initialHotPageSize,
+                        this::buildUntombstonedHotCandidatePredicate);
+                return limitAndClose(hot, filter.getLimit());
+            }
             int mutationBatchSize = adaptiveMutationBatchSize(filter.getLimit());
             Stream<Entry<BigId, IObsData>> hot = super.selectEntries(
                     unbounded, fields, parentTableOnly, initialHotPageSize);
@@ -892,10 +904,10 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 : new ArchiveCatalog.MutationCounts(0L, 0L);
         long mutationCount = mutationCounts.total();
         boolean effectiveHasMutations = mutationCount > 0L;
-        boolean hasTombstones = mutationCounts.tombstoneCount() > 0L;
+        boolean hasOverlays = mutationCounts.overlayCount() > 0L;
         boolean parentTableOnly = isAllMutableOnlyDataStreams(dataStreams);
         boolean latest = hasLatestSelection(filter);
-        boolean pushDownLatest = latest && !hasTombstones &&
+        boolean pushDownLatest = latest &&
                 queryBuilder.supportsLatestResultPerDataStreamQuery(resolvedFilter);
 
         // The top N of a union can only contain rows from the top N of either
@@ -934,21 +946,28 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         Stream<Entry<BigId, IObsData>> hot;
         Stream<Entry<BigId, IObsData>> cold;
         if (parentTableOnly) {
-            hot = super.selectEntries(tierFilter, (Set<ObsField>) null,
-                    true, initialHotPageSize);
-            if (effectiveHasMutations)
-                hot = excludeMutated(hot, entry -> entry.getKey().getIdAsLong(), mutationBatchSize);
+            if (pushDownLatest && effectiveHasMutations) {
+                hot = selectLatestPerDataStreamEntries(
+                        tierFilter, null, true, initialHotPageSize,
+                        this::buildUnmutatedHotCandidatePredicate);
+            } else {
+                hot = super.selectEntries(tierFilter, (Set<ObsField>) null,
+                        true, initialHotPageSize);
+                if (effectiveHasMutations)
+                    hot = excludeMutated(hot, entry -> entry.getKey().getIdAsLong(), mutationBatchSize);
+            }
             cold = Stream.empty();
         } else if (pushDownLatest && dataStreams != null && !dataStreams.isEmpty()) {
             List<Entry<BigId, IObsData>> hotEntries;
-            try (Stream<Entry<BigId, IObsData>> hotStream =
-                         super.selectEntries(tierFilter, (Set<ObsField>) null,
-                                 false, initialHotPageSize)) {
+            try (Stream<Entry<BigId, IObsData>> hotStream = effectiveHasMutations
+                    ? selectLatestPerDataStreamEntries(
+                            tierFilter, null, false, initialHotPageSize,
+                            this::buildUnmutatedHotCandidatePredicate)
+                    : super.selectEntries(tierFilter, (Set<ObsField>) null,
+                            false, initialHotPageSize)) {
                 hotEntries = hotStream.toList();
             }
-            hot = effectiveHasMutations
-                    ? excludeMutated(hotEntries.stream(), entry -> entry.getKey().getIdAsLong(), mutationBatchSize)
-                    : hotEntries.stream();
+            hot = hotEntries.stream();
             cold = streamColdBasesForLatest(tierFilter, tierLimit,
                     dataStreams, fois, hotEntries, effectiveHasMutations);
         } else if (boundedMerge && filter.getLimit() <= STREAM_FETCH_SIZE) {
@@ -984,7 +1003,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 : 1_000;
         Stream<Entry<BigId, IObsData>> overlays = parentTableOnly
                 ? Stream.empty()
-                : streamOverlays(tierFilter, dataStreams, fois, effectiveHasMutations, overlayInitialPageSize);
+                : streamOverlays(tierFilter, dataStreams, fois, hasOverlays, overlayInitialPageSize);
 
         // Each source is already ordered by phenomenon time and ID. Merge it
         // lazily so cold payloads are never accumulated in a JVM collection.
@@ -1343,9 +1362,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             Set<Long> dataStreams, Set<Long> fois, boolean hasMutations, int mutationBatchSize) {
         if (effectiveCandidates.isEmpty())
             return Stream.empty();
-        Stream<ParquetArchiveReader.ArchivedRow> rows = archiveReader.stream(
-                effectiveCandidates, filter, dataStreams, fois, readerLimit);
-        if (hasMutations)
+        boolean pushDownMutatedIdsForLatest = hasMutations && hasLatestSelection(filter);
+        Stream<ParquetArchiveReader.ArchivedRow> rows = pushDownMutatedIdsForLatest
+                ? archiveReader.stream(
+                        effectiveCandidates, filter, dataStreams, fois, readerLimit,
+                        clusterGenIds -> archiveCatalog.mutatedObservationIdsInGenerations(
+                                clusterGenIds, dataStreams))
+                : archiveReader.stream(
+                        effectiveCandidates, filter, dataStreams, fois, readerLimit);
+        if (hasMutations && !pushDownMutatedIdsForLatest)
             rows = excludeMutated(rows, row -> row.observation().id(), mutationBatchSize);
         return rows
                 .map(row -> {
@@ -2871,18 +2896,20 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         }
     }
 
-    private java.util.Optional<UUID> findArchiveGeneration(Connection connection,
-                                                            long observationId) throws Exception {
+    private record ArchiveOwner(UUID generationId, long dataStreamId) {}
+
+    private java.util.Optional<ArchiveOwner> findArchiveOwner(Connection connection,
+                                                              long observationId) throws Exception {
         List<ArchiveGeneration> candidates = archiveCatalog.candidates(
                 connection, MIN_ARCHIVE_TIME, MAX_ARCHIVE_TIME, observationId);
         if (candidates.isEmpty())
             return java.util.Optional.empty();
         ObsFilter filter = new ObsFilter.Builder()
                 .withInternalIDs(BigId.fromLong(idScope, observationId)).build();
-        UUID[] generation = {null};
+        ArchiveOwner[] owner = {null};
         archiveReader.forEachMetadata(candidates, filter, null, null, 1,
-                row -> generation[0] = row.generation().id());
-        return java.util.Optional.ofNullable(generation[0]);
+                row -> owner[0] = new ArchiveOwner(row.generation().id(), row.dataStreamId()));
+        return java.util.Optional.ofNullable(owner[0]);
     }
 
     @Override
@@ -2915,7 +2942,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     // deletion; the exact-generation tombstone is the logical
                     // deletion.
                     archiveCatalog.tombstoneIfAbsent(connection, observationId,
-                            previous.generationId(), "Removed through IObsStore",
+                            previous.generationId(), previous.dataStreamId(),
+                            "Removed through IObsStore",
                             "USER_OR_SYSTEM_DELETE", holds);
                     if (!archiveConfig.enabled) {
                         try (PreparedStatement delete = connection.prepareStatement(
@@ -3371,7 +3399,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         }
                         if (current.generationId() != null) {
                             boolean tombstoned = archiveCatalog.tombstoneIfAbsent(connection, id,
-                                    current.generationId(), "Removed through IObsStore filter",
+                                    current.generationId(), current.dataStreamId(),
+                                    "Removed through IObsStore filter",
                                     "USER_OR_SYSTEM_DELETE", holds);
                             if (!archiveConfig.enabled) {
                                 try (PreparedStatement delete = connection.prepareStatement(
@@ -3413,18 +3442,20 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                             continue;
                         }
                         if (archiveCatalog.tombstoneIfAbsent(connection, id,
-                                overlayCurrent.generationId(), "Removed through IObsStore filter",
+                                overlayCurrent.generationId(), overlayCurrent.dataStreamId(),
+                                "Removed through IObsStore filter",
                                 "USER_OR_SYSTEM_DELETE", holds)) {
                             removed = Math.addExact(removed, 1L);
                         }
                         continue;
                     }
 
-                    java.util.Optional<UUID> generation = findArchiveGeneration(connection, id);
-                    if (generation.isPresent() && holds.blocks(id, generation.get())) {
+                    java.util.Optional<ArchiveOwner> owner = findArchiveOwner(connection, id);
+                    if (owner.isPresent() && holds.blocks(id, owner.get().generationId())) {
                         heldObservationIds.add(id);
-                    } else if (generation.isPresent() && archiveCatalog.tombstoneIfAbsent(
-                            connection, id, generation.get(), "Removed through IObsStore filter",
+                    } else if (owner.isPresent() && archiveCatalog.tombstoneIfAbsent(
+                            connection, id, owner.get().generationId(), owner.get().dataStreamId(),
+                            "Removed through IObsStore filter",
                             "USER_OR_SYSTEM_DELETE", holds)) {
                         removed = Math.addExact(removed, 1L);
                     }
@@ -4292,6 +4323,99 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                             "AND g.id_scope=tombstone.id_scope AND g.state IN ('ACTIVE','SEALED')))");
         }
         return clause.toString();
+    }
+
+    private String buildUnmutatedHotCandidatePredicate(String alias) {
+        String escapedTbl = getDatastoreName().replace("'", "''");
+        return "NOT EXISTS (SELECT 1 FROM oscar_obs_overlay overlay_row " +
+                "JOIN oscar_archive_generation g ON g.id=overlay_row.generation_id " +
+                "WHERE overlay_row.observation_id=" + alias + ".id " +
+                "AND overlay_row.store_key='" + escapedTbl + "' " +
+                "AND overlay_row.id_scope=" + idScope +
+                " AND g.store_key=overlay_row.store_key AND g.id_scope=overlay_row.id_scope " +
+                "AND g.state IN ('ACTIVE','SEALED')) " +
+                "AND NOT EXISTS (SELECT 1 FROM oscar_tombstone tombstone " +
+                "WHERE tombstone.subject_type='OBSERVATION' " +
+                "AND tombstone.store_key='" + escapedTbl + "' " +
+                "AND tombstone.id_scope=" + idScope +
+                " AND tombstone.subject_id=" + alias + ".id::text " +
+                "AND tombstone.generation_id IS NOT NULL " +
+                "AND EXISTS (SELECT 1 FROM oscar_archive_generation g " +
+                "WHERE g.id=tombstone.generation_id AND g.store_key=tombstone.store_key " +
+                "AND g.id_scope=tombstone.id_scope AND g.state IN ('ACTIVE','SEALED')))";
+    }
+
+    private String buildUntombstonedHotCandidatePredicate(String alias) {
+        String escapedTbl = getDatastoreName().replace("'", "''");
+        return "NOT EXISTS (SELECT 1 FROM oscar_tombstone tombstone " +
+                "WHERE tombstone.subject_type='OBSERVATION' " +
+                "AND tombstone.store_key='" + escapedTbl + "' " +
+                "AND tombstone.id_scope=" + idScope +
+                " AND tombstone.subject_id=" + alias + ".id::text)";
+    }
+
+    private void backfillLegacyTombstoneDataStreams(int limit) {
+        if (!archiveConfig.enabled || limit <= 0)
+            return;
+        List<ArchiveCatalog.LegacyTombstoneTarget> missing =
+                archiveCatalog.loadObservationTombstonesMissingDataStream(limit);
+        if (missing.isEmpty())
+            return;
+        Map<Long, Long> resolved = new HashMap<>(missing.size());
+        Long[] allIds = missing.stream()
+                .map(ArchiveCatalog.LegacyTombstoneTarget::observationId)
+                .distinct()
+                .toArray(Long[]::new);
+        String hotSql = "SELECT id, datastreamid FROM " + getDatastoreName() +
+                " WHERE id = ANY(?::bigint[])";
+        try (Connection connection = this.connectionManager.getConnection()) {
+            connection.setReadOnly(true);
+            java.sql.Array idArray = connection.createArrayOf("bigint", allIds);
+            try (PreparedStatement statement = connection.prepareStatement(hotSql)) {
+                statement.setArray(1, idArray);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next()) {
+                        resolved.put(result.getLong(1), result.getLong(2));
+                    }
+                }
+            } finally {
+                idArray.free();
+            }
+        } catch (SQLException e) {
+            LOG.warn("Unable to inspect hot tier while backfilling legacy tombstone datastreams", e);
+        }
+
+        Map<UUID, List<Long>> coldIdsByGen = new HashMap<>();
+        for (ArchiveCatalog.LegacyTombstoneTarget target : missing) {
+            if (!resolved.containsKey(target.observationId()) && target.generationId() != null) {
+                coldIdsByGen.computeIfAbsent(target.generationId(), ignored -> new ArrayList<>())
+                        .add(target.observationId());
+            }
+        }
+        if (!coldIdsByGen.isEmpty()) {
+            Map<UUID, ArchiveGeneration> generations =
+                    archiveCatalog.activeOrSealedGenerationsByIds(coldIdsByGen.keySet());
+            for (Map.Entry<UUID, List<Long>> entry : coldIdsByGen.entrySet()) {
+                ArchiveGeneration generation = generations.get(entry.getKey());
+                if (generation == null)
+                    continue;
+                List<BigId> bigIds = entry.getValue().stream()
+                        .map(id -> BigId.fromLong(idScope, id))
+                        .toList();
+                ObsFilter filter = new ObsFilter.Builder().withInternalIDs(bigIds).build();
+                try {
+                    archiveReader.forEachMetadata(
+                            List.of(generation), filter, null, null, bigIds.size(),
+                            row -> resolved.put(row.id(), row.dataStreamId()));
+                } catch (RuntimeException e) {
+                    LOG.debug("Skipping cold legacy tombstone datastream backfill for generation {}",
+                            generation.id(), e);
+                }
+            }
+        }
+        if (!resolved.isEmpty()) {
+            archiveCatalog.updateTombstoneDataStreams(resolved);
+        }
     }
 
     private long countHotRows(ObsFilter filter, boolean parentTableOnly, String extraWhereClause) {

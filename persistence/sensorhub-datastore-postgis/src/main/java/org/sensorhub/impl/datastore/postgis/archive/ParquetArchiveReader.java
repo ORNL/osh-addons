@@ -266,6 +266,12 @@ public final class ParquetArchiveReader {
      */
     public Stream<ArchivedRow> stream(List<ArchiveGeneration> generations, ObsFilter filter,
                                       Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit) {
+        return stream(generations, filter, allowedDataStreams, allowedFois, limit, null);
+    }
+
+    public Stream<ArchivedRow> stream(List<ArchiveGeneration> generations, ObsFilter filter,
+                                      Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit,
+                                      Function<Collection<UUID>, Set<Long>> mutatedIdsByClusterLookup) {
         if (limit < 0)
             throw new IllegalArgumentException("Archive query limit cannot be negative");
         if (limit == 0 || generations.isEmpty() ||
@@ -278,9 +284,11 @@ public final class ParquetArchiveReader {
         boolean javaCql = filter.getCQLFilter() != null;
         if (!latestSelection && !javaCql && (limit != Long.MAX_VALUE || generations.size() > 1))
             return streamWindowClusters(generations, filter, allowedDataStreams, allowedFois, limit);
-        if (latestSelection && generations.size() > 1 && !javaCql &&
-                filter.getValuePredicate() == null && filter.getPhenomenonLocation() == null)
-            return streamLatestAcrossWindowClusters(generations, filter, allowedDataStreams, allowedFois, limit);
+        if (latestSelection && !javaCql &&
+                filter.getValuePredicate() == null && filter.getPhenomenonLocation() == null &&
+                (generations.size() > 1 || mutatedIdsByClusterLookup != null))
+            return streamLatestAcrossWindowClusters(
+                    generations, filter, allowedDataStreams, allowedFois, limit, mutatedIdsByClusterLookup);
 
         // CQL is evaluated against the decoded JSON map. It must run before
         // latest-per-stream selection and before LIMIT or matching rows can be
@@ -304,12 +312,17 @@ public final class ParquetArchiveReader {
         }
 
         if (javaLatest) {
+            Set<Long> mutatedIds = resolveClusterMutatedIds(generations, mutatedIdsByClusterLookup);
             Map<Long, ArchivedRow> latest = new HashMap<>();
             try (Stream<ArchivedRow> latestRows = rows) {
-                latestRows.forEach(row -> latest.merge(row.observation().dataStreamId(), row,
-                        (previous, candidate) -> later(candidate, previous,
-                                filter.getResultTime() != null && filter.getResultTime().isLatestTime())
-                                ? candidate : previous));
+                latestRows.forEach(row -> {
+                    if (!mutatedIds.isEmpty() && mutatedIds.contains(row.observation().id()))
+                        return;
+                    latest.merge(row.observation().dataStreamId(), row,
+                            (previous, candidate) -> later(candidate, previous,
+                                    filter.getResultTime() != null && filter.getResultTime().isLatestTime())
+                                    ? candidate : previous);
+                });
             }
             Stream<ArchivedRow> reduced = latest.values().stream().sorted(rowComparator(filter));
             return limit == Long.MAX_VALUE ? reduced : reduced.limit(limit);
@@ -357,16 +370,30 @@ public final class ParquetArchiveReader {
      * newest to oldest so that once every requested datastream has a non-null
      * timestamp in a newer cluster, older clusters do not need to be scanned.
      */
+    private static Set<Long> resolveClusterMutatedIds(
+            List<ArchiveGeneration> clusterGenerations,
+            Function<Collection<UUID>, Set<Long>> mutatedIdsByClusterLookup) {
+        if (mutatedIdsByClusterLookup == null || clusterGenerations.isEmpty())
+            return Set.of();
+        List<UUID> ids = clusterGenerations.stream().map(ArchiveGeneration::id).toList();
+        Set<Long> resolved = mutatedIdsByClusterLookup.apply(ids);
+        return resolved == null ? Set.of() : resolved;
+    }
+
     private Stream<ArchivedRow> streamLatestAcrossWindowClusters(
             List<ArchiveGeneration> generations, ObsFilter filter,
-            Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit) {
+            Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit,
+            Function<Collection<UUID>, Set<Long>> mutatedIdsByClusterLookup) {
         List<List<ArchiveGeneration>> clusters = windowClusters(generations);
         if (clusters.size() <= 1) {
-            AuthorizedObjects objects = authorize(generations);
-            if (objects.byFilename().isEmpty())
-                return Stream.empty();
-            return openRowStream(objects, auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
-                    true, true, limit), generations.size());
+            Set<Long> singleClusterMutated = resolveClusterMutatedIds(generations, mutatedIdsByClusterLookup);
+            if (singleClusterMutated.size() <= MAX_INLINE_MUTATION_EXCLUSIONS) {
+                AuthorizedObjects objects = authorize(generations);
+                if (objects.byFilename().isEmpty())
+                    return Stream.empty();
+                return openRowStream(objects, auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
+                        singleClusterMutated, true, true, limit, true), generations.size());
+            }
         }
 
         boolean latestResult = filter.getResultTime() != null && filter.getResultTime().isLatestTime();
@@ -417,11 +444,17 @@ public final class ParquetArchiveReader {
             if (objects.byFilename().isEmpty())
                 continue;
             final Set<Long> effectiveClusterStreams = clusterStreams;
+            final Set<Long> clusterMutatedIds = resolveClusterMutatedIds(
+                    clusterGenerations, mutatedIdsByClusterLookup);
+            final boolean pushDownMutated = clusterMutatedIds.size() <= MAX_INLINE_MUTATION_EXCLUSIONS;
             try (Stream<ArchivedRow> clusterRows = openRowStream(objects,
                     auth -> queryPlan(auth, filter, effectiveClusterStreams, allowedFois,
-                            true, true, Long.MAX_VALUE),
+                            pushDownMutated ? clusterMutatedIds : Set.of(),
+                            true, pushDownMutated, Long.MAX_VALUE, pushDownMutated),
                     clusterGenerations.size())) {
                 clusterRows.forEach(row -> {
+                    if (!pushDownMutated && clusterMutatedIds.contains(row.observation().id()))
+                        return;
                     long streamId = row.observation().dataStreamId();
                     bestByStream.merge(streamId, row,
                             (previous, candidate) -> later(candidate, previous, latestResult)
@@ -437,6 +470,7 @@ public final class ParquetArchiveReader {
         return limit == Long.MAX_VALUE ? ordered : ordered.limit(limit);
     }
 
+    private static final int MAX_INLINE_MUTATION_EXCLUSIONS = 4_096;
     private static final int MAX_RESULT_TIME_METADATA_BATCH = 64;
     private static final int MAX_CQL_PAYLOAD_BATCH = 64;
     private static final int LOCAL_STAGE_COPY_RETRIES = 3;
@@ -1774,6 +1808,15 @@ public final class ParquetArchiveReader {
                                 Set<Long> allowedDataStreams, Set<Long> allowedFois,
                                 boolean includeResult, boolean applyLatest, long limit,
                                 boolean ordered) {
+        return queryPlan(objects, filter, allowedDataStreams, allowedFois, Set.of(),
+                includeResult, applyLatest, limit, ordered);
+    }
+
+    private QueryPlan queryPlan(AuthorizedObjects objects, ObsFilter filter,
+                                Set<Long> allowedDataStreams, Set<Long> allowedFois,
+                                Set<Long> excludedObservationIds,
+                                boolean includeResult, boolean applyLatest, long limit,
+                                boolean ordered) {
         String columns = includeResult ? FULL_COLUMNS : METADATA_COLUMNS;
         String fileList = objects.byFilename().keySet().stream().map(path -> "'" + sqlLiteral(path) + "'")
                 .collect(Collectors.joining(","));
@@ -1783,6 +1826,8 @@ public final class ParquetArchiveReader {
 
         if (filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty())
             appendIn(source, "id_value", filter.getInternalIDs().stream().map(BigId::getIdAsLong).toList(), parameters);
+        if (excludedObservationIds != null && !excludedObservationIds.isEmpty())
+            appendNotIn(source, "id_value", excludedObservationIds.stream().sorted().toList(), parameters);
         if (allowedDataStreams != null)
             appendIn(source, "datastream_id", allowedDataStreams, parameters);
         if (allowedFois != null) {
@@ -2276,6 +2321,15 @@ public final class ParquetArchiveReader {
             return;
         }
         sql.append(" AND ").append(column).append(" IN (");
+        appendPlaceholders(sql, values.size());
+        sql.append(')');
+        parameters.addAll(values);
+    }
+
+    private static void appendNotIn(StringBuilder sql, String column, Collection<Long> values, List<Object> parameters) {
+        if (values == null || values.isEmpty())
+            return;
+        sql.append(" AND ").append(column).append(" NOT IN (");
         appendPlaceholders(sql, values.size());
         sql.append(')');
         parameters.addAll(values);

@@ -522,6 +522,14 @@ public class TestParameterizedQueryBuilder {
         assertTrue(latestOnly.sql().contains("FROM ONLY obs non_null"));
         assertTrue(latestOnly.sql().contains("FROM ONLY obs null_only"));
 
+        ParameterizedQuery latestFiltered = builder.createParameterizedLatestResultPerDataStreamQuery(
+                latestFilter, null, false,
+                alias -> "NOT EXISTS (SELECT 1 FROM oscar_tombstone t WHERE t.subject_id=" + alias + ".id::text)");
+        assertTrue(latestFiltered.sql().contains(
+                "AND (NOT EXISTS (SELECT 1 FROM oscar_tombstone t WHERE t.subject_id=non_null.id::text)) ORDER BY non_null.resultTime DESC"));
+        assertTrue(latestFiltered.sql().contains(
+                "AND (NOT EXISTS (SELECT 1 FROM oscar_tombstone t WHERE t.subject_id=null_only.id::text)) ORDER BY null_only.id DESC"));
+
         String autovacuum = builder.configureAutovacuumQuery();
         assertTrue(autovacuum.startsWith("ALTER TABLE obs SET ("));
         assertTrue(autovacuum.contains("autovacuum_vacuum_insert_scale_factor = 0.01"));

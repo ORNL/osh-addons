@@ -9,16 +9,20 @@ fresh OSCAR databases. Ordinary PostGIS stores and the default
 - PostgreSQL provides a short-lived, crash-recoverable landing tier. A write becomes durable
   when the normal OSH store `commit()` completes; `add()` alone is not a
   durability boundary because the batch store intentionally buffers writes.
-- Only output names in `archive.outputNames` are eligible (by default all 21
+- Only output names in `archive.outputNames` are eligible (by default all 22
   operational and evidentiary streams: `gammaCounts`, `gammaThreshold`,
   `neutronCounts`, `setupGamma`, `setupNeutron`, `speed`, `backgroundReport`,
   `foregroundReport`, `status`, `emlContextual`, `emlScanContextual`,
   `emlAnalysis`, `dailyFile`, `connectionStatus`, `occupancyStatus`, `tamper`,
-  `occupancy`, `adjudication`, `report`, `siteStatistics`, `nationalSummary`).
+  `occupancy`, `adjudication`, `report`, `siteStatistics`, `nationalSummary`,
+  `vehicleOcr`).
   Static singleton configuration streams (`sensorLocation`, `adjudicationCodes`,
   `siteInfo`) remain in `ONLY oscar.obs`. Mutations to archived observations
   (such as appending an adjudication ID onto an archived `occupancy` row) are
-  recorded in `oscar_obs_overlay` and synchronized with `oscar_obs_latest`.
+  recorded in `oscar_obs_overlay` and synchronized with `oscar_obs_latest`, while
+  `oscar_tombstone` records `datastream_id` (with startup backfill of legacy
+  `NULL` rows) so `resultTime=latest` pushdown remains active on datastreams
+  without tombstones or overlays.
   The storage class is recorded when a datastream first receives a
   row; changing that datastream ID between mutable and immutable classes is
   rejected. Export selects physical stage membership rather than re-reading a
@@ -172,7 +176,8 @@ does not provide.
       "adjudication",
       "report",
       "siteStatistics",
-      "nationalSummary"
+      "nationalSummary",
+      "vehicleOcr"
     ]
   }
 }
