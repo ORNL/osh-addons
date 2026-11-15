@@ -476,6 +476,29 @@ public class QueryBuilderObsStore extends QueryBuilder {
                 filter, fields, false, parentTableOnly, additionalSelectColumns);
     }
 
+    public ParameterizedQuery createParameterizedUnorderedSelectEntriesQueryWithCondition(
+            ObsFilter filter, Set<IObsStore.ObsField> fields, boolean parentTableOnly,
+            String extraWhereClause, Object... extraParameters) {
+        if ((filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
+                (filter.getResultTime() != null && filter.getResultTime().isLatestTime())) {
+            throw new IllegalArgumentException(
+                    "Latest observation selection requires its DISTINCT ON ordering");
+        }
+        SelectEntriesObsQuery selectEntriesObsQuery = new SelectEntriesObsQuery.Builder()
+                .tableName(this.getStoreTableName())
+                .linkTo(this.systemStore)
+                .linkTo(this.dataStreamStore)
+                .linkTo(this.foiStore)
+                .withFields(fields)
+                .withObsFilter(filter)
+                .parentTableOnly(parentTableOnly)
+                .withRawCondition(extraWhereClause, extraParameters)
+                .withLimit(filter.getLimit())
+                .withoutOrderByIf(true)
+                .build();
+        return selectEntriesObsQuery.toParameterizedQuery();
+    }
+
     private ParameterizedQuery createParameterizedSelectEntriesQuery(
             ObsFilter filter, Set<IObsStore.ObsField> fields, boolean ordered,
             boolean parentTableOnly, String... additionalSelectColumns) {

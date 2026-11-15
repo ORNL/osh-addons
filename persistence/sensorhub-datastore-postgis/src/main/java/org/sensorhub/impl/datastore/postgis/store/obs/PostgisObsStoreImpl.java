@@ -173,12 +173,25 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
     protected Stream<Entry<BigId, IObsData>> selectLatestPerDataStreamEntries(
             ObsFilter filter, Set<ObsField> fields, boolean parentTableOnly, int initialPageSize,
             java.util.function.Function<String, String> candidatePredicateByAlias) {
-        return selectEntries(filter, fields, parentTableOnly, initialPageSize, candidatePredicateByAlias);
+        return selectEntries(filter, fields, parentTableOnly, initialPageSize, candidatePredicateByAlias, null);
+    }
+
+    protected Stream<Entry<BigId, IObsData>> selectEntriesWithCondition(
+            ObsFilter filter, Set<ObsField> fields, boolean parentTableOnly, int initialPageSize,
+            String extraWhereClause) {
+        return selectEntries(filter, fields, parentTableOnly, initialPageSize, null, extraWhereClause);
     }
 
     private Stream<Entry<BigId, IObsData>> selectEntries(
             ObsFilter filter, Set<ObsField> fields, boolean parentTableOnly, int initialPageSize,
             java.util.function.Function<String, String> latestCandidatePredicateByAlias) {
+        return selectEntries(filter, fields, parentTableOnly, initialPageSize, latestCandidatePredicateByAlias, null);
+    }
+
+    private Stream<Entry<BigId, IObsData>> selectEntries(
+            ObsFilter filter, Set<ObsField> fields, boolean parentTableOnly, int initialPageSize,
+            java.util.function.Function<String, String> latestCandidatePredicateByAlias,
+            String extraWhereClause) {
         Set<ObsField> requestedFields = fields == null || fields.isEmpty()
                 ? null : Set.copyOf(fields);
         boolean projectAfterPredicate = filter.getValuePredicate() != null && requestedFields != null;
@@ -213,6 +226,9 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
             // supplies the final stable page order.
             query = queryBuilder.createParameterizedSelectEntriesQuery(
                     queryFilter, queryFields, parentTableOnly);
+        } else if (extraWhereClause != null && !extraWhereClause.isBlank()) {
+            query = queryBuilder.createParameterizedUnorderedSelectEntriesQueryWithCondition(
+                    queryFilter, queryFields, parentTableOnly, extraWhereClause);
         } else {
             query = queryBuilder.createParameterizedUnorderedSelectEntriesQuery(
                     queryFilter, queryFields, parentTableOnly);

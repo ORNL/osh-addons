@@ -84,6 +84,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.function.ToLongBiFunction;
 import java.util.function.ToLongFunction;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -105,6 +106,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private static final int REMOVE_BATCH_SIZE = 512;
     private static final int POINT_READ_COALESCER_BATCH = 64;
     private static final int OVERLAY_WRITE_COALESCER_BATCH = 64;
+    private static final int MAX_EAGER_NON_COLD_OFFSET_ROWS = 4_096;
+    private static final long MIN_SUMMARY_SKIP_OFFSET = 32L;
 
     private final TieredArchiveConfig archiveConfig;
     private final ArchiveCatalog archiveCatalog;
@@ -112,11 +115,16 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private final ArchiveLifecycleManager archiveLifecycle;
     private final ParquetArchiveReader archiveReader;
     private final ImmutableObservationStageManager immutableStage;
-    private final Map<String, IDataStreamInfo> archivedSchemas = new ConcurrentHashMap<>();
     private final Cache<String, IDataStreamInfo> decodedOverlaySchemas = CacheBuilder.newBuilder()
-            .maximumSize(512)
+            .maximumSize(1024)
             .expireAfterAccess(30, TimeUnit.MINUTES)
             .build();
+    private final Cache<String, String> generationStreamSchemaHashes = CacheBuilder.newBuilder()
+            .maximumSize(65_536)
+            .expireAfterAccess(30, TimeUnit.MINUTES)
+            .build();
+    private final java.util.concurrent.atomic.AtomicLong decodedArchivedResultCount =
+            new java.util.concurrent.atomic.AtomicLong();
     private final Cache<Long, CachedOverlaySchema> liveOverlaySchemas = CacheBuilder.newBuilder()
             .maximumSize(2048)
             .expireAfterAccess(30, TimeUnit.MINUTES)
@@ -890,6 +898,243 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         return selectTieredEntries(filter, fields, archiveCatalog.hasObservationMutations());
     }
 
+    public long getDecodedArchivedResultCountForTesting() {
+        return decodedArchivedResultCount.get();
+    }
+
+    @Override
+    public Stream<Entry<BigId, IObsData>> selectEntries(
+            ObsFilter filter, Set<ObsField> fields, long offset) {
+        if (offset < 0L)
+            throw new IllegalArgumentException("Observation query offset cannot be negative");
+        if (offset == 0L)
+            return selectEntries(filter, fields);
+        if (filter.getLimit() <= offset)
+            return Stream.empty();
+        if (!archiveConfig.enabled || offset < MIN_SUMMARY_SKIP_OFFSET)
+            return selectEntries(filter, fields).skip(offset);
+        return selectTieredEntriesWithOffset(
+                filter, fields, offset, archiveCatalog.hasObservationMutations());
+    }
+
+    private record ColdOffsetStream(
+            Stream<Entry<BigId, IObsData>> stream,
+            long skippedExactRows) {}
+
+    private Stream<Entry<BigId, IObsData>> selectTieredEntriesWithOffset(
+            ObsFilter filter, Set<ObsField> fields, long offset, boolean hasMutations) {
+        ResolvedRelatedFilter related = resolveRelatedFilter(filter);
+        if (!related.matches())
+            return Stream.empty();
+        Set<Long> dataStreams = related.dataStreams();
+        Set<Long> fois = related.fois();
+        ObsFilter resolvedFilter = related.filter();
+        boolean parentTableOnly = isAllMutableOnlyDataStreams(dataStreams);
+        boolean latest = hasLatestSelection(filter);
+        boolean boundedMerge = !latest && filter.getLimit() != Long.MAX_VALUE &&
+                filter.getValuePredicate() == null &&
+                filter.getPhenomenonLocation() == null;
+        boolean hasExplicitIds = resolvedFilter.getInternalIDs() != null &&
+                !resolvedFilter.getInternalIDs().isEmpty();
+        String exactEventId = fois == null && resolvedFilter.getCQLFilter() != null
+                ? JsonCqlEvaluator.extractExactEventIdFilter(resolvedFilter.getCQLFilter()).orElse(null)
+                : null;
+        JsonCqlEvaluator.SummaryCounterSpec summarySpec = fois == null
+                ? JsonCqlEvaluator.summaryCounterSpec(resolvedFilter.getCQLFilter()).orElse(null)
+                : null;
+        if (parentTableOnly || !boundedMerge || fois != null || hasExplicitIds ||
+                exactEventId != null || summarySpec == null) {
+            return selectTieredEntries(filter, fields, hasMutations).skip(offset);
+        }
+
+        ArchiveCatalog.MutationCounts mutationCounts = hasMutations
+                ? archiveCatalog.countObservationMutationBreakdown(dataStreams)
+                : new ArchiveCatalog.MutationCounts(0L, 0L);
+        long mutationCount = mutationCounts.total();
+        boolean effectiveHasMutations = mutationCount > 0L;
+        boolean hasOverlays = mutationCounts.overlayCount() > 0L;
+
+        long probeCap = Math.min(filter.getLimit(), MAX_EAGER_NON_COLD_OFFSET_ROWS + 1L);
+        ObsFilter nonColdFilter = ObsFilter.Builder.from(resolvedFilter).withLimit(probeCap).build();
+        int initialNonColdPageSize = adaptiveInitialPageSize(Math.min(probeCap, STREAM_FETCH_SIZE));
+
+        List<Entry<BigId, IObsData>> hotUnowned;
+        try (Stream<Entry<BigId, IObsData>> hotStream = selectEntriesWithCondition(
+                nonColdFilter, null, false, initialNonColdPageSize,
+                buildUnownedHotCountPredicate(false, effectiveHasMutations))) {
+            hotUnowned = hotStream.limit(probeCap).toList();
+        }
+        List<Entry<BigId, IObsData>> overlayEntries;
+        if (hasOverlays) {
+            try (Stream<Entry<BigId, IObsData>> ovStream = streamOverlays(
+                    nonColdFilter, dataStreams, null, true,
+                    Math.min(1_000, initialNonColdPageSize))) {
+                overlayEntries = ovStream.limit(probeCap).toList();
+            }
+        } else {
+            overlayEntries = List.of();
+        }
+
+        if ((hotUnowned.size() > MAX_EAGER_NON_COLD_OFFSET_ROWS ||
+                overlayEntries.size() > MAX_EAGER_NON_COLD_OFFSET_ROWS) &&
+                filter.getLimit() > MAX_EAGER_NON_COLD_OFFSET_ROWS) {
+            return selectTieredEntries(filter, fields, hasMutations).skip(offset);
+        }
+
+        Comparator<Entry<BigId, IObsData>> comparator = entryComparator(filter);
+        List<Entry<BigId, IObsData>> nonCold;
+        if (overlayEntries.isEmpty()) {
+            nonCold = hotUnowned.size() > filter.getLimit()
+                    ? hotUnowned.subList(0, (int) filter.getLimit())
+                    : hotUnowned;
+        } else if (hotUnowned.isEmpty()) {
+            nonCold = overlayEntries.size() > filter.getLimit()
+                    ? overlayEntries.subList(0, (int) filter.getLimit())
+                    : overlayEntries;
+        } else {
+            try (Stream<Entry<BigId, IObsData>> mergedNonCold =
+                         mergeSorted(hotUnowned.stream(), overlayEntries.stream(), comparator)) {
+                nonCold = mergedNonCold.limit(filter.getLimit()).toList();
+            }
+        }
+
+        boolean nonColdComplete = nonCold.size() < filter.getLimit();
+        Instant hotBoundaryTime = !nonColdComplete && filter.getLimit() > 0L
+                ? nonCold.get((int) filter.getLimit() - 1).getValue().getPhenomenonTime()
+                : null;
+        boolean descending = filter.getPhenomenonTime() != null &&
+                filter.getPhenomenonTime().descendingOrder();
+        ToLongBiFunction<Instant, Instant> nonColdPrecedingFn = nonColdComplete
+                ? (clusterMinStart, clusterMaxEnd) -> countPrecedingNonCold(
+                        nonCold, descending, clusterMinStart, clusterMaxEnd)
+                : null;
+
+        ColdOffsetStream coldPlan = streamColdBasesWithSkip(
+                resolvedFilter, filter.getLimit(), mutationCount, dataStreams,
+                effectiveHasMutations, hotBoundaryTime, summarySpec,
+                nonColdComplete ? offset : 0L, nonColdPrecedingFn);
+
+        long skipped = coldPlan.skippedExactRows();
+        long remainingTotalLimit = filter.getLimit() - skipped;
+        long remainingOffset = offset - skipped;
+        Stream<Entry<BigId, IObsData>> merged = nonCold.isEmpty()
+                ? coldPlan.stream()
+                : mergeSorted(nonCold.stream(), coldPlan.stream(), comparator);
+        Stream<Entry<BigId, IObsData>> windowed = limitAndClose(merged, remainingTotalLimit)
+                .skip(remainingOffset);
+        return fields == null || fields.isEmpty()
+                ? windowed
+                : windowed.map(entry -> Map.<BigId, IObsData>entry(
+                        entry.getKey(), project(entry.getValue(), fields)));
+    }
+
+    private ColdOffsetStream streamColdBasesWithSkip(
+            ObsFilter resolvedFilter,
+            long callerLimit,
+            long mutationCount,
+            Set<Long> dataStreams,
+            boolean hasMutations,
+            Instant hotBoundaryTime,
+            JsonCqlEvaluator.SummaryCounterSpec summarySpec,
+            long offsetForSkip,
+            ToLongBiFunction<Instant, Instant> nonColdPrecedingFn) {
+        ArchiveBounds bounds = archiveBounds(resolvedFilter, hotBoundaryTime);
+        if (!bounds.start().isBefore(bounds.end()))
+            return new ColdOffsetStream(Stream.empty(), 0L);
+        Instant minResultTime = minResultTimeBound(resolvedFilter);
+        Instant maxResultTime = maxResultTimeBound(resolvedFilter);
+        List<ArchiveGeneration> allCandidates = pruneAndBackfillLegacyResultTimeCandidates(
+                archiveCatalog.candidates(
+                        bounds.start(), bounds.end(), null, null, null, dataStreams,
+                        minResultTime, maxResultTime),
+                minResultTime);
+        if (allCandidates.isEmpty())
+            return new ColdOffsetStream(Stream.empty(), 0L);
+
+        boolean descending = resolvedFilter.getPhenomenonTime() != null &&
+                resolvedFilter.getPhenomenonTime().descendingOrder();
+        long readerLimit = saturateAdd(callerLimit, mutationCount);
+        ArchiveCatalog.CandidateSelectionPlan plan = archiveCatalog.selectSummaryMatchedCandidates(
+                allCandidates,
+                resolvedFilter.getPhenomenonTime(),
+                resolvedFilter.getResultTime(),
+                dataStreams,
+                descending,
+                callerLimit,
+                readerLimit,
+                hasMutations,
+                summarySpec,
+                null,
+                hasMutations
+                        ? (chunk, mutatedByGen) -> countMutatedSummaryBaseMatchesByGeneration(
+                                chunk, mutatedByGen, resolvedFilter, dataStreams, null)
+                        : null,
+                offsetForSkip,
+                nonColdPrecedingFn);
+
+        long skipped = plan.skippedExactRows();
+        if (plan.primaryCandidates().isEmpty())
+            return new ColdOffsetStream(Stream.empty(), skipped);
+
+        long remainingCallerLimit = Math.max(1L, callerLimit - skipped);
+        long remainingReaderLimit = saturateAdd(remainingCallerLimit, mutationCount);
+        int mutationBatchSize = adaptiveMutationBatchSize(remainingCallerLimit);
+        ObsFilter coldStreamFilter = ObsFilter.Builder.from(resolvedFilter)
+                .withLimit(remainingCallerLimit)
+                .build();
+        if (plan.overflowCandidates().isEmpty()) {
+            return new ColdOffsetStream(
+                    streamColdBasesFromPreprunedCandidates(
+                            plan.primaryCandidates(), coldStreamFilter, remainingReaderLimit,
+                            dataStreams, null, hasMutations, mutationBatchSize),
+                    skipped);
+        }
+        java.util.concurrent.atomic.AtomicLong emitted = new java.util.concurrent.atomic.AtomicLong();
+        Supplier<Stream<Entry<BigId, IObsData>>> primarySupplier = () ->
+                streamColdBasesFromPreprunedCandidates(
+                        plan.primaryCandidates(), coldStreamFilter, remainingReaderLimit,
+                        dataStreams, null, hasMutations, mutationBatchSize)
+                        .peek(ignored -> emitted.incrementAndGet());
+        Supplier<Stream<Entry<BigId, IObsData>>> overflowSupplier = () -> {
+            long remainingLimit = remainingReaderLimit == Long.MAX_VALUE
+                    ? Long.MAX_VALUE
+                    : remainingReaderLimit - emitted.get();
+            if (remainingReaderLimit != Long.MAX_VALUE && remainingLimit <= 0L)
+                return Stream.empty();
+            return streamColdBasesFromPreprunedCandidates(
+                    plan.overflowCandidates(), coldStreamFilter, remainingLimit,
+                    dataStreams, null, hasMutations, mutationBatchSize);
+        };
+        return new ColdOffsetStream(
+                Stream.of(primarySupplier, overflowSupplier).flatMap(Supplier::get),
+                skipped);
+    }
+
+    private static long countPrecedingNonCold(
+            List<Entry<BigId, IObsData>> nonCold,
+            boolean descending,
+            Instant clusterMinStart,
+            Instant clusterMaxEnd) {
+        if (nonCold.isEmpty())
+            return 0L;
+        long count = 0L;
+        for (Entry<BigId, IObsData> entry : nonCold) {
+            Instant t = entry.getValue().getPhenomenonTime();
+            if (descending) {
+                if (t == null || !t.isBefore(clusterMinStart))
+                    count++;
+                else
+                    break;
+            } else {
+                if (t == null || t.isBefore(clusterMaxEnd))
+                    count++;
+                else
+                    break;
+            }
+        }
+        return count;
+    }
+
     private Stream<Entry<BigId, IObsData>> selectTieredEntries(
             ObsFilter filter, Set<ObsField> fields,
             boolean hasMutations) {
@@ -1377,6 +1622,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             Set<Long> dataStreams, Set<Long> fois, boolean hasMutations, int mutationBatchSize) {
         if (effectiveCandidates.isEmpty())
             return Stream.empty();
+        preloadGenerationSchemas(effectiveCandidates, dataStreams);
         boolean pushDownMutatedIdsForLatest = hasMutations && hasLatestSelection(filter);
         Stream<ParquetArchiveReader.ArchivedRow> rows = pushDownMutatedIdsForLatest
                 ? archiveReader.stream(
@@ -1390,10 +1636,55 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         return rows
                 .map(row -> {
                     long id = row.observation().id();
-                    IObsData observation = toObservation(row.generation().id(), null, row.observation());
+                    IObsData observation = toLazyObservation(row.generation().id(), null, row.observation());
                     return Map.entry(BigId.fromLong(idScope, id), observation);
                 })
                 .filter(entry -> filter.test(entry.getValue()));
+    }
+
+    private void preloadGenerationSchemas(List<ArchiveGeneration> candidates, Set<Long> dataStreams) {
+        if (candidates.isEmpty() || candidates.size() > 64)
+            return;
+        if (dataStreams == null && candidates.size() > 8)
+            return;
+        List<UUID> missingGenIds = new ArrayList<>();
+        for (ArchiveGeneration gen : candidates) {
+            if (dataStreams != null && !dataStreams.isEmpty()) {
+                boolean anyMissing = false;
+                for (Long dsId : dataStreams) {
+                    String key = gen.id() + ":" + dsId;
+                    String hash = generationStreamSchemaHashes.getIfPresent(key);
+                    if (hash == null || decodedOverlaySchemas.getIfPresent(hash) == null) {
+                        anyMissing = true;
+                        break;
+                    }
+                }
+                if (anyMissing)
+                    missingGenIds.add(gen.id());
+            } else {
+                missingGenIds.add(gen.id());
+            }
+        }
+        if (missingGenIds.isEmpty())
+            return;
+        Set<String> alreadyDecoded = Set.copyOf(decodedOverlaySchemas.asMap().keySet());
+        List<ArchiveCatalog.GenerationStreamSchemaRef> refs =
+                archiveCatalog.loadSchemaReferences(missingGenIds, dataStreams, alreadyDecoded);
+        for (ArchiveCatalog.GenerationStreamSchemaRef ref : refs) {
+            IDataStreamInfo decoded = decodedOverlaySchemas.getIfPresent(ref.schemaSha256());
+            if (decoded == null && ref.schemaJson() != null) {
+                try {
+                    decoded = SerializerUtils.readIDataStreamInfoFromJson(ref.schemaJson());
+                    decodedOverlaySchemas.put(ref.schemaSha256(), decoded);
+                } catch (IOException e) {
+                    throw new IllegalStateException("Cannot decode archived datastream schema", e);
+                }
+            }
+            if (decoded != null) {
+                generationStreamSchemaHashes.put(
+                        ref.generationId() + ":" + ref.dataStreamId(), ref.schemaSha256());
+            }
+        }
     }
 
     private List<ArchiveGeneration> pruneAndBackfillLegacyResultTimeCandidates(
@@ -1443,7 +1734,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     if (cqlMatcher != null && !cqlMatcher.test(overlay.resultJson()))
                         return Stream.empty();
                     long id = overlay.id();
-                    IObsData observation = toObservation(
+                    IObsData observation = toLazyObservation(
                             mutation.generationId(), mutation.schemaJson(), overlay);
                     return matchesObservationWithoutCqlIfPrechecked(
                             filter, dataStreams, fois, id, overlay.resultJson(), observation, cqlMatcher != null)
@@ -1683,6 +1974,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         return builder.build();
     }
 
+    private IObsData toLazyObservation(UUID generationId, String overlaySchemaJson,
+                                       ArchivedObservation archived) {
+        return new LazyArchivedObsData(generationId, overlaySchemaJson, archived);
+    }
+
     private IObsData toObservation(UUID generationId, String overlaySchemaJson,
                                    ArchivedObservation archived) {
         return toObservation(null, generationId, overlaySchemaJson, archived);
@@ -1691,6 +1987,26 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private IObsData toObservation(Connection transaction, UUID generationId,
                                    String overlaySchemaJson, ArchivedObservation archived) {
         BigId dataStreamId = BigId.fromLong(archived.dataStreamScope(), archived.dataStreamId());
+        DataBlock result = decodeArchivedResult(transaction, generationId, overlaySchemaJson, archived);
+        ObsData.Builder builder = new ObsData.Builder().withDataStream(dataStreamId).withResult(result);
+        if (archived.foiId() != null)
+            builder.withFoi(BigId.fromLong(archived.foiScope(), archived.foiId()));
+        if (archived.phenomenonTime() != null)
+            builder.withPhenomenonTime(archived.phenomenonTime());
+        if (archived.resultTime() != null)
+            builder.withResultTime(archived.resultTime());
+        return builder.build();
+    }
+
+    private DataBlock decodeArchivedResult(Connection transaction, UUID generationId,
+                                           String overlaySchemaJson, ArchivedObservation archived) {
+        IDataStreamInfo schema = resolveArchivedSchema(transaction, generationId, overlaySchemaJson, archived);
+        decodedArchivedResultCount.incrementAndGet();
+        return SerializerUtils.readDataBlockFromJson(schema.getRecordStructure(), archived.resultJson());
+    }
+
+    private IDataStreamInfo resolveArchivedSchema(Connection transaction, UUID generationId,
+                                                  String overlaySchemaJson, ArchivedObservation archived) {
         boolean overlay = "OVERLAY".equals(archived.profile());
         IDataStreamInfo schema = null;
         if (overlay && overlaySchemaJson != null) {
@@ -1707,16 +2023,22 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         }
         if (schema == null && generationId != null) {
             String cacheKey = generationId + ":" + archived.dataStreamId();
-            schema = archivedSchemas.get(cacheKey);
+            String cachedHash = generationStreamSchemaHashes.getIfPresent(cacheKey);
+            if (cachedHash != null)
+                schema = decodedOverlaySchemas.getIfPresent(cachedHash);
             if (schema == null) {
                 try {
-                    java.util.Optional<String> serialized = transaction == null
-                            ? archiveCatalog.schemaJson(generationId, archived.dataStreamId())
-                            : archiveCatalog.schemaJson(transaction, generationId, archived.dataStreamId());
-                    if (serialized.isPresent()) {
-                        IDataStreamInfo decoded = SerializerUtils.readIDataStreamInfoFromJson(serialized.get());
-                        IDataStreamInfo existing = archivedSchemas.putIfAbsent(cacheKey, decoded);
-                        schema = existing == null ? decoded : existing;
+                    java.util.Optional<ArchiveCatalog.SchemaReference> ref = transaction == null
+                            ? archiveCatalog.schemaReference(generationId, archived.dataStreamId())
+                            : archiveCatalog.schemaReference(transaction, generationId, archived.dataStreamId());
+                    if (ref.isPresent()) {
+                        ArchiveCatalog.SchemaReference schemaRef = ref.get();
+                        schema = decodedOverlaySchemas.getIfPresent(schemaRef.schemaSha256());
+                        if (schema == null) {
+                            schema = SerializerUtils.readIDataStreamInfoFromJson(schemaRef.schemaJson());
+                            decodedOverlaySchemas.put(schemaRef.schemaSha256(), schema);
+                        }
+                        generationStreamSchemaHashes.put(cacheKey, schemaRef.schemaSha256());
                     }
                 } catch (Exception e) {
                     throw new IllegalStateException("Cannot decode archived datastream schema", e);
@@ -1726,15 +2048,42 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         if (schema == null)
             throw new IllegalStateException((overlay ? "No live or archived schema for overlaid datastream " :
                     "No generation schema for archived datastream ") + archived.dataStreamId());
-        DataBlock result = SerializerUtils.readDataBlockFromJson(schema.getRecordStructure(), archived.resultJson());
-        ObsData.Builder builder = new ObsData.Builder().withDataStream(dataStreamId).withResult(result);
-        if (archived.foiId() != null)
-            builder.withFoi(BigId.fromLong(archived.foiScope(), archived.foiId()));
-        if (archived.phenomenonTime() != null)
-            builder.withPhenomenonTime(archived.phenomenonTime());
-        if (archived.resultTime() != null)
-            builder.withResultTime(archived.resultTime());
-        return builder.build();
+        return schema;
+    }
+
+    private final class LazyArchivedObsData extends ObsData {
+        private final UUID generationId;
+        private final String overlaySchemaJson;
+        private final ArchivedObservation archived;
+        private volatile DataBlock decodedResult;
+
+        LazyArchivedObsData(UUID generationId, String overlaySchemaJson, ArchivedObservation archived) {
+            this.generationId = generationId;
+            this.overlaySchemaJson = overlaySchemaJson;
+            this.archived = archived;
+            this.dataStreamID = BigId.fromLong(archived.dataStreamScope(), archived.dataStreamId());
+            this.foiID = archived.foiId() != null
+                    ? BigId.fromLong(archived.foiScope(), archived.foiId())
+                    : IObsData.NO_FOI;
+            this.phenomenonTime = archived.phenomenonTime();
+            this.resultTime = archived.resultTime();
+        }
+
+        @Override
+        public DataBlock getResult() {
+            DataBlock local = decodedResult;
+            if (local == null) {
+                synchronized (this) {
+                    local = decodedResult;
+                    if (local == null) {
+                        local = decodeArchivedResult(null, generationId, overlaySchemaJson, archived);
+                        this.result = local;
+                        this.decodedResult = local;
+                    }
+                }
+            }
+            return local;
+        }
     }
 
     private static Comparator<Entry<BigId, IObsData>> entryComparator(ObsFilter filter) {

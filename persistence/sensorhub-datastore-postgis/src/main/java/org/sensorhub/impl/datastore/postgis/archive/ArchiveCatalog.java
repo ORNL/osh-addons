@@ -2428,6 +2428,112 @@ public final class ArchiveCatalog {
         }
     }
 
+    public record SchemaReference(String schemaSha256, String schemaJson) {}
+
+    public record GenerationStreamSchemaRef(
+            UUID generationId, long dataStreamId, String schemaSha256, String schemaJson) {}
+
+    public Optional<SchemaReference> schemaReference(UUID generationId, long dataStreamId) {
+        try (Connection connection = connections.open()) {
+            return schemaReference(connection, generationId, dataStreamId);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot load archived datastream schema", e);
+        }
+    }
+
+    public Optional<SchemaReference> schemaReference(Connection connection, UUID generationId, long dataStreamId)
+            throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT schema.schema_sha256, COALESCE(schema.schema_json, blob.schema_json)::text " +
+                        "FROM oscar_archive_schema schema " +
+                        "LEFT JOIN oscar_archive_schema_blob blob ON blob.schema_sha256=schema.schema_sha256 " +
+                        "JOIN oscar_archive_generation generation ON generation.id=schema.generation_id " +
+                        "WHERE schema.generation_id=? AND schema.datastream_id=? " +
+                        "AND generation.store_key=? AND generation.id_scope=?")) {
+            statement.setObject(1, generationId);
+            statement.setLong(2, dataStreamId);
+            statement.setString(3, storeKey);
+            statement.setInt(4, idScope);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next())
+                    return Optional.empty();
+                String hash = result.getString(1);
+                String json = result.getString(2);
+                if (json == null)
+                    return Optional.empty();
+                return Optional.of(new SchemaReference(
+                        hash != null ? hash : computeSchemaSha256(json), json));
+            }
+        }
+    }
+
+    /**
+     * Batch-resolves {@code (generation_id, datastream_id) -> schema_sha256} and
+     * omits {@code schema_json} text transfer for hashes already decoded by the caller.
+     */
+    public List<GenerationStreamSchemaRef> loadSchemaReferences(
+            Collection<UUID> generationIds, Set<Long> dataStreams, Set<String> alreadyDecodedHashes) {
+        if (generationIds == null || generationIds.isEmpty())
+            return List.of();
+        boolean filterStreams = dataStreams != null && !dataStreams.isEmpty();
+        boolean hasKnownHashes = alreadyDecodedHashes != null && !alreadyDecodedHashes.isEmpty();
+        String jsonProjection = hasKnownHashes
+                ? "CASE WHEN schema.schema_sha256 IS NOT NULL AND schema.schema_sha256 = ANY (?::text[]) " +
+                  "THEN NULL ELSE COALESCE(schema.schema_json, blob.schema_json)::text END"
+                : "COALESCE(schema.schema_json, blob.schema_json)::text";
+        String sql = "SELECT schema.generation_id, schema.datastream_id, schema.schema_sha256, " +
+                jsonProjection + " " +
+                "FROM oscar_archive_schema schema " +
+                "LEFT JOIN oscar_archive_schema_blob blob ON blob.schema_sha256=schema.schema_sha256 " +
+                "JOIN oscar_archive_generation generation ON generation.id=schema.generation_id " +
+                "WHERE schema.generation_id = ANY (?::uuid[]) " +
+                (filterStreams ? "AND schema.datastream_id = ANY (?::bigint[]) " : "") +
+                "AND generation.store_key=? AND generation.id_scope=?";
+        List<GenerationStreamSchemaRef> refs = new ArrayList<>();
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            java.sql.Array knownHashesArray = hasKnownHashes
+                    ? connection.createArrayOf("text", alreadyDecodedHashes.toArray(String[]::new))
+                    : null;
+            java.sql.Array genArray = connection.createArrayOf(
+                    "uuid", generationIds.toArray(UUID[]::new));
+            java.sql.Array streamArray = filterStreams
+                    ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
+                    : null;
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                int param = 1;
+                if (knownHashesArray != null)
+                    statement.setArray(param++, knownHashesArray);
+                statement.setArray(param++, genArray);
+                if (streamArray != null)
+                    statement.setArray(param++, streamArray);
+                statement.setString(param++, storeKey);
+                statement.setInt(param, idScope);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next()) {
+                        UUID genId = result.getObject(1, UUID.class);
+                        long dsId = result.getLong(2);
+                        String hash = result.getString(3);
+                        String json = result.getString(4);
+                        if (hash == null && json != null)
+                            hash = computeSchemaSha256(json);
+                        if (hash != null)
+                            refs.add(new GenerationStreamSchemaRef(genId, dsId, hash, json));
+                    }
+                }
+            } finally {
+                if (knownHashesArray != null)
+                    knownHashesArray.free();
+                genArray.free();
+                if (streamArray != null)
+                    streamArray.free();
+            }
+            return refs;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot batch-load archived datastream schemas", e);
+        }
+    }
+
     public static String computeSchemaSha256(String schemaJson) {
         return sha256Hex(schemaJson);
     }
@@ -3124,7 +3230,14 @@ public final class ArchiveCatalog {
 
     public record CandidateSelectionPlan(
             List<ArchiveGeneration> primaryCandidates,
-            List<ArchiveGeneration> overflowCandidates) {}
+            List<ArchiveGeneration> overflowCandidates,
+            long skippedExactRows) {
+        public CandidateSelectionPlan(
+                List<ArchiveGeneration> primaryCandidates,
+                List<ArchiveGeneration> overflowCandidates) {
+            this(primaryCandidates, overflowCandidates, 0L);
+        }
+    }
 
     /**
      * Prunes zero-match archive generations using {@code oscar_archive_schema}
@@ -3178,6 +3291,26 @@ public final class ArchiveCatalog {
             JsonCqlEvaluator.SummaryCounterSpec summarySpec,
             String exactEventId,
             java.util.function.BiFunction<List<ArchiveGeneration>, Map<UUID, Set<Long>>, Map<UUID, Long>> exactMutatedMatchResolver) {
+        return selectSummaryMatchedCandidates(
+                candidates, phenomenonTimeFilter, resultTimeFilter,
+                dataStreams, descending, callerLimit, readerLimit,
+                hasMutations, summarySpec, exactEventId, exactMutatedMatchResolver, 0L, null);
+    }
+
+    public CandidateSelectionPlan selectSummaryMatchedCandidates(
+            List<ArchiveGeneration> candidates,
+            TemporalFilter phenomenonTimeFilter,
+            TemporalFilter resultTimeFilter,
+            Set<Long> dataStreams,
+            boolean descending,
+            long callerLimit,
+            long readerLimit,
+            boolean hasMutations,
+            JsonCqlEvaluator.SummaryCounterSpec summarySpec,
+            String exactEventId,
+            java.util.function.BiFunction<List<ArchiveGeneration>, Map<UUID, Set<Long>>, Map<UUID, Long>> exactMutatedMatchResolver,
+            long offsetForSkip,
+            java.util.function.ToLongBiFunction<Instant, Instant> preClusterPrecedingNonColdCount) {
         if (candidates == null || candidates.isEmpty())
             return new CandidateSelectionPlan(List.of(), List.of());
 
@@ -3274,20 +3407,21 @@ public final class ArchiveCatalog {
             return new CandidateSelectionPlan(List.of(), List.of());
 
         boolean boundedTarget = callerLimit != Long.MAX_VALUE && readerLimit != Long.MAX_VALUE;
-        if (!hasMutations && (!boundedTarget || surviving.size() <= 1))
+        boolean canSkipClusters = boundedTarget && offsetForSkip > 0L && preClusterPrecedingNonColdCount != null;
+        if (!hasMutations && !canSkipClusters && (!boundedTarget || surviving.size() <= 1))
             return new CandidateSelectionPlan(surviving, List.of());
 
         List<List<ArchiveGeneration>> clusters = groupDisjointClusters(surviving);
         if (descending)
             java.util.Collections.reverse(clusters);
-        if (!hasMutations && clusters.size() <= 1)
+        if (!hasMutations && !canSkipClusters && clusters.size() <= 1)
             return new CandidateSelectionPlan(surviving, List.of());
 
         Map<UUID, Set<Long>> mutatedByGen = hasMutations
                 ? mutatedObservationIdsByGeneration(
                         surviving.stream().map(ArchiveGeneration::id).toList())
                 : Map.of();
-        if (mutatedByGen.isEmpty() && (!boundedTarget || clusters.size() <= 1))
+        if (mutatedByGen.isEmpty() && !canSkipClusters && (!boundedTarget || clusters.size() <= 1))
             return new CandidateSelectionPlan(surviving, List.of());
 
         long targetMatches = boundedTarget ? Math.max(1L, Math.min(callerLimit, readerLimit)) : Long.MAX_VALUE;
@@ -3383,6 +3517,69 @@ public final class ArchiveCatalog {
             }
         }
 
+        long skippedExactRows = 0L;
+        int startClusterIndex = 0;
+        if (canSkipClusters) {
+            while (startClusterIndex < clusters.size()) {
+                List<ArchiveGeneration> rawCluster = clusters.get(startClusterIndex);
+                boolean clusterExactForSkip = true;
+                long clusterExactRemaining = 0L;
+                Instant clusterMinStart = null;
+                Instant clusterMaxEnd = null;
+                for (ArchiveGeneration gen : rawCluster) {
+                    if (gen.start() == null || gen.end() == null) {
+                        clusterExactForSkip = false;
+                        break;
+                    }
+                    if (clusterMinStart == null || gen.start().isBefore(clusterMinStart))
+                        clusterMinStart = gen.start();
+                    if (clusterMaxEnd == null || gen.end().isAfter(clusterMaxEnd))
+                        clusterMaxEnd = gen.end();
+                    UUID genId = gen.id();
+                    Set<Long> genMutated = mutatedByGen.getOrDefault(genId, Set.of());
+                    if (!Boolean.TRUE.equals(populatedByGen.get(genId)) ||
+                            !Boolean.TRUE.equals(exactReadyByGen.get(genId)) ||
+                            !isGenerationWindowFullyContained(gen, phenomenonTimeFilter) ||
+                            !isGenerationResultTimeFullyContained(gen, resultTimeFilter)) {
+                        clusterExactForSkip = false;
+                        break;
+                    }
+                    long exactVal = exactByGen.getOrDefault(genId, 0L);
+                    long exactRemaining;
+                    if (genMutated.isEmpty()) {
+                        exactRemaining = exactVal;
+                    } else if (exactMutatedMatches.containsKey(genId)) {
+                        exactRemaining = Math.max(0L, exactVal - exactMutatedMatches.get(genId));
+                    } else {
+                        clusterExactForSkip = false;
+                        break;
+                    }
+                    clusterExactRemaining = saturateAddLong(clusterExactRemaining, exactRemaining);
+                }
+                if (!clusterExactForSkip || clusterMinStart == null || clusterMaxEnd == null)
+                    break;
+                if (clusterExactRemaining == 0L) {
+                    startClusterIndex++;
+                    continue;
+                }
+                long nonColdPreceding = preClusterPrecedingNonColdCount.applyAsLong(
+                        clusterMinStart, clusterMaxEnd);
+                if (nonColdPreceding < 0L)
+                    break;
+                long cumulativeRows = saturateAddLong(
+                        nonColdPreceding, saturateAddLong(skippedExactRows, clusterExactRemaining));
+                if (cumulativeRows <= offsetForSkip) {
+                    skippedExactRows = saturateAddLong(skippedExactRows, clusterExactRemaining);
+                    startClusterIndex++;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        long remainingTargetMatches = boundedTarget
+                ? Math.max(1L, targetMatches - skippedExactRows)
+                : Long.MAX_VALUE;
         List<ArchiveGeneration> primary = new ArrayList<>();
         List<ArchiveGeneration> overflow = new ArrayList<>();
         long guaranteedMatches = 0L;
@@ -3390,7 +3587,8 @@ public final class ArchiveCatalog {
         int primaryClusterCount = 0;
         boolean fillOverflow = false;
 
-        for (List<ArchiveGeneration> rawCluster : clusters) {
+        for (int clusterIdx = startClusterIndex; clusterIdx < clusters.size(); clusterIdx++) {
+            List<ArchiveGeneration> rawCluster = clusters.get(clusterIdx);
             List<ArchiveGeneration> cluster = new ArrayList<>(rawCluster.size());
             for (ArchiveGeneration gen : rawCluster) {
                 UUID genId = gen.id();
@@ -3428,7 +3626,7 @@ public final class ArchiveCatalog {
                     clusterExactSum = saturateAddLong(clusterExactSum, exactRemaining);
                     continue;
                 }
-                long upper = populated ? upperByGen.getOrDefault(genId, 0L) : targetMatches;
+                long upper = populated ? upperByGen.getOrDefault(genId, 0L) : remainingTargetMatches;
                 clusterUpperSum = saturateAddLong(clusterUpperSum, Math.max(0L, upper - mutatedCount));
                 if (clusterExact &&
                         Boolean.TRUE.equals(exactReadyByGen.get(genId)) &&
@@ -3444,10 +3642,10 @@ public final class ArchiveCatalog {
             if (clusterExact)
                 guaranteedMatches = saturateAddLong(guaranteedMatches, clusterExactSum);
 
-            if (guaranteedMatches >= targetMatches) {
+            if (guaranteedMatches >= remainingTargetMatches) {
                 break;
             }
-            if (upperBoundMatches >= targetMatches && primaryClusterCount >= 4) {
+            if (upperBoundMatches >= remainingTargetMatches && primaryClusterCount >= 4) {
                 fillOverflow = true;
             }
         }
@@ -3458,7 +3656,7 @@ public final class ArchiveCatalog {
         overflow.sort(java.util.Comparator.comparing(ArchiveGeneration::start)
                 .thenComparing(ArchiveGeneration::end)
                 .thenComparing(ArchiveGeneration::id));
-        return new CandidateSelectionPlan(primary, overflow);
+        return new CandidateSelectionPlan(primary, overflow, skippedExactRows);
     }
 
     private static List<List<ArchiveGeneration>> groupDisjointClusters(List<ArchiveGeneration> generations) {

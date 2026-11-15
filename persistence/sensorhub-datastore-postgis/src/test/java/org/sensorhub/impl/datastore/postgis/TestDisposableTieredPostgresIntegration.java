@@ -5629,6 +5629,178 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertLatestPerStreamEquals(tiered, coldStream, hotStream, c2, 20.0, h1, 150.0);
     }
 
+    @Test
+    public void deepOffsetPaginationSkipsArchivedClustersAndDefersDataBlockDecodeWithExactParity() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        BigId streamA = addAlarmDataStream(bigId(1105), "gammaCounts");
+        BigId streamB = addAlarmDataStream(bigId(1106), "gammaCounts");
+        Instant base = Instant.parse("2026-10-12T00:00:00Z");
+
+        // Populate 6 distinct 1-hour archived windows (50 matching alarms + 10 non-alarms per window = 300 archived alarms)
+        // Keeping grace-period hot rows intact on half the windows and retiring hot rows on the other half!
+        List<BigId> windowIds = new ArrayList<>();
+        for (int w = 0; w < 6; w++) {
+            Instant windowStart = base.plus(w, ChronoUnit.HOURS);
+            for (int i = 0; i < 60; i++) {
+                BigId stream = (i % 2 == 0) ? streamA : streamB;
+                boolean gamma = (i < 50);
+                boolean neutron = (i % 10 == 0);
+                Instant t = windowStart.plusSeconds(60L + i * 30L);
+                BigId id = tiered.add(alarmObs(stream, t, t, gamma, neutron, 100.0 * w + i));
+                if (gamma)
+                    windowIds.add(id);
+            }
+            forceReadBackFromStorage();
+            tiered.archiveWindow(windowStart, windowStart.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+            if (w % 2 == 0) {
+                try (Connection connection = open();
+                     PreparedStatement purge = connection.prepareStatement(
+                             "DELETE FROM " + TABLE + " WHERE phenomenontime >= ? AND phenomenontime < ?")) {
+                    org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime.setInstant(purge, 1, windowStart);
+                    org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime.setInstant(
+                            purge, 2, windowStart.plus(1, ChronoUnit.HOURS));
+                    purge.executeUpdate();
+                }
+            }
+        }
+
+        // Add 6 live unarchived alarms in hour 6 (not exported to Parquet).
+        Instant liveBase = base.plus(6, ChronoUnit.HOURS);
+        for (int i = 0; i < 6; i++) {
+            Instant t = liveBase.plusSeconds(10L + i * 20L);
+            tiered.add(alarmObs(streamA, t, t, true, false, 900.0 + i));
+        }
+        forceReadBackFromStorage();
+
+        // Verify pure cold + grace-overlap skip BEFORE any mutations (common dashboard path):
+        // At offset 210 (page size 15 -> limit = 226), windows 5, 4, 3, and 2 (6 live + 4*50 = 206 rows)
+        // are skipped from catalog summary counters, decoding only ~20 archived payloads instead of 220!
+        var gammaCql = ObsFilter.parseCqlFilter("gammaAlarm=true");
+        long decodeBefore = tiered.getDecodedArchivedResultCountForTesting();
+        ObsFilter deepPageFilter = new ObsFilter.Builder()
+                .withDataStreams(streamA, streamB)
+                .withPhenomenonTime()
+                .withRange(base.minusSeconds(60), liveBase.plus(1, ChronoUnit.HOURS))
+                .descendingOrder(true)
+                .done()
+                .withCQLFilter(gammaCql)
+                .withLimit(210 + 16)
+                .build();
+        List<Map.Entry<BigId, IObsData>> fastPage;
+        try (var s = tiered.selectEntries(deepPageFilter, null, 210)) {
+            fastPage = s.toList();
+        }
+        assertEquals(16, fastPage.size());
+        // Force result materialization on the 16 returned entries (as OM+JSON serialization does).
+        for (var e : fastPage)
+            assertNotNull(e.getValue().getResult());
+        long fastDecoded = tiered.getDecodedArchivedResultCountForTesting() - decodeBefore;
+        assertTrue("Expected deep offset cluster skip to decode <= 40 archived payloads, got " + fastDecoded,
+                fastDecoded <= 40L);
+
+        // Verify LazyArchivedObsData on direct .skip(210) also avoids decoding skipped payloads!
+        long skipDecodeBefore = tiered.getDecodedArchivedResultCountForTesting();
+        List<Map.Entry<BigId, IObsData>> baselinePage;
+        try (var s = tiered.selectEntries(deepPageFilter).skip(210)) {
+            baselinePage = s.toList();
+        }
+        for (var e : baselinePage)
+            assertNotNull(e.getValue().getResult());
+        long skipDecoded = tiered.getDecodedArchivedResultCountForTesting() - skipDecodeBefore;
+        assertEquals("LazyArchivedObsData should decode only the 16 post-skip payloads", 16L, skipDecoded);
+        assertEntriesEqual(baselinePage, fastPage, true);
+
+        // Now apply mutations across archived windows: tombstone one alarm, flip one alarm to false via overlay,
+        // and update another alarm's value/timestamp via overlay!
+        BigId tombstonedId = windowIds.get(120);
+        BigId clearedAlarmId = windowIds.get(175);
+        BigId updatedAlarmId = windowIds.get(40);
+        assertNotNull(tiered.remove(tombstonedId));
+        IObsData clearedExisting = tiered.get(clearedAlarmId);
+        tiered.put(clearedAlarmId, alarmObs(
+                clearedExisting.getDataStreamID(),
+                clearedExisting.getPhenomenonTime(),
+                clearedExisting.getResultTime(),
+                false, false, 777.0));
+        IObsData updatedExisting = tiered.get(updatedAlarmId);
+        tiered.put(updatedAlarmId, alarmObs(
+                updatedExisting.getDataStreamID(),
+                base.plus(2, ChronoUnit.HOURS).plusSeconds(5),
+                updatedExisting.getResultTime(),
+                true, true, 888.5));
+
+        long[] offsets = {0L, 15L, 32L, 95L, 165L, 240L, 298L, 320L};
+        for (boolean descending : new boolean[]{true, false}) {
+            for (boolean withCql : new boolean[]{true, false}) {
+                for (long off : offsets) {
+                    ObsFilter.Builder fb = new ObsFilter.Builder()
+                            .withDataStreams(streamA, streamB)
+                            .withPhenomenonTime()
+                            .withRange(base.minusSeconds(60), liveBase.plus(1, ChronoUnit.HOURS))
+                            .descendingOrder(descending)
+                            .done()
+                            .withLimit(off + 16L);
+                    if (withCql)
+                        fb.withCQLFilter(gammaCql);
+                    ObsFilter f = fb.build();
+                    List<Map.Entry<BigId, IObsData>> expected;
+                    try (var s = tiered.selectEntries(f).skip(off)) {
+                        expected = s.toList();
+                    }
+                    List<Map.Entry<BigId, IObsData>> actual;
+                    try (var s = tiered.selectEntries(f, off)) {
+                        actual = s.toList();
+                    }
+                    assertEntriesEqual(expected, actual, true);
+                }
+            }
+        }
+
+        // Verify narrow field projection and limit <= offset edge case.
+        Set<org.sensorhub.api.datastore.obs.IObsStore.ObsField> keyFields = Set.of(
+                org.sensorhub.api.datastore.obs.IObsStore.ObsField.DATASTREAM_ID,
+                org.sensorhub.api.datastore.obs.IObsStore.ObsField.PHENOMENON_TIME);
+        ObsFilter projFilter = new ObsFilter.Builder()
+                .withDataStreams(streamA, streamB)
+                .withPhenomenonTime()
+                .withRange(base.minusSeconds(60), liveBase.plus(1, ChronoUnit.HOURS))
+                .descendingOrder(true)
+                .done()
+                .withCQLFilter(gammaCql)
+                .withLimit(150L)
+                .build();
+        try (var expectedS = tiered.selectEntries(projFilter, keyFields).skip(120);
+             var actualS = tiered.selectEntries(projFilter, keyFields, 120)) {
+            assertEntriesEqual(expectedS.toList(), actualS.toList(), false);
+        }
+        try (var emptyS = tiered.selectEntries(projFilter, null, 150)) {
+            assertEquals(0, emptyS.toList().size());
+        }
+        assertEquals(0, tiered.getOpenArchiveCursorCount());
+    }
+
+    private static void assertEntriesEqual(
+            List<Map.Entry<BigId, IObsData>> expected,
+            List<Map.Entry<BigId, IObsData>> actual,
+            boolean comparePayload) {
+        assertEquals(expected.size(), actual.size());
+        for (int i = 0; i < expected.size(); i++) {
+            assertEquals("Mismatch ID at index " + i, expected.get(i).getKey(), actual.get(i).getKey());
+            assertEquals("Mismatch phenomenonTime at index " + i,
+                    expected.get(i).getValue().getPhenomenonTime(),
+                    actual.get(i).getValue().getPhenomenonTime());
+            assertEquals("Mismatch dataStreamID at index " + i,
+                    expected.get(i).getValue().getDataStreamID(),
+                    actual.get(i).getValue().getDataStreamID());
+            if (comparePayload) {
+                assertEquals("Mismatch maxGamma at index " + i,
+                        expected.get(i).getValue().getResult().getDoubleValue(2),
+                        actual.get(i).getValue().getResult().getDoubleValue(2),
+                        1e-6);
+            }
+        }
+    }
+
     private static void assertLatestPerStreamEquals(
             OscarTieredObsStore tiered, BigId stream1, BigId stream2,
             BigId expectedId1, double expectedVal1, BigId expectedId2, double expectedVal2) {
