@@ -290,19 +290,67 @@ public class CQLFilterHandler {
     }
 
     private void handleLike(PropertyIsLike filter) {
-        String propertyName = ((PropertyName) filter.getExpression()).getPropertyName();
-        String pattern = filter.getLiteral();
+        String propertyName = getPropertyName(filter.getExpression());
+        String pgPattern = toPostgresLikePattern(filter);
+        String operator = filter.isMatchingCase() ? "LIKE" : "ILIKE";
 
-        // LIKE queries can't use containment, must use extraction
-        pattern = pattern.replace("\\", "\\\\")
-                .replace("'", "''")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-                .replace("*", "%")
-                .replace("?", "_");
+        String[] parts = propertyName.split("\\.");
+        StringBuilder jsonbPath = new StringBuilder("result");
+        for (String part : parts) {
+            jsonbPath.append("->'").append(escapeJsonKey(part)).append("'");
+        }
+        String extracted = buildJsonPathExtract(propertyName);
 
-        whereClause.append(buildJsonPathExtract(propertyName)).append(" LIKE ?");
-        parameters.add(pattern);
+        whereClause.append("CASE WHEN jsonb_typeof(").append(jsonbPath)
+                .append(") IN ('string', 'number', 'boolean') THEN (")
+                .append(extracted).append(") ").append(operator).append(" ? ESCAPE '\\' ")
+                .append("WHEN jsonb_typeof(").append(jsonbPath)
+                .append(") = 'array' THEN EXISTS (SELECT 1 FROM jsonb_array_elements(")
+                .append(jsonbPath)
+                .append(") AS elem WHERE jsonb_typeof(elem) IN ('string', 'number', 'boolean') AND (elem #>> '{}') ")
+                .append(operator).append(" ? ESCAPE '\\') ELSE FALSE END");
+        parameters.add(pgPattern);
+        parameters.add(pgPattern);
+    }
+
+    static String toPostgresLikePattern(PropertyIsLike filter) {
+        String literal = filter.getLiteral() == null ? "" : filter.getLiteral();
+        String wildcard = filter.getWildCard() == null ? "" : filter.getWildCard();
+        String single = filter.getSingleChar() == null ? "" : filter.getSingleChar();
+        String escape = filter.getEscape() == null ? "" : filter.getEscape();
+
+        StringBuilder out = new StringBuilder(literal.length() + 4);
+        for (int index = 0; index < literal.length();) {
+            if (!escape.isEmpty() && literal.startsWith(escape, index)) {
+                index += escape.length();
+                if (index < literal.length()) {
+                    int point = literal.codePointAt(index);
+                    appendEscapedPgLikeLiteralCodePoint(out, point);
+                    index += Character.charCount(point);
+                } else {
+                    out.append("\\\\");
+                }
+            } else if (!wildcard.isEmpty() && literal.startsWith(wildcard, index)) {
+                out.append('%');
+                index += wildcard.length();
+            } else if (!single.isEmpty() && literal.startsWith(single, index)) {
+                out.append('_');
+                index += single.length();
+            } else {
+                int point = literal.codePointAt(index);
+                appendEscapedPgLikeLiteralCodePoint(out, point);
+                index += Character.charCount(point);
+            }
+        }
+        return out.toString();
+    }
+
+    private static void appendEscapedPgLikeLiteralCodePoint(StringBuilder out, int codePoint) {
+        if (codePoint == '\\' || codePoint == '%' || codePoint == '_') {
+            out.append('\\').append((char) codePoint);
+        } else {
+            out.appendCodePoint(codePoint);
+        }
     }
 
     /**

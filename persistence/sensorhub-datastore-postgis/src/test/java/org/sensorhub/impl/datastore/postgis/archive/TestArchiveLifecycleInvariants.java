@@ -775,6 +775,40 @@ public class TestArchiveLifecycleInvariants {
                 () -> reader.read(List.of(corruptGen), code9Filter, null, null, 10L));
         assertFalse("Corrupted Parquet must never enter local cache objects/",
                 Files.exists(localCacheDir.resolve("objects").resolve(fakeExpectedSha + ".parquet")));
+
+        // Verify candidate cache directory resolution prefers duckDbTemporaryDirectory sibling .cache
+        // ahead of /var/tmp so read-only container root filesystems keep 9p local staging active.
+        List<Path> candidates = ParquetArchiveReader.candidateLocal9pCacheDirectories(config);
+        assertEquals(
+                duckTmp.toAbsolutePath().normalize().getParent().resolve(".cache").resolve("oscar-9p-parquet-cache"),
+                candidates.get(0));
+
+        // Verify persistent cache mode adopts verified objects across reader restarts while sweeping pins/tmp.
+        Path persistCacheDir = temporary.getRoot().toPath().resolve("persistent-ext4-stage-cache");
+        ParquetArchiveReader writerReader = new ParquetArchiveReader(root, config);
+        writerReader.setPersistentLocalStageCacheForTesting(persistCacheDir, totalFileBytes * 4L);
+        assertEquals(3, writerReader.read(generations, code9Filter, null, null, 10L).size());
+        assertEquals(6L, writerReader.localStageCacheCopyCountForTesting());
+        Files.createDirectories(persistCacheDir.resolve("pins").resolve("stale-pin"));
+        Files.writeString(persistCacheDir.resolve("tmp").resolve("stale.tmp"), "leftover");
+
+        ParquetArchiveReader restartedReader = new ParquetArchiveReader(root, config);
+        restartedReader.setPersistentLocalStageCacheForTesting(persistCacheDir, totalFileBytes * 4L);
+        assertTrue("Restarted persistent cache must adopt previously verified objects",
+                restartedReader.localStageCacheTrackedBytesForTesting() >= totalFileBytes);
+        assertEquals(3, restartedReader.read(generations, secondaryFilter, null, null, 10L).size());
+        assertEquals("Restarted persistent cache must serve warm objects with zero new 9p copies",
+                0L, restartedReader.localStageCacheCopyCountForTesting());
+        assertEquals(6L, restartedReader.localStageCachePinHitCountForTesting());
+        // Repeat CQL stream scan skips zero-match unmutated generations without opening DuckDB on them.
+        var rareFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount > 0 AND adjudicatedIds = 'code:99'")
+                .build();
+        assertEquals(0, restartedReader.read(generations, rareFilter, null, null, 10L).size());
+        long pinsAfterFirstZeroScan = restartedReader.localStageCachePinHitCountForTesting();
+        assertEquals(0, restartedReader.read(generations, rareFilter, null, null, 10L).size());
+        assertEquals("Repeat zero-match CQL stream must skip verified zero-match generations",
+                pinsAfterFirstZeroScan, restartedReader.localStageCachePinHitCountForTesting());
     }
 
     private static void writeSingleObservationParquet(

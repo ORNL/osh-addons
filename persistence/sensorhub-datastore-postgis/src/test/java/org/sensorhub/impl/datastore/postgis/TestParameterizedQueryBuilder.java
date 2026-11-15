@@ -573,6 +573,45 @@ public class TestParameterizedQueryBuilder {
                 notEmlFilter.getCQLFilter(), unadjudicatedJson));
     }
 
+    @Test
+    public void testLikeAndIlikeCqlPredicatesTranslateWildcardsAndPushDownToDuckDb() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+
+        ObsFilter likeFilter = new ObsFilter.Builder()
+                .withCQLFilter("normalizedValue LIKE '%MSCU1234%'")
+                .build();
+        ParameterizedQuery likeQuery = builder.createParameterizedSelectEntriesQuery(likeFilter, null);
+        assertTrue(likeQuery.sql().contains(" LIKE ? ESCAPE '\\'"));
+        assertEquals(List.of("%MSCU1234%", "%MSCU1234%"), likeQuery.parameters());
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(
+                likeFilter.getCQLFilter()));
+
+        var ff = org.geotools.factory.CommonFactoryFinder.getFilterFactory();
+        ObsFilter ilikeFilter = new ObsFilter.Builder()
+                .withCQLFilter(ff.like(ff.property("vehicleId"), "mscu-1234%", "%", "_", "\\", false))
+                .build();
+        ParameterizedQuery ilikeQuery = builder.createParameterizedSelectEntriesQuery(ilikeFilter, null);
+        assertTrue(ilikeQuery.sql().contains(" ILIKE ? ESCAPE '\\'"));
+        assertEquals(List.of("mscu-1234%", "mscu-1234%"), ilikeQuery.parameters());
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(
+                ilikeFilter.getCQLFilter()));
+
+        ObsFilter starWildcardFilter = new ObsFilter.Builder()
+                .withCQLFilter(ff.like(ff.property("vehicleId"), "100%*MSCU?", "*", "?", "\\", false))
+                .build();
+        ParameterizedQuery starQuery = builder.createParameterizedSelectEntriesQuery(starWildcardFilter, null);
+        assertTrue(starQuery.sql().contains(" ILIKE ? ESCAPE '\\'"));
+        assertEquals(List.of("100\\%%MSCU_", "100\\%%MSCU_"), starQuery.parameters());
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(
+                starWildcardFilter.getCQLFilter()));
+
+        ObsFilter broadWildcardFilter = new ObsFilter.Builder()
+                .withCQLFilter("vehicleId LIKE '%'")
+                .build();
+        assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(
+                broadWildcardFilter.getCQLFilter()));
+    }
+
     private void assertSqlDoesNotContainInjection(ParameterizedQuery query) {
         assertFalse(query.sql().contains(INJECTION));
         assertTrue(query.parameters().stream().anyMatch(parameter -> parameter.toString().contains(INJECTION)));

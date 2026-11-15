@@ -86,15 +86,16 @@ public final class ParquetArchiveReader {
             boolean nonNullPhenomenonRequired,
             boolean nonNullResultTimeRequired) {}
 
-    private static final long DEFAULT_LOCAL_9P_CACHE_MAX_BYTES = 1_073_741_824L;
+    private static final long DEFAULT_LOCAL_9P_CACHE_MAX_BYTES = 2_147_483_648L;
+    private static final Path DEFAULT_STATE_9P_CACHE_DIR = Path.of("/var/lib/oscar/.cache/oscar-9p-parquet-cache");
     private static final Path DEFAULT_LOCAL_9P_CACHE_DIR = Path.of("/var/tmp/oscar-9p-parquet-cache");
     private static final Pattern SHA256_HEX_PATTERN = Pattern.compile("^[0-9a-f]{64}$");
     private static final Set<PosixFilePermission> PRIVATE_CACHE_DIR_PERMISSIONS =
             PosixFilePermissions.fromString("rwx------");
     private static final Set<PosixFilePermission> PRIVATE_CACHE_FILE_PERMISSIONS =
             PosixFilePermissions.fromString("rw-------");
-    private static volatile Local9pParquetCache defaultLocal9pCache;
-    private static volatile boolean defaultLocal9pCacheInitialized;
+    private static final Map<Path, java.util.Optional<Local9pParquetCache>> SHARED_LOCAL_9P_CACHES =
+            new ConcurrentHashMap<>();
 
     private final Path root;
     private final TieredArchiveConfig config;
@@ -107,6 +108,7 @@ public final class ParquetArchiveReader {
     private volatile Boolean archiveMountIs9p;
     private volatile Boolean forceProactiveLocalStagingForTesting;
     private volatile Local9pParquetCache localStageCacheForTesting;
+    private volatile java.util.Optional<Local9pParquetCache> resolvedSharedLocal9pCache;
 
     @FunctionalInterface
     interface DirectReadFaultInjector {
@@ -156,6 +158,29 @@ public final class ParquetArchiveReader {
         return "tmpfs".equals(normalized) || "ramfs".equals(normalized);
     }
 
+    void setPersistentLocalStageCacheForTesting(Path cacheDir, long maxBytes) throws IOException {
+        this.localStageCacheForTesting = cacheDir == null
+                ? null
+                : Local9pParquetCache.open(cacheDir, maxBytes, false);
+    }
+
+    static List<Path> candidateLocal9pCacheDirectories(TieredArchiveConfig cfg) {
+        Set<Path> candidates = new LinkedHashSet<>();
+        if (cfg != null && cfg.duckDbTemporaryDirectory != null && !cfg.duckDbTemporaryDirectory.isBlank()) {
+            try {
+                Path duckTmp = Path.of(cfg.duckDbTemporaryDirectory).toAbsolutePath().normalize();
+                Path duckParent = duckTmp.getParent();
+                if (duckParent != null) {
+                    candidates.add(duckParent.resolve(".cache").resolve("oscar-9p-parquet-cache").normalize());
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        candidates.add(DEFAULT_STATE_9P_CACHE_DIR.toAbsolutePath().normalize());
+        candidates.add(DEFAULT_LOCAL_9P_CACHE_DIR.toAbsolutePath().normalize());
+        return List.copyOf(candidates);
+    }
+
     private Local9pParquetCache activeLocalStageCache() {
         if (directReadFaultInjector != null)
             return null;
@@ -164,32 +189,68 @@ public final class ParquetArchiveReader {
             return testCache;
         if (forceProactiveLocalStagingForTesting != null)
             return null;
-        return isArchiveOn9pMount() ? getDefaultLocal9pCache() : null;
+        return isArchiveOn9pMount() ? resolveSharedLocal9pCache() : null;
     }
 
-    private static Local9pParquetCache getDefaultLocal9pCache() {
-        if (defaultLocal9pCacheInitialized)
-            return defaultLocal9pCache;
-        synchronized (ParquetArchiveReader.class) {
-            if (defaultLocal9pCacheInitialized)
-                return defaultLocal9pCache;
-            Local9pParquetCache created = null;
-            try {
-                Path parent = DEFAULT_LOCAL_9P_CACHE_DIR.getParent();
-                if (parent != null && Files.isDirectory(parent)) {
-                    String fsType = Files.getFileStore(parent).type();
-                    if (!is9pFileSystemType(fsType) && !isVolatileMemoryFileSystemType(fsType)) {
-                        created = Local9pParquetCache.open(
-                                DEFAULT_LOCAL_9P_CACHE_DIR, DEFAULT_LOCAL_9P_CACHE_MAX_BYTES, true);
-                    }
+    private Local9pParquetCache resolveSharedLocal9pCache() {
+        java.util.Optional<Local9pParquetCache> existing = resolvedSharedLocal9pCache;
+        if (existing != null)
+            return existing.orElse(null);
+        synchronized (this) {
+            existing = resolvedSharedLocal9pCache;
+            if (existing != null)
+                return existing.orElse(null);
+            Path duckTmp = null;
+            if (config.duckDbTemporaryDirectory != null && !config.duckDbTemporaryDirectory.isBlank()) {
+                try {
+                    duckTmp = Path.of(config.duckDbTemporaryDirectory).toAbsolutePath().normalize();
+                } catch (Exception ignored) {
                 }
-            } catch (Exception ignored) {
-                created = null;
             }
-            defaultLocal9pCache = created;
-            defaultLocal9pCacheInitialized = true;
-            return created;
+            Local9pParquetCache found = null;
+            for (Path candidate : candidateLocal9pCacheDirectories(config)) {
+                if (pathsOverlap(candidate, root) || (duckTmp != null && pathsOverlap(candidate, duckTmp)))
+                    continue;
+                Path ancestor = nearestExistingAncestor(candidate);
+                if (ancestor == null)
+                    continue;
+                try {
+                    if (!Files.isDirectory(ancestor, LinkOption.NOFOLLOW_LINKS) || !Files.isWritable(ancestor))
+                        continue;
+                    String fsType = Files.getFileStore(ancestor).type();
+                    if (is9pFileSystemType(fsType) || isVolatileMemoryFileSystemType(fsType))
+                        continue;
+                    java.util.Optional<Local9pParquetCache> opened = SHARED_LOCAL_9P_CACHES.computeIfAbsent(
+                            candidate,
+                            dir -> {
+                                try {
+                                    return java.util.Optional.of(
+                                            Local9pParquetCache.open(dir, DEFAULT_LOCAL_9P_CACHE_MAX_BYTES, false));
+                                } catch (Exception ignored) {
+                                    return java.util.Optional.empty();
+                                }
+                            });
+                    if (opened.isPresent()) {
+                        found = opened.get();
+                        break;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+            resolvedSharedLocal9pCache = java.util.Optional.ofNullable(found);
+            return found;
         }
+    }
+
+    private static boolean pathsOverlap(Path first, Path second) {
+        return first.equals(second) || first.startsWith(second) || second.startsWith(first);
+    }
+
+    private static Path nearestExistingAncestor(Path target) {
+        Path current = target.getParent();
+        while (current != null && !Files.exists(current, LinkOption.NOFOLLOW_LINKS))
+            current = current.getParent();
+        return current;
     }
 
     private boolean shouldProactivelyStage(AuthorizedObjects objects, Path operationDirectory) {
@@ -294,21 +355,24 @@ public final class ParquetArchiveReader {
         // latest-per-stream selection and before LIMIT or matching rows can be
         // silently lost. Structured predicates remain pushed into Parquet.
         boolean javaLatest = javaCql && latestSelection;
+        Predicate<String> cqlMatcher = javaCql ? JsonCqlEvaluator.compileMatcher(filter.getCQLFilter()) : null;
         Stream<ArchivedRow> rows;
         if (generations.size() > 1) {
             long callerHintLimit = javaLatest ? Long.MAX_VALUE : Math.min(limit, filter.getLimit());
             rows = streamWindowClusters(generations, filter, allowedDataStreams, allowedFois,
-                    Long.MAX_VALUE, callerHintLimit);
+                    Long.MAX_VALUE, callerHintLimit, javaLatest ? null : cqlMatcher);
+            if (javaLatest && cqlMatcher != null) {
+                rows = rows.filter(row -> cqlMatcher.test(row.observation().resultJson()));
+            }
         } else {
             AuthorizedObjects objects = authorize(generations);
             if (objects.byFilename().isEmpty())
                 return Stream.empty();
             rows = openRowStream(objects, auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
                     true, !javaCql, javaCql ? Long.MAX_VALUE : limit), generations.size());
-        }
-        if (javaCql) {
-            Predicate<String> cqlMatcher = JsonCqlEvaluator.compileMatcher(filter.getCQLFilter());
-            rows = rows.filter(row -> cqlMatcher.test(row.observation().resultJson()));
+            if (cqlMatcher != null) {
+                rows = rows.filter(row -> cqlMatcher.test(row.observation().resultJson()));
+            }
         }
 
         if (javaLatest) {
@@ -339,13 +403,13 @@ public final class ParquetArchiveReader {
     private Stream<ArchivedRow> streamWindowClusters(
             List<ArchiveGeneration> generations, ObsFilter filter,
             Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit) {
-        return streamWindowClusters(generations, filter, allowedDataStreams, allowedFois, limit, limit);
+        return streamWindowClusters(generations, filter, allowedDataStreams, allowedFois, limit, limit, null);
     }
 
     private Stream<ArchivedRow> streamWindowClusters(
             List<ArchiveGeneration> generations, ObsFilter filter,
             Set<Long> allowedDataStreams, Set<Long> allowedFois,
-            long cursorLimit, long callerHintLimit) {
+            long cursorLimit, long callerHintLimit, Predicate<String> cqlMatcher) {
         List<List<ArchiveGeneration>> clusters = windowClusters(generations);
         if (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().descendingOrder())
             java.util.Collections.reverse(clusters);
@@ -355,11 +419,13 @@ public final class ParquetArchiveReader {
         if (selectiveColdScan && clusters.size() > 1) {
             int leadSingleClusters = callerHintLimit <= 64 ? 2 : 0;
             clusters = batchOrderedClustersWithLeadProbe(clusters, leadSingleClusters, MAX_CQL_PAYLOAD_BATCH);
-        } else if (cursorLimit >= 2 && cursorLimit <= 64 && filter.getCQLFilter() == null && clusters.size() > 8) {
-            clusters = batchOrderedClusters(clusters, 16);
+        } else if (filter.getCQLFilter() == null && clusters.size() > 4 &&
+                ((cursorLimit >= 2 && cursorLimit <= 64) ||
+                 (cursorLimit == Long.MAX_VALUE && allowedDataStreams != null && allowedDataStreams.size() <= 256))) {
+            clusters = batchOrderedClusters(clusters, 32);
         }
         WindowClusterCursor cursor = new WindowClusterCursor(
-                clusters.iterator(), filter, allowedDataStreams, allowedFois, cursorLimit);
+                clusters.iterator(), filter, allowedDataStreams, allowedFois, cursorLimit, cqlMatcher);
         return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
                         Spliterator.ORDERED | Spliterator.NONNULL), false)
                 .onClose(cursor::close);
@@ -472,7 +538,7 @@ public final class ParquetArchiveReader {
 
     private static final int MAX_INLINE_MUTATION_EXCLUSIONS = 4_096;
     private static final int MAX_RESULT_TIME_METADATA_BATCH = 64;
-    private static final int MAX_CQL_PAYLOAD_BATCH = 64;
+    private static final int MAX_CQL_PAYLOAD_BATCH = 128;
     private static final int LOCAL_STAGE_COPY_RETRIES = 3;
 
     /**
@@ -927,7 +993,7 @@ public final class ParquetArchiveReader {
                 if (batchMap.isEmpty())
                     continue;
                 Map<UUID, Long> perGenCounts = cacheKeyByGenId.isEmpty() ? null : new HashMap<>(batch.size() * 2);
-                AuthorizedObjects batchObjects = new AuthorizedObjects(batchMap);
+                AuthorizedObjects batchObjects = new AuthorizedObjects(batchMap, allAuthorized.stampsByGenId());
                 long batchTotal = countCqlAuthorizedBatch(
                         duckSession, batchObjects, batch.size(), filter, allowedDataStreams, allowedFois,
                         exclusions, perGenCounts);
@@ -1401,71 +1467,100 @@ public final class ParquetArchiveReader {
             Runnable cancellationCheck = ConnectionManager.captureCancellableOperationCheck();
             cancellationCheck.run();
 
+            String[] stagedFilenames = new String[n];
+            List<Integer> missIndices = new ArrayList<>();
+            if (localCache != null && !objects.stampsByGenId().isEmpty()) {
+                for (int i = 0; i < n; i++) {
+                    cancellationCheck.run();
+                    ArchiveGeneration generation = generationList.get(i);
+                    VerificationStamp stamp = objects.stampsByGenId().get(generation.id());
+                    Path target = stageTargetPath(stageDir, i, generation);
+                    if (stamp != null && localCache.tryPinCached(generation.sha256(), stamp.size(), target)) {
+                        stagedFilenames[i] = canonicalFilename(target);
+                    } else {
+                        missIndices.add(i);
+                    }
+                }
+                if (missIndices.isEmpty()) {
+                    Map<String, ArchiveGeneration> fastStaged = new LinkedHashMap<>(n * 2);
+                    for (int i = 0; i < n; i++) {
+                        fastStaged.put(stagedFilenames[i], generationList.get(i));
+                    }
+                    completed = true;
+                    return new AuthorizedObjects(fastStaged, objects.stampsByGenId());
+                }
+            } else {
+                for (int i = 0; i < n; i++) {
+                    missIndices.add(i);
+                }
+            }
+
             Path realRoot = resolveRealRoot();
-            if (n == 1) {
-                ArchiveGeneration generation = generationList.get(0);
+            if (missIndices.size() == 1) {
+                int idx = missIndices.get(0);
+                ArchiveGeneration generation = generationList.get(idx);
                 Path normalizedRelative = validateNormalizedRelativePath(generation.objectPath());
                 verifyRelativeDirectories(realRoot, normalizedRelative);
                 ResolvedSourceObject source = resolveLeafObjectForStaging(realRoot, normalizedRelative);
-                Path target = stageTargetPath(stageDir, 0, generation);
+                Path target = stageTargetPath(stageDir, idx, generation);
                 stageSingleObject(source, target, generation.sha256(), localCache, cancellationCheck);
-                Map<String, ArchiveGeneration> single = Map.of(canonicalFilename(target), generation);
-                completed = true;
-                return new AuthorizedObjects(single);
-            }
-
-            Path[] normalizedRelatives = new Path[n];
-            Set<Path> uniqueRelativeDirs = new LinkedHashSet<>();
-            for (int i = 0; i < n; i++) {
-                Path normalizedRelative = validateNormalizedRelativePath(generationList.get(i).objectPath());
-                normalizedRelatives[i] = normalizedRelative;
-                Path parent = normalizedRelative.getParent();
-                if (parent != null) {
-                    Path prefix = null;
-                    for (Path component : parent) {
-                        prefix = prefix == null ? component : prefix.resolve(component);
-                        uniqueRelativeDirs.add(prefix);
+                stagedFilenames[idx] = canonicalFilename(target);
+            } else {
+                int missCount = missIndices.size();
+                Path[] normalizedRelatives = new Path[missCount];
+                Set<Path> uniqueRelativeDirs = new LinkedHashSet<>();
+                for (int m = 0; m < missCount; m++) {
+                    int idx = missIndices.get(m);
+                    Path normalizedRelative = validateNormalizedRelativePath(generationList.get(idx).objectPath());
+                    normalizedRelatives[m] = normalizedRelative;
+                    Path parent = normalizedRelative.getParent();
+                    if (parent != null) {
+                        Path prefix = null;
+                        for (Path component : parent) {
+                            prefix = prefix == null ? component : prefix.resolve(component);
+                            uniqueRelativeDirs.add(prefix);
+                        }
                     }
                 }
-            }
 
-            if (!uniqueRelativeDirs.isEmpty()) {
-                List<Path> dirList = new ArrayList<>(uniqueRelativeDirs);
-                runParallelSlices(dirList.size(), (start, end) -> {
-                    for (int i = start; i < end; i++) {
+                if (!uniqueRelativeDirs.isEmpty()) {
+                    List<Path> dirList = new ArrayList<>(uniqueRelativeDirs);
+                    runParallelSlices(dirList.size(), (start, end) -> {
+                        for (int i = start; i < end; i++) {
+                            cancellationCheck.run();
+                            Path relDir = dirList.get(i);
+                            if (Files.isSymbolicLink(realRoot.resolve(relDir)))
+                                throw new IllegalStateException(
+                                        "Archive object path contains a symbolic link: " + root.resolve(relDir));
+                        }
+                    });
+                }
+
+                runParallelSlices(missCount, (start, end) -> {
+                    for (int m = start; m < end; m++) {
                         cancellationCheck.run();
-                        Path relDir = dirList.get(i);
-                        if (Files.isSymbolicLink(realRoot.resolve(relDir)))
-                            throw new IllegalStateException(
-                                    "Archive object path contains a symbolic link: " + root.resolve(relDir));
+                        int idx = missIndices.get(m);
+                        ArchiveGeneration generation = generationList.get(idx);
+                        ResolvedSourceObject source = resolveLeafObjectForStaging(realRoot, normalizedRelatives[m]);
+                        Path target = stageTargetPath(stageDir, idx, generation);
+                        try {
+                            stageSingleObject(source, target, generation.sha256(), localCache, cancellationCheck);
+                        } catch (RuntimeException | Error unchecked) {
+                            throw unchecked;
+                        } catch (Exception checked) {
+                            throw new StagingIoException(checked);
+                        }
+                        stagedFilenames[idx] = canonicalFilename(target);
                     }
                 });
             }
-
-            String[] stagedFilenames = new String[n];
-            runParallelSlices(n, (start, end) -> {
-                for (int i = start; i < end; i++) {
-                    cancellationCheck.run();
-                    ArchiveGeneration generation = generationList.get(i);
-                    ResolvedSourceObject source = resolveLeafObjectForStaging(realRoot, normalizedRelatives[i]);
-                    Path target = stageTargetPath(stageDir, i, generation);
-                    try {
-                        stageSingleObject(source, target, generation.sha256(), localCache, cancellationCheck);
-                    } catch (RuntimeException | Error unchecked) {
-                        throw unchecked;
-                    } catch (Exception checked) {
-                        throw new StagingIoException(checked);
-                    }
-                    stagedFilenames[i] = canonicalFilename(target);
-                }
-            });
 
             Map<String, ArchiveGeneration> staged = new LinkedHashMap<>(n * 2);
             for (int i = 0; i < n; i++) {
                 staged.put(stagedFilenames[i], generationList.get(i));
             }
             completed = true;
-            return new AuthorizedObjects(staged);
+            return new AuthorizedObjects(staged, objects.stampsByGenId());
         } catch (StagingIoException wrapped) {
             if (wrapped.getCause() instanceof Exception checked)
                 throw checked;
@@ -1700,7 +1795,10 @@ public final class ParquetArchiveReader {
             Path normalizedRelative = validateNormalizedRelativePath(generation.objectPath());
             verifyRelativeDirectories(realRoot, normalizedRelative);
             Path object = verifyLeafObject(realRoot, normalizedRelative, generation.sha256());
-            return new AuthorizedObjects(Map.of(canonicalFilename(object), generation));
+            VerificationStamp stamp = verifiedObjects.get(object);
+            return new AuthorizedObjects(
+                    Map.of(canonicalFilename(object), generation),
+                    stamp != null ? Map.of(generation.id(), stamp) : Map.of());
         }
 
         Path[] normalizedRelatives = new Path[n];
@@ -1733,24 +1831,29 @@ public final class ParquetArchiveReader {
         }
 
         String[] filenames = new String[n];
+        VerificationStamp[] stamps = new VerificationStamp[n];
         runParallelSlices(n, (start, end) -> {
             for (int i = start; i < end; i++) {
                 cancellationCheck.run();
                 Path object = verifyLeafObject(
                         realRoot, normalizedRelatives[i], generations.get(i).sha256());
                 filenames[i] = canonicalFilename(object);
+                stamps[i] = verifiedObjects.get(object);
             }
         });
 
         Map<String, ArchiveGeneration> objects = new LinkedHashMap<>(n * 2);
+        Map<UUID, VerificationStamp> stampsByGenId = new HashMap<>(n * 2);
         for (int i = 0; i < n; i++) {
             ArchiveGeneration generation = generations.get(i);
             String filename = filenames[i];
             ArchiveGeneration previous = objects.putIfAbsent(filename, generation);
             if (previous != null && !previous.id().equals(generation.id()))
                 throw new IllegalStateException("Multiple archive generations reference the same object: " + filename);
+            if (stamps[i] != null)
+                stampsByGenId.put(generation.id(), stamps[i]);
         }
-        return new AuthorizedObjects(objects);
+        return new AuthorizedObjects(objects, stampsByGenId);
     }
 
     @FunctionalInterface
@@ -1959,6 +2062,14 @@ public final class ParquetArchiveReader {
     }
 
     private Path verifyLeafObject(Path realRoot, Path normalizedRelative, String expectedSha256) {
+        return verifyLeafObject(realRoot, normalizedRelative, expectedSha256, true);
+    }
+
+    private Path verifyLeafObject(
+            Path realRoot,
+            Path normalizedRelative,
+            String expectedSha256,
+            boolean allowAdoptedLocalCache) {
         Path candidate = realRoot.resolve(normalizedRelative).normalize();
         if (!candidate.startsWith(realRoot))
             throw new IllegalStateException("Archive object resolves outside configured root");
@@ -1978,7 +2089,7 @@ public final class ParquetArchiveReader {
             verifiedObjects.remove(candidate);
             throw new IllegalStateException("Cataloged archive object is not a regular file: " + candidate);
         }
-        verifyOnceWithAttributes(candidate, expectedSha256, before);
+        verifyOnceWithAttributes(candidate, expectedSha256, before, allowAdoptedLocalCache);
         return candidate;
     }
 
@@ -2008,10 +2119,14 @@ public final class ParquetArchiveReader {
         Path realRoot = resolveRealRoot();
         Path normalizedRelative = validateNormalizedRelativePath(generation.objectPath());
         verifyRelativeDirectories(realRoot, normalizedRelative);
-        verifyLeafObject(realRoot, normalizedRelative, generation.sha256());
+        verifyLeafObject(realRoot, normalizedRelative, generation.sha256(), false);
     }
 
-    private void verifyOnceWithAttributes(Path object, String expectedSha256, BasicFileAttributes initialBefore) {
+    private void verifyOnceWithAttributes(
+            Path object,
+            String expectedSha256,
+            BasicFileAttributes initialBefore,
+            boolean allowAdoptedLocalCache) {
         try {
             long now = System.nanoTime();
             VerificationStamp cached = verifiedObjects.get(object);
@@ -2026,6 +2141,11 @@ public final class ParquetArchiveReader {
                     return;
                 Local9pParquetCache localCache = activeLocalStageCache();
                 if (localCache != null && localCache.canCache(expectedSha256, before.size())) {
+                    if (allowAdoptedLocalCache &&
+                            localCache.verifyCachedObjectOnLocalDisk(expectedSha256, before.size())) {
+                        verifiedObjects.put(object, VerificationStamp.from(expectedSha256, before, now));
+                        return;
+                    }
                     Runnable cancellationCheck = ConnectionManager.captureCancellableOperationCheck();
                     Path tempFile = localCache.newTempFile();
                     try {
@@ -2078,6 +2198,7 @@ public final class ParquetArchiveReader {
         private final long maxBytes;
         private final Object lock = new Object();
         private final LinkedHashMap<String, Long> lruSizes = new LinkedHashMap<>(512, 0.75f, true);
+        private final Set<String> digestVerifiedInProcess = new LinkedHashSet<>();
         private long trackedBytes;
         final AtomicLong copyCount = new AtomicLong();
         final AtomicLong pinHitCount = new AtomicLong();
@@ -2103,12 +2224,53 @@ public final class ParquetArchiveReader {
             ensurePrivateDirectory(objectsDir);
             ensurePrivateDirectory(pinsDir);
             ensurePrivateDirectory(tmpDir);
+            sweepDirectoryChildren(pinsDir);
+            sweepDirectoryChildren(tmpDir);
             if (resetOnOpen) {
                 sweepDirectoryChildren(objectsDir);
-                sweepDirectoryChildren(pinsDir);
-                sweepDirectoryChildren(tmpDir);
+                return new Local9pParquetCache(realRoot, objectsDir, pinsDir, tmpDir, maxBytes);
             }
-            return new Local9pParquetCache(realRoot, objectsDir, pinsDir, tmpDir, maxBytes);
+            Local9pParquetCache cache = new Local9pParquetCache(realRoot, objectsDir, pinsDir, tmpDir, maxBytes);
+            cache.adoptExistingObjects();
+            return cache;
+        }
+
+        private void adoptExistingObjects() {
+            record CandidateCachedFile(String sha256, long size, long lastModifiedMillis) {}
+            List<CandidateCachedFile> retained = new ArrayList<>();
+            try (var entries = Files.newDirectoryStream(objectsDir)) {
+                for (Path entry : entries) {
+                    try {
+                        BasicFileAttributes attrs = Files.readAttributes(
+                                entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                        String fileName = entry.getFileName().toString();
+                        if (!attrs.isRegularFile() || attrs.isSymbolicLink() || !fileName.endsWith(".parquet")) {
+                            if (attrs.isDirectory() && !attrs.isSymbolicLink())
+                                sweepDirectoryChildren(entry);
+                            Files.deleteIfExists(entry);
+                            continue;
+                        }
+                        String sha = fileName.substring(0, fileName.length() - ".parquet".length());
+                        if (!canCache(sha, attrs.size())) {
+                            Files.deleteIfExists(entry);
+                            continue;
+                        }
+                        retained.add(new CandidateCachedFile(
+                                sha, attrs.size(), attrs.lastModifiedTime().toMillis()));
+                    } catch (IOException ignored) {
+                    }
+                }
+            } catch (IOException ignored) {
+                return;
+            }
+            retained.sort(Comparator.comparingLong(CandidateCachedFile::lastModifiedMillis));
+            synchronized (lock) {
+                for (CandidateCachedFile item : retained) {
+                    lruSizes.put(item.sha256(), item.size());
+                    trackedBytes += item.size();
+                }
+                evictOverflowUnderLock(null);
+            }
         }
 
         boolean canCache(String expectedSha256, long sizeBytes) {
@@ -2137,6 +2299,68 @@ public final class ParquetArchiveReader {
             return pinDir;
         }
 
+        boolean verifyCachedObjectOnLocalDisk(String sha256, long expectedSize) {
+            if (!canCache(sha256, expectedSize))
+                return false;
+            Path verifyPin = null;
+            try {
+                BasicFileAttributes beforeAttrs;
+                synchronized (lock) {
+                    Long recordedSize = lruSizes.get(sha256);
+                    if (recordedSize == null || recordedSize != expectedSize)
+                        return false;
+                    Path cachedFile = objectPath(sha256);
+                    try {
+                        beforeAttrs = Files.readAttributes(cachedFile, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                    } catch (IOException missing) {
+                        trackedBytes = Math.max(0L, trackedBytes - recordedSize);
+                        lruSizes.remove(sha256);
+                        digestVerifiedInProcess.remove(sha256);
+                        return false;
+                    }
+                    if (!beforeAttrs.isRegularFile() || beforeAttrs.isSymbolicLink() || beforeAttrs.size() != expectedSize) {
+                        Files.deleteIfExists(cachedFile);
+                        trackedBytes = Math.max(0L, trackedBytes - recordedSize);
+                        lruSizes.remove(sha256);
+                        digestVerifiedInProcess.remove(sha256);
+                        return false;
+                    }
+                    if (digestVerifiedInProcess.contains(sha256))
+                        return true;
+                    verifyPin = newTempFile();
+                    linkOrCopy(cachedFile, verifyPin);
+                }
+                String actual = ArchiveExporter.sha256(verifyPin);
+                if (!sha256.equals(actual)) {
+                    synchronized (lock) {
+                        Long removed = lruSizes.remove(sha256);
+                        if (removed != null)
+                            trackedBytes = Math.max(0L, trackedBytes - removed);
+                        digestVerifiedInProcess.remove(sha256);
+                        Files.deleteIfExists(objectPath(sha256));
+                    }
+                    return false;
+                }
+                synchronized (lock) {
+                    Long currentSize = lruSizes.get(sha256);
+                    if (currentSize != null && currentSize == expectedSize) {
+                        digestVerifiedInProcess.add(sha256);
+                        return true;
+                    }
+                    return false;
+                }
+            } catch (Exception ignored) {
+                return false;
+            } finally {
+                if (verifyPin != null) {
+                    try {
+                        Files.deleteIfExists(verifyPin);
+                    } catch (IOException ignored) {
+                    }
+                }
+            }
+        }
+
         boolean tryPinCached(String sha256, long expectedSize, Path pinTarget) throws IOException {
             if (!canCache(sha256, expectedSize))
                 return false;
@@ -2151,12 +2375,14 @@ public final class ParquetArchiveReader {
                 } catch (IOException missing) {
                     trackedBytes = Math.max(0L, trackedBytes - recordedSize);
                     lruSizes.remove(sha256);
+                    digestVerifiedInProcess.remove(sha256);
                     return false;
                 }
                 if (!attrs.isRegularFile() || attrs.isSymbolicLink() || attrs.size() != expectedSize) {
                     Files.deleteIfExists(cachedFile);
                     trackedBytes = Math.max(0L, trackedBytes - recordedSize);
                     lruSizes.remove(sha256);
+                    digestVerifiedInProcess.remove(sha256);
                     return false;
                 }
                 linkOrCopy(cachedFile, pinTarget);
@@ -2201,6 +2427,7 @@ public final class ParquetArchiveReader {
             }
             setPrivateFilePermissionsIfSupported(cachedFile);
             lruSizes.put(sha256, sizeBytes);
+            digestVerifiedInProcess.add(sha256);
             trackedBytes += sizeBytes;
             return cachedFile;
         }
@@ -2217,6 +2444,7 @@ public final class ParquetArchiveReader {
                 } catch (IOException ignored) {
                 }
                 trackedBytes = Math.max(0L, trackedBytes - eldest.getValue());
+                digestVerifiedInProcess.remove(eldest.getKey());
                 it.remove();
             }
         }
@@ -2450,46 +2678,208 @@ public final class ParquetArchiveReader {
         private final ObsFilter filter;
         private final Set<Long> allowedDataStreams;
         private final Set<Long> allowedFois;
+        private final Predicate<String> cqlMatcher;
+        private final boolean zeroCacheAllowed;
+        private final String cqlCacheKey;
+        private final String streamsCacheKey;
+        private final String foisCacheKey;
+        private final boolean nonNullPhenomenonRequired;
+        private final boolean nonNullResultTimeRequired;
         private final AtomicBoolean closed = new AtomicBoolean();
-        private Stream<ArchivedRow> currentStream;
-        private Iterator<ArchivedRow> currentRows;
+
+        private DuckDbResourcePolicy.Session sharedSession;
+        private boolean sessionCountedInOpenCursors;
+        private PreparedStatement currentStatement;
+        private ResultSet currentResult;
+        private AuthorizedObjects currentActiveObjects;
+        private AuthorizedObjects currentStagedObjects;
+        private List<ArchiveGeneration> currentBatchGenerations;
+        private Set<UUID> currentBatchMatchedGenIds;
+        private ArchivedRow prefetchedNext;
+        private boolean hasPrefetched;
         private long remaining;
 
         WindowClusterCursor(Iterator<List<ArchiveGeneration>> clusters, ObsFilter filter,
-                            Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit) {
+                            Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit,
+                            Predicate<String> cqlMatcher) {
             this.clusters = clusters;
             this.filter = filter;
             this.allowedDataStreams = allowedDataStreams;
             this.allowedFois = allowedFois;
             this.remaining = limit;
+            this.cqlMatcher = cqlMatcher;
+            boolean allowCache = cqlMatcher != null &&
+                    directReadFaultInjector == null &&
+                    (filter.getInternalIDs() == null || filter.getInternalIDs().isEmpty());
+            String resolvedKey = allowCache
+                    ? JsonCqlEvaluator.canonicalCacheKey(filter.getCQLFilter()).orElse(null)
+                    : null;
+            this.zeroCacheAllowed = resolvedKey != null;
+            this.cqlCacheKey = resolvedKey;
+            this.streamsCacheKey = zeroCacheAllowed ? canonicalIdSetKey(allowedDataStreams) : null;
+            this.foisCacheKey = zeroCacheAllowed ? canonicalIdSetKey(allowedFois) : null;
+            this.nonNullPhenomenonRequired = filter.getPhenomenonTime() != null;
+            this.nonNullResultTimeRequired = filter.getResultTime() != null;
+        }
+
+        private CqlGenerationCountKey cacheKeyFor(ArchiveGeneration generation) {
+            return new CqlGenerationCountKey(
+                    generation.sha256(),
+                    streamsCacheKey,
+                    foisCacheKey,
+                    cqlCacheKey,
+                    nonNullPhenomenonRequired,
+                    nonNullResultTimeRequired);
         }
 
         @Override
         public boolean hasNext() {
+            if (hasPrefetched)
+                return true;
             if (closed.get() || remaining == 0)
                 return false;
             try {
                 while (true) {
-                    if (currentRows != null && currentRows.hasNext())
-                        return true;
-                    closeCurrent();
+                    if (currentResult != null) {
+                        while (nextCancellable(currentResult)) {
+                            String resultJson = currentResult.getString(10);
+                            if (cqlMatcher != null && !cqlMatcher.test(resultJson)) {
+                                continue;
+                            }
+                            ArchiveGeneration generation = generationForFilename(
+                                    currentActiveObjects, currentResult.getString(1));
+                            if (currentBatchMatchedGenIds != null) {
+                                currentBatchMatchedGenIds.add(generation.id());
+                            }
+                            Integer foiScope = currentResult.getObject(6, Integer.class);
+                            Long foiId = currentResult.getObject(7, Long.class);
+                            prefetchedNext = new ArchivedRow(generation, new ArchivedObservation(
+                                    currentResult.getInt(2), currentResult.getLong(3),
+                                    currentResult.getInt(4), currentResult.getLong(5),
+                                    foiScope, foiId,
+                                    UtcJdbcTime.getDuckDbInstant(currentResult, 8),
+                                    UtcJdbcTime.getDuckDbInstant(currentResult, 9),
+                                    resultJson, currentResult.getString(11)));
+                            hasPrefetched = true;
+                            return true;
+                        }
+                        recordBatchZeroMatches();
+                        closeCurrentBatch();
+                    }
                     if (!clusters.hasNext()) {
                         close();
                         return false;
                     }
                     List<ArchiveGeneration> cluster = clusters.next();
                     AuthorizedObjects objects = authorize(cluster);
-                    boolean javaCql = filter.getCQLFilter() != null;
-                    final long clusterLimit = javaCql ? Long.MAX_VALUE : remaining;
-                    currentStream = openRowStream(objects,
-                            auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
-                                    true, !javaCql, clusterLimit),
-                            cluster.size());
-                    currentRows = currentStream.iterator();
+                    if (objects.byFilename().isEmpty())
+                        continue;
+                    List<ArchiveGeneration> activeGenerations = cluster;
+                    if (zeroCacheAllowed) {
+                        Map<String, ArchiveGeneration> uncachedMap = new LinkedHashMap<>(objects.byFilename().size() * 2);
+                        List<ArchiveGeneration> uncachedGens = new ArrayList<>(cluster.size());
+                        for (Map.Entry<String, ArchiveGeneration> entry : objects.byFilename().entrySet()) {
+                            ArchiveGeneration gen = entry.getValue();
+                            if (gen.parityVerified() &&
+                                    Long.valueOf(0L).equals(unmutatedCqlCounts.get(cacheKeyFor(gen)))) {
+                                continue;
+                            }
+                            uncachedMap.put(entry.getKey(), gen);
+                            uncachedGens.add(gen);
+                        }
+                        if (uncachedMap.isEmpty())
+                            continue;
+                        if (uncachedMap.size() != objects.byFilename().size()) {
+                            objects = new AuthorizedObjects(uncachedMap, objects.stampsByGenId());
+                            activeGenerations = uncachedGens;
+                        }
+                    }
+                    openNextBatch(objects, activeGenerations);
                 }
             } catch (RuntimeException | Error error) {
-                close();
+                closeAndSuppress(this, error);
                 throw error;
+            } catch (Exception checked) {
+                closeAndSuppress(this, checked);
+                throw new IllegalStateException("Cannot decode archived observation", checked);
+            }
+        }
+
+        private void openNextBatch(AuthorizedObjects objects, List<ArchiveGeneration> activeGenerations) {
+            boolean javaCql = filter.getCQLFilter() != null;
+            final long clusterLimit = javaCql ? Long.MAX_VALUE : remaining;
+            Function<AuthorizedObjects, QueryPlan> planFactory = auth -> queryPlan(
+                    auth, filter, allowedDataStreams, allowedFois, true, !javaCql, clusterLimit);
+            PreparedStatement statement = null;
+            ResultSet result = null;
+            AuthorizedObjects stagedObjects = null;
+            try {
+                if (sharedSession == null) {
+                    sharedSession = DuckDbResourcePolicy.open(config, "cold-query");
+                    openCursors.incrementAndGet();
+                    sessionCountedInOpenCursors = true;
+                }
+                AuthorizedObjects activeObjects = objects;
+                if (shouldProactivelyStage(objects, sharedSession.operationDirectory())) {
+                    stagedObjects = stageAuthorizedObjectsLocally(objects, sharedSession.operationDirectory());
+                    activeObjects = stagedObjects;
+                    QueryPlan stagedPlan = planFactory.apply(activeObjects);
+                    statement = ConnectionManager.trackCancellableStatement(
+                            sharedSession.connection().prepareStatement(stagedPlan.sql()), "DuckDB cold query");
+                    bind(statement, stagedPlan.parameters());
+                    result = statement.executeQuery();
+                } else {
+                    try {
+                        maybeInjectDirectReadFault(objects);
+                        QueryPlan plan = planFactory.apply(objects);
+                        statement = ConnectionManager.trackCancellableStatement(
+                                sharedSession.connection().prepareStatement(plan.sql()), "DuckDB cold query");
+                        bind(statement, plan.parameters());
+                        result = statement.executeQuery();
+                    } catch (Exception directError) {
+                        if (!isTransientReadMemoryError(directError))
+                            throw directError;
+                        closeAndSuppress(result, directError);
+                        closeAndSuppress(statement, directError);
+                        result = null;
+                        statement = null;
+                        stagedObjects = stageAuthorizedObjectsLocally(objects, sharedSession.operationDirectory());
+                        activeObjects = stagedObjects;
+                        QueryPlan stagedPlan = planFactory.apply(activeObjects);
+                        statement = ConnectionManager.trackCancellableStatement(
+                                sharedSession.connection().prepareStatement(stagedPlan.sql()), "DuckDB cold query");
+                        bind(statement, stagedPlan.parameters());
+                        result = statement.executeQuery();
+                    }
+                }
+                currentStatement = statement;
+                currentResult = result;
+                currentActiveObjects = activeObjects;
+                currentStagedObjects = stagedObjects;
+                currentBatchGenerations = zeroCacheAllowed ? activeGenerations : null;
+                currentBatchMatchedGenIds = zeroCacheAllowed ? new java.util.HashSet<>() : null;
+            } catch (Exception | Error error) {
+                closeAndSuppress(result, error);
+                closeAndSuppress(statement, error);
+                if (stagedObjects != null)
+                    cleanupStagedBatchObjects(stagedObjects);
+                if (error instanceof Error fatal)
+                    throw fatal;
+                throw new IllegalStateException(
+                        "Cannot query " + activeGenerations.size() + " archive generation(s)", error);
+            }
+        }
+
+        private void recordBatchZeroMatches() {
+            if (!zeroCacheAllowed || currentBatchGenerations == null || currentBatchMatchedGenIds == null)
+                return;
+            if (unmutatedCqlCounts.size() >= MAX_CQL_COUNT_CACHE_ENTRIES)
+                unmutatedCqlCounts.clear();
+            for (ArchiveGeneration generation : currentBatchGenerations) {
+                if (!currentBatchMatchedGenIds.contains(generation.id()) &&
+                        isEligibleForUnmutatedCqlCache(generation, filter, null)) {
+                    unmutatedCqlCounts.putIfAbsent(cacheKeyFor(generation), 0L);
+                }
             }
         }
 
@@ -2497,7 +2887,9 @@ public final class ParquetArchiveReader {
         public ArchivedRow next() {
             if (!hasNext())
                 throw new NoSuchElementException();
-            ArchivedRow value = currentRows.next();
+            ArchivedRow value = prefetchedNext;
+            prefetchedNext = null;
+            hasPrefetched = false;
             if (remaining != Long.MAX_VALUE) {
                 remaining--;
                 if (remaining == 0)
@@ -2510,14 +2902,41 @@ public final class ParquetArchiveReader {
         public void close() {
             if (!closed.compareAndSet(false, true))
                 return;
-            closeCurrent();
+            Throwable failure = null;
+            try {
+                failure = closeCurrentBatchAndCollect(failure);
+                failure = closeAndCollect(sharedSession, failure);
+            } finally {
+                if (sessionCountedInOpenCursors) {
+                    openCursors.decrementAndGet();
+                    sessionCountedInOpenCursors = false;
+                }
+                sharedSession = null;
+                prefetchedNext = null;
+                hasPrefetched = false;
+            }
+            if (failure != null)
+                throw new IllegalStateException("Cannot close archive query resources", failure);
         }
 
-        private void closeCurrent() {
-            if (currentStream != null)
-                currentStream.close();
-            currentStream = null;
-            currentRows = null;
+        private void closeCurrentBatch() {
+            Throwable failure = closeCurrentBatchAndCollect(null);
+            if (failure != null)
+                throw new IllegalStateException("Cannot close archive batch resources", failure);
+        }
+
+        private Throwable closeCurrentBatchAndCollect(Throwable failure) {
+            failure = closeAndCollect(currentResult, failure);
+            failure = closeAndCollect(currentStatement, failure);
+            if (currentStagedObjects != null)
+                cleanupStagedBatchObjects(currentStagedObjects);
+            currentResult = null;
+            currentStatement = null;
+            currentActiveObjects = null;
+            currentStagedObjects = null;
+            currentBatchGenerations = null;
+            currentBatchMatchedGenIds = null;
+            return failure;
         }
     }
 
@@ -2598,7 +3017,13 @@ public final class ParquetArchiveReader {
     }
 
     private record QueryPlan(String sql, List<Object> parameters) {}
-    private record AuthorizedObjects(Map<String, ArchiveGeneration> byFilename) {}
+    private record AuthorizedObjects(
+            Map<String, ArchiveGeneration> byFilename,
+            Map<UUID, VerificationStamp> stampsByGenId) {
+        AuthorizedObjects(Map<String, ArchiveGeneration> byFilename) {
+            this(byFilename, Map.of());
+        }
+    }
     private record VerificationStamp(String expectedSha256, long size,
                                      java.nio.file.attribute.FileTime lastModified,
                                      Object fileKey, long verifiedAtNanos) {

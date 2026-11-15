@@ -1331,9 +1331,24 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             return Stream.of(initialSupplier, remainderSupplier).flatMap(Supplier::get);
         }
 
-        List<ArchiveGeneration> candidates = archiveCatalog.candidates(
-                bounds.start(), bounds.end(), oneId, minId, maxId, dataStreams,
-                minResultTime, maxResultTime);
+        List<ArchiveGeneration> candidates;
+        if (filter.getInternalIDs() != null &&
+                filter.getInternalIDs().size() > 1 &&
+                filter.getInternalIDs().size() <= 4_096) {
+            List<Long> targetLongIds = filter.getInternalIDs().stream()
+                    .filter(id -> id.getScope() == idScope)
+                    .map(BigId::getIdAsLong)
+                    .distinct()
+                    .toList();
+            if (targetLongIds.isEmpty())
+                return Stream.empty();
+            candidates = archiveCatalog.candidatesForObservationIds(
+                    targetLongIds, bounds.start(), bounds.end(), dataStreams, minResultTime, maxResultTime);
+        } else {
+            candidates = archiveCatalog.candidates(
+                    bounds.start(), bounds.end(), oneId, minId, maxId, dataStreams,
+                    minResultTime, maxResultTime);
+        }
         return streamColdBasesFromCandidates(
                 candidates, filter, readerLimit, dataStreams, fois, hasMutations, mutationBatchSize);
     }

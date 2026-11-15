@@ -1085,6 +1085,38 @@ public class TestParquetArchiveReader {
         }
     }
 
+    @Test
+    public void likeAndIlikePushDownLiteralRunsIntoDuckDbForArchivedVehicleOcrRows() throws Exception {
+        Path root = temporary.newFolder("vehicle-ocr-like").toPath();
+        ArchiveGeneration generation = writeGeneration(root, "ocr.parquet", new TestRow[]{
+                new TestRow(501L, 77L, "2026-01-01T00:01:00Z",
+                        "{\"occupancyObsId\":\"obs-a\",\"value\":\"MSCU 123456 5\",\"normalizedValue\":\"MSCU1234565\",\"confidence\":0.98}"),
+                new TestRow(502L, 77L, "2026-01-01T00:05:00Z",
+                        "{\"occupancyObsId\":\"obs-b\",\"value\":\"TGHU 999888 1\",\"normalizedValue\":\"TGHU9998881\",\"confidence\":0.94}"),
+                new TestRow(503L, 77L, "2026-01-01T00:09:00Z",
+                        "{\"occupancyObsId\":\"obs-c\",\"value\":\"MSCU 123456 5\",\"normalizedValue\":\"MSCU1234565\",\"confidence\":0.96}")
+        });
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+
+        ObsFilter prefixFilter = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(4, 77L))
+                .withCQLFilter("normalizedValue LIKE 'MSCU1234%'")
+                .build();
+        assertTrue(JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(prefixFilter.getCQLFilter()));
+        var prefixMatches = reader.read(generation, prefixFilter, Set.of(77L), null);
+        assertEquals(List.of(501L, 503L), prefixMatches.stream().map(r -> r.observation().id()).toList());
+
+        var ff = org.geotools.factory.CommonFactoryFinder.getFilterFactory();
+        ObsFilter caseInsensitiveContains = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(4, 77L))
+                .withCQLFilter(ff.like(ff.property("value"), "%tghu 999888%", "%", "_", "\\", false))
+                .build();
+        assertTrue(JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(caseInsensitiveContains.getCQLFilter()));
+        var containsMatches = reader.read(generation, caseInsensitiveContains, Set.of(77L), null);
+        assertEquals(List.of(502L), containsMatches.stream().map(r -> r.observation().id()).toList());
+    }
+
     private record TestRow(long id, long dataStreamId, String time, String resultJson) {
         private TestRow(long id, long dataStreamId, String time) {
             this(id, dataStreamId, time, "{\"value\":" + id + "}");

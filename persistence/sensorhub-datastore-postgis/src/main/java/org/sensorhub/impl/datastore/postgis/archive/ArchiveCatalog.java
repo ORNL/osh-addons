@@ -1663,11 +1663,26 @@ public final class ArchiveCatalog {
      * least one requested observation ID in a single PostgreSQL round trip.
      */
     public List<ArchiveGeneration> candidatesForObservationIds(Collection<Long> observationIds) {
+        return candidatesForObservationIds(observationIds, null, null, null, null, null);
+    }
+
+    public List<ArchiveGeneration> candidatesForObservationIds(
+            Collection<Long> observationIds,
+            Instant start,
+            Instant end,
+            Set<Long> dataStreams,
+            Instant minResultTime,
+            Instant maxResultTime) {
         if (observationIds == null || observationIds.isEmpty())
+            return List.of();
+        if (dataStreams != null && dataStreams.isEmpty())
+            return List.of();
+        if (start != null && end != null && !start.isBefore(end))
             return List.of();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
-            return candidatesForObservationIds(connection, observationIds);
+            return candidatesForObservationIds(
+                    connection, observationIds, start, end, dataStreams, minResultTime, maxResultTime);
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot plan archive point-ID query", e);
         }
@@ -1675,28 +1690,72 @@ public final class ArchiveCatalog {
 
     public List<ArchiveGeneration> candidatesForObservationIds(
             Connection connection, Collection<Long> observationIds) throws SQLException {
+        return candidatesForObservationIds(connection, observationIds, null, null, null, null, null);
+    }
+
+    public List<ArchiveGeneration> candidatesForObservationIds(
+            Connection connection,
+            Collection<Long> observationIds,
+            Instant start,
+            Instant end,
+            Set<Long> dataStreams,
+            Instant minResultTime,
+            Instant maxResultTime) throws SQLException {
         if (observationIds == null || observationIds.isEmpty())
             return List.of();
-        String sql = "WITH requested(id) AS (SELECT DISTINCT unnest(?::bigint[])) " +
+        if (dataStreams != null && dataStreams.isEmpty())
+            return List.of();
+        if (start != null && end != null && !start.isBefore(end))
+            return List.of();
+        boolean filterWindow = start != null && end != null;
+        boolean filterDataStreams = dataStreams != null;
+        StringBuilder sql = new StringBuilder(
+                "WITH requested(id) AS (SELECT DISTINCT unnest(?::bigint[])) " +
                 "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
                 "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
                 "FROM oscar_archive_generation g " +
                 "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
                 "AND EXISTS (SELECT 1 FROM requested r JOIN oscar_archive_id_block b " +
-                "ON r.id BETWEEN b.min_id AND b.max_id WHERE b.generation_id=g.id) " +
-                "ORDER BY g.window_start, g.id";
+                "ON r.id BETWEEN b.min_id AND b.max_id WHERE b.generation_id=g.id)");
+        if (filterWindow)
+            sql.append(" AND g.window_start < ? AND g.window_end > ?");
+        if (minResultTime != null)
+            sql.append(" AND (g.max_result_time IS NULL OR g.max_result_time >= ?)");
+        if (maxResultTime != null)
+            sql.append(" AND (g.min_result_time IS NULL OR g.min_result_time <= ?)");
+        if (filterDataStreams)
+            sql.append(" AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
+                    "WHERE s.generation_id=g.id AND s.datastream_id=ANY (?::bigint[]))");
+        sql.append(" ORDER BY g.window_start, g.id");
+
         List<ArchiveGeneration> generations = new ArrayList<>();
         java.sql.Array ids = connection.createArrayOf("bigint", observationIds.toArray(Long[]::new));
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
-            statement.setArray(1, ids);
-            statement.setString(2, storeKey);
-            statement.setInt(3, idScope);
+        java.sql.Array streamArray = filterDataStreams
+                ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
+                : null;
+        try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            int p = 1;
+            statement.setArray(p++, ids);
+            statement.setString(p++, storeKey);
+            statement.setInt(p++, idScope);
+            if (filterWindow) {
+                UtcJdbcTime.setInstant(statement, p++, end);
+                UtcJdbcTime.setInstant(statement, p++, start);
+            }
+            if (minResultTime != null)
+                UtcJdbcTime.setInstant(statement, p++, minResultTime);
+            if (maxResultTime != null)
+                UtcJdbcTime.setInstant(statement, p++, maxResultTime);
+            if (streamArray != null)
+                statement.setArray(p, streamArray);
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next())
                     generations.add(readGeneration(result));
             }
         } finally {
             ids.free();
+            if (streamArray != null)
+                streamArray.free();
         }
         return generations;
     }

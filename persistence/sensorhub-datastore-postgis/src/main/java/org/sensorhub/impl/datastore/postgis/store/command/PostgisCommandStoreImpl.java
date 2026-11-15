@@ -51,10 +51,12 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
 
     protected PostgisCommandStreamStoreImpl commandStreamStore;
     protected PostgisCommandStatusStore commandStatusStore;
+    private static final int COMMAND_STREAM_CACHE_MAX_SIZE = 262_144;
     private final Cache<Long, BigId> commandStreamByCommandId = CacheBuilder.newBuilder()
-            .maximumSize(16_384)
-            .expireAfterAccess(30, TimeUnit.MINUTES)
+            .maximumSize(COMMAND_STREAM_CACHE_MAX_SIZE)
+            .expireAfterAccess(2, TimeUnit.HOURS)
             .build();
+    private volatile boolean commandStreamCacheWarmed = false;
 
     public PostgisCommandStoreImpl(String url, String dbName, String login, String password,
                                    int idScope, IdProviderType dsIdProviderType, boolean useBatch) {
@@ -173,6 +175,13 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
         if (cached != null) {
             return cached;
         }
+        if (!commandStreamCacheWarmed) {
+            warmCommandStreamCache();
+            cached = commandStreamByCommandId.getIfPresent(internalId);
+            if (cached != null) {
+                return cached;
+            }
+        }
         String sql = "SELECT " + COMMANDSTREAM_ID + " FROM " + queryBuilder.getStoreTableName() + " WHERE id = ?";
         try (Connection connection = this.connectionManager.getConnection();
              PreparedStatement statement = connection.prepareStatement(sql)) {
@@ -190,6 +199,34 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
             return null;
         } catch (SQLException e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    private synchronized void warmCommandStreamCache() {
+        if (commandStreamCacheWarmed) {
+            return;
+        }
+        String sql = "SELECT id, " + COMMANDSTREAM_ID
+                + " FROM " + queryBuilder.getStoreTableName()
+                + " ORDER BY id DESC LIMIT " + COMMAND_STREAM_CACHE_MAX_SIZE;
+        Map<Long, BigId> internedStreams = new HashMap<>();
+        try (Connection connection = this.connectionManager.getConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setFetchSize(2048);
+            try (ResultSet rs = statement.executeQuery()) {
+                while (rs.next()) {
+                    long cmdId = rs.getLong(1);
+                    long streamId = rs.getLong(2);
+                    if (!rs.wasNull()) {
+                        BigId resolved = internedStreams.computeIfAbsent(
+                                streamId, s -> BigId.fromLong(idScope, s));
+                        commandStreamByCommandId.put(cmdId, resolved);
+                    }
+                }
+            }
+            commandStreamCacheWarmed = true;
+        } catch (SQLException e) {
+            logger.debug("Bulk command-stream cache warm skipped: {}", e.getMessage());
         }
     }
 

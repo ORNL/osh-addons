@@ -748,9 +748,27 @@ public final class JsonCqlEvaluator {
             return new PrefilterClause(String.join(" OR ", clauses), params, selective);
         }
         if (filter instanceof PropertyIsLike like) {
-            if (like.getExpression() instanceof PropertyName property)
-                return leafKeyPrefilter(property.getPropertyName(), column);
-            return null;
+            if (!(like.getExpression() instanceof PropertyName property))
+                return null;
+            String leafKey = extractSafeLeafKey(property.getPropertyName());
+            String literalRun = extractLongestSafeLikeSubstring(like);
+            if (!literalRun.isEmpty()) {
+                List<Object> params = new ArrayList<>();
+                StringBuilder expr = new StringBuilder();
+                if (like.isMatchingCase()) {
+                    expr.append("strpos(").append(column).append(", ?) > 0");
+                    params.add(literalRun);
+                } else {
+                    expr.append("strpos(lower(").append(column).append("), ?) > 0");
+                    params.add(literalRun.toLowerCase(Locale.ROOT));
+                }
+                if (leafKey != null) {
+                    expr.append(" AND strpos(").append(column).append(", ?) > 0");
+                    params.add(leafKey);
+                }
+                return new PrefilterClause(expr.toString(), params, literalRun.length() >= 2);
+            }
+            return leafKeyPrefilter(property.getPropertyName(), column);
         }
         if (filter instanceof BinaryComparisonOperator comparison) {
             if (!(comparison.getExpression1() instanceof PropertyName property) ||
@@ -874,6 +892,60 @@ public final class JsonCqlEvaluator {
             prefix = prefix.substring(0, j);
         }
         return prefix;
+    }
+
+    private static String extractLongestSafeLikeSubstring(PropertyIsLike like) {
+        String literal = like.getLiteral();
+        if (literal == null || literal.isEmpty())
+            return "";
+        String wildcard = like.getWildCard() == null ? "" : like.getWildCard();
+        String single = like.getSingleChar() == null ? "" : like.getSingleChar();
+        String escape = like.getEscape() == null ? "" : like.getEscape();
+
+        String best = "";
+        StringBuilder current = new StringBuilder();
+        for (int index = 0; index < literal.length();) {
+            if (!escape.isEmpty() && literal.startsWith(escape, index)) {
+                index += escape.length();
+                if (index < literal.length()) {
+                    int point = literal.codePointAt(index);
+                    appendOrFlushSafeCodePoint(point, current);
+                    if (current.length() > best.length())
+                        best = current.toString();
+                    index += Character.charCount(point);
+                } else {
+                    current.setLength(0);
+                }
+            } else if (!wildcard.isEmpty() && literal.startsWith(wildcard, index)) {
+                current.setLength(0);
+                index += wildcard.length();
+            } else if (!single.isEmpty() && literal.startsWith(single, index)) {
+                current.setLength(0);
+                index += single.length();
+            } else {
+                int point = literal.codePointAt(index);
+                appendOrFlushSafeCodePoint(point, current);
+                if (current.length() > best.length())
+                    best = current.toString();
+                index += Character.charCount(point);
+            }
+        }
+        return best;
+    }
+
+    private static void appendOrFlushSafeCodePoint(int codePoint, StringBuilder current) {
+        if ((codePoint >= 'A' && codePoint <= 'Z')
+                || (codePoint >= 'a' && codePoint <= 'z')
+                || (codePoint >= '0' && codePoint <= '9')
+                || codePoint == ' '
+                || codePoint == '_'
+                || codePoint == '.'
+                || codePoint == ':'
+                || codePoint == '-') {
+            current.appendCodePoint(codePoint);
+        } else {
+            current.setLength(0);
+        }
     }
 
     private static PrefilterClause leafKeyPrefilter(String propertyPath, String column) {
