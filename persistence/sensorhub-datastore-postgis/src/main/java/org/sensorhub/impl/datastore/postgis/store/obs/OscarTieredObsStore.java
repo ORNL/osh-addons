@@ -942,8 +942,12 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         JsonCqlEvaluator.SummaryCounterSpec summarySpec = fois == null
                 ? JsonCqlEvaluator.summaryCounterSpec(resolvedFilter.getCQLFilter()).orElse(null)
                 : null;
+        JsonCqlEvaluator.TimeContainedSummarySpec timeContainedSpec =
+                fois == null && (summarySpec == null || "false".equals(summarySpec.exactReadyExpr()))
+                        ? JsonCqlEvaluator.timeContainedSummarySpec(resolvedFilter.getCQLFilter()).orElse(null)
+                        : null;
         if (parentTableOnly || !boundedMerge || fois != null || hasExplicitIds ||
-                exactEventId != null || summarySpec == null) {
+                exactEventId != null || (summarySpec == null && timeContainedSpec == null)) {
             return selectTieredEntries(filter, fields, hasMutations).skip(offset);
         }
 
@@ -1011,7 +1015,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
         ColdOffsetStream coldPlan = streamColdBasesWithSkip(
                 resolvedFilter, filter.getLimit(), mutationCount, dataStreams,
-                effectiveHasMutations, hotBoundaryTime, summarySpec,
+                effectiveHasMutations, hotBoundaryTime, summarySpec, timeContainedSpec,
                 nonColdComplete ? offset : 0L, nonColdPrecedingFn);
 
         long skipped = coldPlan.skippedExactRows();
@@ -1036,6 +1040,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             boolean hasMutations,
             Instant hotBoundaryTime,
             JsonCqlEvaluator.SummaryCounterSpec summarySpec,
+            JsonCqlEvaluator.TimeContainedSummarySpec timeContainedSpec,
             long offsetForSkip,
             ToLongBiFunction<Instant, Instant> nonColdPrecedingFn) {
         ArchiveBounds bounds = archiveBounds(resolvedFilter, hotBoundaryTime);
@@ -1064,6 +1069,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 readerLimit,
                 hasMutations,
                 summarySpec,
+                timeContainedSpec,
                 null,
                 hasMutations
                         ? (chunk, mutatedByGen) -> countMutatedSummaryBaseMatchesByGeneration(
@@ -1487,10 +1493,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     fois == null && filter.getCQLFilter() != null
                             ? JsonCqlEvaluator.summaryCounterSpec(filter.getCQLFilter()).orElse(null)
                             : null;
+            JsonCqlEvaluator.TimeContainedSummarySpec timeContainedSpec =
+                    fois == null && filter.getCQLFilter() != null &&
+                            (summarySpec == null || "false".equals(summarySpec.exactReadyExpr()))
+                            ? JsonCqlEvaluator.timeContainedSummarySpec(filter.getCQLFilter()).orElse(null)
+                            : null;
             String exactEventId = fois == null && filter.getCQLFilter() != null
                     ? JsonCqlEvaluator.extractExactEventIdFilter(filter.getCQLFilter()).orElse(null)
                     : null;
-            if (summarySpec != null || exactEventId != null) {
+            if (summarySpec != null || timeContainedSpec != null || exactEventId != null) {
                 List<ArchiveGeneration> allCandidates = pruneAndBackfillLegacyResultTimeCandidates(
                         archiveCatalog.candidates(
                                 bounds.start(), bounds.end(), null, null, null, dataStreams,
@@ -1502,11 +1513,12 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         archiveCatalog.selectSummaryMatchedCandidates(
                                 allCandidates, filter.getPhenomenonTime(), filter.getResultTime(),
                                 dataStreams, descending, callerLimit, readerLimit, hasMutations,
-                                summarySpec, exactEventId,
-                                summarySpec != null && hasMutations
+                                summarySpec, timeContainedSpec, exactEventId,
+                                (summarySpec != null || timeContainedSpec != null) && hasMutations
                                         ? (chunk, mutatedByGen) -> countMutatedSummaryBaseMatchesByGeneration(
                                                 chunk, mutatedByGen, filter, dataStreams, fois)
-                                        : null);
+                                        : null,
+                                0L, null);
                 if (plan.primaryCandidates().isEmpty())
                     return Stream.empty();
                 ObsFilter coldStreamFilter = callerLimit == readerLimit

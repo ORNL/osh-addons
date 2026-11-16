@@ -3311,6 +3311,28 @@ public final class ArchiveCatalog {
             java.util.function.BiFunction<List<ArchiveGeneration>, Map<UUID, Set<Long>>, Map<UUID, Long>> exactMutatedMatchResolver,
             long offsetForSkip,
             java.util.function.ToLongBiFunction<Instant, Instant> preClusterPrecedingNonColdCount) {
+        return selectSummaryMatchedCandidates(
+                candidates, phenomenonTimeFilter, resultTimeFilter,
+                dataStreams, descending, callerLimit, readerLimit,
+                hasMutations, summarySpec, null, exactEventId,
+                exactMutatedMatchResolver, offsetForSkip, preClusterPrecedingNonColdCount);
+    }
+
+    public CandidateSelectionPlan selectSummaryMatchedCandidates(
+            List<ArchiveGeneration> candidates,
+            TemporalFilter phenomenonTimeFilter,
+            TemporalFilter resultTimeFilter,
+            Set<Long> dataStreams,
+            boolean descending,
+            long callerLimit,
+            long readerLimit,
+            boolean hasMutations,
+            JsonCqlEvaluator.SummaryCounterSpec summarySpec,
+            JsonCqlEvaluator.TimeContainedSummarySpec timeContainedSpec,
+            String exactEventId,
+            java.util.function.BiFunction<List<ArchiveGeneration>, Map<UUID, Set<Long>>, Map<UUID, Long>> exactMutatedMatchResolver,
+            long offsetForSkip,
+            java.util.function.ToLongBiFunction<Instant, Instant> preClusterPrecedingNonColdCount) {
         if (candidates == null || candidates.isEmpty())
             return new CandidateSelectionPlan(List.of(), List.of());
 
@@ -3341,17 +3363,34 @@ public final class ArchiveCatalog {
             }
         }
 
-        if (summarySpec == null)
+        if (summarySpec == null && timeContainedSpec == null)
             return new CandidateSelectionPlan(working, List.of());
+
+        String upperExpr = summarySpec != null ? summarySpec.upperBoundExpr() : timeContainedSpec.upperBoundExpr();
+        String exactReadyExpr = summarySpec != null ? summarySpec.exactReadyExpr() : "false";
+        String exactExpr = summarySpec != null ? summarySpec.exactExpr() : "0::bigint";
+        boolean checkTimeContained = timeContainedSpec != null &&
+                !timeContainedSpec.requiredTimeFields().isEmpty();
+        String tcReadyExpr = checkTimeContained
+                ? "((" + timeContainedSpec.exactReadyExpr() + ") AND ((" +
+                  timeContainedSpec.upperBoundExpr() + ") = 0 OR (" +
+                  buildRequiredTimeFieldsSchemaSql(timeContainedSpec.requiredTimeFields()) + ")))"
+                : "false";
+        String tcExactExpr = checkTimeContained ? timeContainedSpec.exactExpr() : "0::bigint";
 
         boolean filterStreams = dataStreams != null;
         boolean omitGenFilter = filterStreams && working.size() > 64;
         String sql = "SELECT s.generation_id, " +
                 "BOOL_AND(s.summary_populated), " +
-                "COALESCE(SUM(" + summarySpec.upperBoundExpr() + "), 0)::bigint, " +
-                "BOOL_AND(" + summarySpec.exactReadyExpr() + "), " +
-                "COALESCE(SUM(" + summarySpec.exactExpr() + "), 0)::bigint " +
-                "FROM oscar_archive_schema s WHERE " +
+                "COALESCE(SUM(" + upperExpr + "), 0)::bigint, " +
+                "BOOL_AND(" + exactReadyExpr + "), " +
+                "COALESCE(SUM(" + exactExpr + "), 0)::bigint" +
+                (checkTimeContained
+                        ? ", BOOL_AND(" + tcReadyExpr + "), COALESCE(SUM(" + tcExactExpr + "), 0)::bigint"
+                        : "") +
+                " FROM oscar_archive_schema s " +
+                (checkTimeContained ? "LEFT JOIN oscar_archive_schema_blob b ON b.schema_sha256 = s.schema_sha256 " : "") +
+                "WHERE " +
                 (omitGenFilter
                         ? "s.datastream_id=ANY (?::bigint[])"
                         : "s.generation_id=ANY (?::uuid[])" +
@@ -3362,6 +3401,8 @@ public final class ArchiveCatalog {
         Map<UUID, Long> upperByGen = new HashMap<>();
         Map<UUID, Boolean> exactReadyByGen = new HashMap<>();
         Map<UUID, Long> exactByGen = new HashMap<>();
+        Map<UUID, Boolean> tcReadyByGen = checkTimeContained ? new HashMap<>() : Map.of();
+        Map<UUID, Long> tcExactByGen = checkTimeContained ? new HashMap<>() : Map.of();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
             java.sql.Array genArray = omitGenFilter ? null : connection.createArrayOf("uuid",
@@ -3382,6 +3423,10 @@ public final class ArchiveCatalog {
                         upperByGen.put(genId, result.getLong(3));
                         exactReadyByGen.put(genId, result.getBoolean(4));
                         exactByGen.put(genId, result.getLong(5));
+                        if (checkTimeContained) {
+                            tcReadyByGen.put(genId, result.getBoolean(6));
+                            tcExactByGen.put(genId, result.getLong(7));
+                        }
                     }
                 }
             } finally {
@@ -3392,6 +3437,18 @@ public final class ArchiveCatalog {
             }
         } catch (SQLException e) {
             return new CandidateSelectionPlan(working, List.of());
+        }
+
+        if (checkTimeContained) {
+            for (ArchiveGeneration gen : working) {
+                UUID genId = gen.id();
+                if (!Boolean.TRUE.equals(exactReadyByGen.get(genId)) &&
+                        Boolean.TRUE.equals(tcReadyByGen.get(genId)) &&
+                        isGenerationInsideTimeContainedBounds(gen, timeContainedSpec)) {
+                    exactReadyByGen.put(genId, Boolean.TRUE);
+                    exactByGen.put(genId, tcExactByGen.getOrDefault(genId, 0L));
+                }
+            }
         }
 
         List<ArchiveGeneration> surviving = new ArrayList<>();
@@ -3478,14 +3535,18 @@ public final class ArchiveCatalog {
 
             int nextClusterToCheck = 0;
             long resolvedGuaranteed = 0L;
-            for (int start = 0; start < eligibleMutated.size(); start += 256) {
-                List<ArchiveGeneration> chunk = eligibleMutated.subList(
-                        start, Math.min(eligibleMutated.size(), start + 256));
+            int chunkSize = boundedTarget && targetMatches <= 128
+                    ? 8
+                    : (boundedTarget && targetMatches <= 2048 ? 16 : 256);
+            int start = 0;
+            while (start < eligibleMutated.size()) {
+                int end = Math.min(eligibleMutated.size(), start + chunkSize);
+                List<ArchiveGeneration> chunk = eligibleMutated.subList(start, end);
                 exactMutatedMatches.putAll(exactMutatedMatchResolver.apply(chunk, mutatedByGen));
                 if (boundedTarget) {
-                    boolean moreChunksRemain = start + 256 < eligibleMutated.size();
+                    boolean moreChunksRemain = end < eligibleMutated.size();
                     int safeClusterExclusive = moreChunksRemain
-                            ? lastGenClusterIndex.getOrDefault(eligibleMutated.get(start + 256).id(), resolveLimit)
+                            ? lastGenClusterIndex.getOrDefault(eligibleMutated.get(end).id(), resolveLimit)
                             : resolveLimit;
                     while (nextClusterToCheck < safeClusterExclusive) {
                         List<ArchiveGeneration> cluster = clusters.get(nextClusterToCheck);
@@ -3513,6 +3574,10 @@ public final class ArchiveCatalog {
                     }
                     if (resolvedGuaranteed >= targetMatches)
                         break;
+                }
+                start = end;
+                if (chunkSize < 256) {
+                    chunkSize = Math.min(256, chunkSize * 2);
                 }
             }
         }

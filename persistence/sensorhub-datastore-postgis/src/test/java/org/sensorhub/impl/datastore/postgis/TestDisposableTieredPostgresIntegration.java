@@ -5511,6 +5511,25 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertEquals(3L, tiered.countMatchingEntries(interiorRangeFilter));
         assertEquals(3L, selectCount(tiered, interiorRangeFilter));
 
+        // selectSummaryMatchedCandidates must promote interior generation g3 to exactReady via timeContainedSpec
+        // so descending limit=1 stops primaryCandidates at {g6, g3} instead of scanning all older generations {g0}.
+        var selectionPlan = tiered.getArchiveCatalog().selectSummaryMatchedCandidates(
+                List.of(g0, g3, g6), null, null, Set.of(timedStream.getIdAsLong()),
+                true, 1L, 1L, false, summarySpec, timeContainedSpec, null, null, 0L, null);
+        assertEquals(Set.of(g3.id(), g6.id()),
+                selectionPlan.primaryCandidates().stream().map(ArchiveGeneration::id).collect(java.util.stream.Collectors.toSet()));
+        assertTrue(selectionPlan.overflowCandidates().isEmpty());
+
+        ObsFilter descPaginated = ObsFilter.Builder.from(interiorRangeFilter)
+                .withPhenomenonTime(new org.sensorhub.api.datastore.TemporalFilter.Builder().withAllTimes().descendingOrder(true).build())
+                .withLimit(2)
+                .build();
+        try (var pageStream = tiered.selectEntries(descPaginated, null, 1L)) {
+            var rows = pageStream.toList();
+            assertEquals(1, rows.size());
+            assertEquals(day3.plusSeconds(60), rows.get(0).getValue().getPhenomenonTime());
+        }
+
         // Untimed datastream lacking startTime/endTime schema fields must NOT be time-summarized.
         var untimedSummary = tiered.getArchiveCatalog().summarizeColdCandidates(
                 List.of(g0, g3, g6), null, null, Set.of(untimedStream.getIdAsLong()), Set.of(),

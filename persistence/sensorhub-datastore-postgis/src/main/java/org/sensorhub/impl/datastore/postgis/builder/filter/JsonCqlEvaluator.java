@@ -109,7 +109,13 @@ public final class JsonCqlEvaluator {
      */
     public static boolean appendPostgresOverlayPrefilter(
             Filter filter, String column, StringBuilder sql) {
-        if (!isPostgresOverlayPrefilterSafe(filter) || !requiresUnadjudicated(filter))
+        if (filter == null)
+            return false;
+        if (filter == Filter.EXCLUDE) {
+            sql.append(" AND FALSE");
+            return true;
+        }
+        if (!requiresUnadjudicated(filter))
             return false;
         sql.append(" AND NOT COALESCE((jsonb_typeof(").append(column)
                 .append("->'adjudicatedIdsCount') = 'number' AND ")
@@ -127,26 +133,6 @@ public final class JsonCqlEvaluator {
                 eq.getExpression1() instanceof PropertyName property &&
                 "adjudicatedIdsCount".equals(property.getPropertyName()) &&
                 eq.getExpression2() instanceof Literal literal && isExactNumericZero(literal.getValue());
-    }
-
-    private static boolean isPostgresOverlayPrefilterSafe(Filter filter) {
-        if (filter == Filter.EXCLUDE)
-            return true;
-        if (filter instanceof And and)
-            return !and.getChildren().isEmpty() &&
-                    and.getChildren().stream().allMatch(JsonCqlEvaluator::isPostgresOverlayPrefilterSafe);
-        if (filter instanceof Or or)
-            return !or.getChildren().isEmpty() &&
-                    or.getChildren().stream().allMatch(JsonCqlEvaluator::isPostgresOverlayPrefilterSafe);
-        if (!(filter instanceof PropertyIsEqualTo eq) ||
-                !(eq.getExpression1() instanceof PropertyName property) ||
-                !(eq.getExpression2() instanceof Literal literal))
-            return false;
-        String name = property.getPropertyName();
-        Object value = literal.getValue();
-        if (("gammaAlarm".equals(name) || "neutronAlarm".equals(name)) && value instanceof Boolean)
-            return true;
-        return "adjudicatedIdsCount".equals(name) && isExactNumericZero(value);
     }
 
     private static boolean isExactNumericZero(Object value) {

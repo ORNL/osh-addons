@@ -23,6 +23,8 @@ import org.sensorhub.impl.datastore.postgis.builder.filter.FilterQuery;
 import org.sensorhub.impl.datastore.postgis.builder.generator.FilterQueryGenerator;
 import org.vast.util.Asserts;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.SortedSet;
 import java.util.stream.Collectors;
 
@@ -96,69 +98,78 @@ public abstract class DataStreamFilterQuery<F extends FilterQueryGenerator> exte
         if (systemFilter != null) {
             if (systemFilter.getUniqueIDs() != null && !systemFilter.getUniqueIDs().isEmpty()) {
                 SortedSet<String> uniqueIds = systemFilter.getUniqueIDs();
-
-                StringBuilder sb = new StringBuilder("(");
-                int i = 0;
-
+                List<String> exactUids = new ArrayList<>();
+                List<String> wildcardPatterns = new ArrayList<>();
                 for (String uid : uniqueIds) {
-                    String operator = "=";
-                    String currentId = uid;
-
                     if (uid.contains("*")) {
-                        operator = "ILIKE";
-                        currentId = uid.replace("*", "%");
+                        wildcardPatterns.add(uid.replace("*", "%"));
+                    } else {
+                        exactUids.add(uid);
                     }
+                }
 
-                    if (i > 0) {
-                        sb.append(" OR ");
+                List<String> branches = new ArrayList<>();
+                if (!exactUids.isEmpty()) {
+                    String exactPlaceholders = placeholders(exactUids.size());
+                    StringBuilder exactSb = new StringBuilder("(")
+                            .append(tableName).append(".data->'system@id'->>'uniqueID' IN (")
+                            .append(exactPlaceholders).append(")");
+                    exactUids.forEach(this::addParameter);
+
+                    if (systemFilter.includeMembers() && sysDescTableName != null) {
+                        exactSb.append(" OR (")
+                                .append(tableName).append(".data->'system@id'->>'uniqueID') IN (SELECT s.data->>'uniqueId' FROM ")
+                                .append(sysDescTableName).append(" s WHERE s.data->>'uniqueId' IS NOT NULL AND s.parentid IN (SELECT p.id FROM ")
+                                .append(sysDescTableName).append(" p WHERE p.data->>'uniqueId' IN (")
+                                .append(exactPlaceholders).append(")))");
+                        exactUids.forEach(this::addParameter);
                     }
+                    exactSb.append(")");
+                    branches.add(exactSb.toString());
+                }
 
-                    // Direct match on datastream's system
-                    sb.append("(").append(tableName).append(".data->'system@id'->>'uniqueID' ")
-                            .append(operator).append(" ?");
-                    addParameter(currentId);
+                for (String pattern : wildcardPatterns) {
+                    StringBuilder wildSb = new StringBuilder("(")
+                            .append(tableName).append(".data->'system@id'->>'uniqueID' ILIKE ?");
+                    addParameter(pattern);
 
-                    if (systemFilter.includeMembers()) {
-                        sb.append(" OR EXISTS (SELECT 1 FROM ")
+                    if (systemFilter.includeMembers() && sysDescTableName != null) {
+                        wildSb.append(" OR EXISTS (SELECT 1 FROM ")
                                 .append(sysDescTableName).append(" s WHERE s.data->>'uniqueId' = ")
                                 .append(tableName).append(".data->'system@id'->>'uniqueID'")
                                 .append(" AND s.parentid IN (SELECT id FROM ")
-                                .append(sysDescTableName).append(" WHERE data->>'uniqueId' ")
-                                .append(operator).append(" ?))");
-                        addParameter(currentId);
+                                .append(sysDescTableName).append(" WHERE data->>'uniqueId' ILIKE ?))");
+                        addParameter(pattern);
                     }
+                    wildSb.append(")");
+                    branches.add(wildSb.toString());
+                }
 
-                    sb.append(")");
-                    i++;
+                addCondition("(" + String.join(" OR ", branches) + ")");
+            }
+
+            // handle internal IDS without temporal-version row multiplication from JOIN sys
+            if (systemFilter.getInternalIDs() != null && !systemFilter.getInternalIDs().isEmpty()) {
+                StringBuilder sb = new StringBuilder("(");
+                String idPlaceholders = placeholders(systemFilter.getInternalIDs().size());
+
+                if (systemFilter.includeMembers() && sysDescTableName != null) {
+                    sb.append("(").append(tableName)
+                            .append(".data->'system@id'->'internalID'->>'id')::bigint IN (SELECT s.id FROM ")
+                            .append(sysDescTableName).append(" s WHERE s.id IN (").append(idPlaceholders)
+                            .append(") OR s.parentid IN (").append(idPlaceholders).append("))");
+                    systemFilter.getInternalIDs().forEach(bigId -> addParameter(bigId.getIdAsLong()));
+                    systemFilter.getInternalIDs().forEach(bigId -> addParameter(bigId.getIdAsLong()));
+                } else {
+                    sb.append("(").append(tableName)
+                            .append(".data->'system@id'->'internalID'->>'id')::bigint IN (")
+                            .append(idPlaceholders).append(")");
+                    systemFilter.getInternalIDs().forEach(bigId -> addParameter(bigId.getIdAsLong()));
                 }
 
                 sb.append(")");
                 addCondition(sb.toString());
             }
-
-                // handle internal IDS
-                if (systemFilter.getInternalIDs() != null && !systemFilter.getInternalIDs().isEmpty()) {
-                    StringBuilder sb = new StringBuilder("(");
-
-                    if (systemFilter.includeMembers()) {
-                        // Use join
-                        addJoin(sysDescTableName + " s ON (" + tableName +
-                                ".data->'system@id'->'internalID'->>'id')::bigint = s.id");
-
-                        sb.append("s.id IN (").append(placeholders(systemFilter.getInternalIDs().size())).append(")")
-                                .append(" OR s.parentid IN (").append(placeholders(systemFilter.getInternalIDs().size())).append(")");
-                        systemFilter.getInternalIDs().forEach(bigId -> addParameter(bigId.getIdAsLong()));
-                        systemFilter.getInternalIDs().forEach(bigId -> addParameter(bigId.getIdAsLong()));
-                    } else {
-                        sb.append("(").append(tableName)
-                                .append(".data->'system@id'->'internalID'->>'id')::bigint IN (")
-                                .append(placeholders(systemFilter.getInternalIDs().size())).append(")");
-                        systemFilter.getInternalIDs().forEach(bigId -> addParameter(bigId.getIdAsLong()));
-                    }
-
-                    sb.append(")");
-                    addCondition(sb.toString());
-                }
 
             if (systemFilter.getParentFilter() != null || systemFilter.getProcedureFilter() != null
                     || systemFilter.getDataStreamFilter() != null || systemFilter.getFullTextFilter() != null

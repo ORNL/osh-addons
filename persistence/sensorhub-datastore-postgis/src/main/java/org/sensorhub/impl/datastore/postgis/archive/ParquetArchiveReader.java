@@ -86,7 +86,12 @@ public final class ParquetArchiveReader {
             boolean nonNullPhenomenonRequired,
             boolean nonNullResultTimeRequired) {}
 
-    private static final long DEFAULT_LOCAL_9P_CACHE_MAX_BYTES = 2_147_483_648L;
+    static final long MIN_LOCAL_9P_CACHE_MAX_BYTES = 2_147_483_648L;
+    static final long MAX_LOCAL_9P_CACHE_MAX_BYTES = 8_589_934_592L;
+    static final long LOW_DISK_FLOOR_LOCAL_9P_CACHE_BYTES = 268_435_456L;
+    static final long LOW_DISK_THRESHOLD_BYTES = 16L * 1024L * 1024L * 1024L;
+    static final String PROP_LOCAL_9P_CACHE_MAX_BYTES = "oscar.archive.local9pCacheMaxBytes";
+    static final String ENV_LOCAL_9P_CACHE_MAX_BYTES = "OSCAR_LOCAL_9P_CACHE_MAX_BYTES";
     private static final Path DEFAULT_STATE_9P_CACHE_DIR = Path.of("/var/lib/oscar/.cache/oscar-9p-parquet-cache");
     private static final Path DEFAULT_LOCAL_9P_CACHE_DIR = Path.of("/var/tmp/oscar-9p-parquet-cache");
     private static final Pattern SHA256_HEX_PATTERN = Pattern.compile("^[0-9a-f]{64}$");
@@ -224,8 +229,9 @@ public final class ParquetArchiveReader {
                             candidate,
                             dir -> {
                                 try {
+                                    long maxBytes = resolveLocal9pCacheMaxBytes(dir, root);
                                     return java.util.Optional.of(
-                                            Local9pParquetCache.open(dir, DEFAULT_LOCAL_9P_CACHE_MAX_BYTES, false));
+                                            Local9pParquetCache.open(dir, maxBytes, false));
                                 } catch (Exception ignored) {
                                     return java.util.Optional.empty();
                                 }
@@ -240,6 +246,47 @@ public final class ParquetArchiveReader {
             resolvedSharedLocal9pCache = java.util.Optional.ofNullable(found);
             return found;
         }
+    }
+
+    static long resolveLocal9pCacheMaxBytes(Path cacheDir, Path archiveRoot) {
+        String explicit = System.getProperty(PROP_LOCAL_9P_CACHE_MAX_BYTES);
+        if (explicit == null || explicit.isBlank()) {
+            explicit = System.getenv(ENV_LOCAL_9P_CACHE_MAX_BYTES);
+        }
+        long minUsable = Long.MAX_VALUE;
+        for (Path target : List.of(cacheDir, archiveRoot)) {
+            Path ancestor = Files.exists(target, LinkOption.NOFOLLOW_LINKS) ? target : nearestExistingAncestor(target);
+            if (ancestor == null)
+                continue;
+            try {
+                long usable = Files.getFileStore(ancestor).getUsableSpace();
+                if (usable > 0L && usable < minUsable) {
+                    minUsable = usable;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return computeLocal9pCacheMaxBytes(minUsable, explicit);
+    }
+
+    public static long computeLocal9pCacheMaxBytes(long minUsableBytes, String explicitOverride) {
+        if (explicitOverride != null && !explicitOverride.isBlank()) {
+            try {
+                long parsed = Long.parseLong(explicitOverride.trim());
+                if (parsed > 0L) {
+                    return parsed;
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        if (minUsableBytes <= 0L || minUsableBytes == Long.MAX_VALUE) {
+            return MIN_LOCAL_9P_CACHE_MAX_BYTES;
+        }
+        if (minUsableBytes < LOW_DISK_THRESHOLD_BYTES) {
+            return Math.max(LOW_DISK_FLOOR_LOCAL_9P_CACHE_BYTES, minUsableBytes / 8L);
+        }
+        long proportional = minUsableBytes / 16L;
+        return Math.max(MIN_LOCAL_9P_CACHE_MAX_BYTES, Math.min(MAX_LOCAL_9P_CACHE_MAX_BYTES, proportional));
     }
 
     private static boolean pathsOverlap(Path first, Path second) {

@@ -74,6 +74,11 @@ public abstract class PostgisBaseFeatureStoreImpl
             .expireAfterAccess(5, TimeUnit.MINUTES)
             .build();
 
+    protected final Cache<Long, Optional<BigId>> parentCache = CacheBuilder.newBuilder()
+            .maximumSize(16_384)
+            .expireAfterWrite(5, TimeUnit.MINUTES)
+            .build();
+
     protected SMLJsonBindings smlJsonBindings = new SMLJsonBindings(false);
 
     protected PostgisBaseFeatureStoreImpl(String url, String dbName, String login, String password, int idScope,
@@ -143,6 +148,7 @@ public abstract class PostgisBaseFeatureStoreImpl
     }
 
     public FeatureKey addOrUpdate(FeatureKey featureKey, BigId parentID, V value) throws DataStoreException {
+        parentCache.invalidate(featureKey.getInternalID().getIdAsLong());
         if (useBatch) {
             try {
                 String sqlQuery = fillAddOrUpdateStatement(featureKey, parentID, value);
@@ -227,6 +233,7 @@ public abstract class PostgisBaseFeatureStoreImpl
             PGobject pgRange = (PGobject) resultSet.getObject(String.valueOf(VALID_TIME));
             Instant[] validTimeInstant = PostgisUtils.getInstantFromPGObject(pgRange);
             PostgisFeatureKey featureKey = new PostgisFeatureKey(parentId,BigId.fromLong(idScope, id), validTimeInstant[0]);
+            parentCache.put(id, parentId != 0 ? Optional.of(BigId.fromLong(idScope, parentId)) : Optional.empty());
             return Map.entry(featureKey, feature);
         } catch (Exception ex) {
             throw new RuntimeException("Cannot parse resultSet to Feature", ex);
@@ -414,16 +421,25 @@ public abstract class PostgisBaseFeatureStoreImpl
     @Override
     public BigId getParent(BigId internalID) {
         DataStoreUtils.checkInternalID(internalID);
+        long rawId = internalID.getIdAsLong();
+        Optional<BigId> cached = parentCache.getIfPresent(rawId);
+        if (cached != null) {
+            return cached.orElse(null);
+        }
         try (Connection connection = connectionManager.getConnection();
              PreparedStatement statement = connection.prepareStatement(
                      queryBuilder.selectParentByIdQuery())) {
-            statement.setLong(1, internalID.getIdAsLong());
+            statement.setLong(1, rawId);
             try (ResultSet result = statement.executeQuery()) {
-                if (!result.next())
+                if (!result.next()) {
+                    parentCache.put(rawId, Optional.empty());
                     return null;
+                }
                 long parentID = result.getLong(1);
-                return !result.wasNull() && parentID != 0
+                BigId resolved = !result.wasNull() && parentID != 0
                         ? BigId.fromLong(idScope, parentID) : null;
+                parentCache.put(rawId, Optional.ofNullable(resolved));
+                return resolved;
             }
         } catch (SQLException error) {
             throw new RuntimeException("Cannot resolve feature parent", error);
@@ -525,6 +541,7 @@ public abstract class PostgisBaseFeatureStoreImpl
                 int rows = preparedStatement.executeUpdate();
                 if (rows > 0) {
                     cache.invalidate(key);
+                    parentCache.invalidate(key.getInternalID().getIdAsLong());
                 } else {
                     return null;
                 }
@@ -568,6 +585,7 @@ public abstract class PostgisBaseFeatureStoreImpl
 
     public void clearCache() {
         cache.invalidateAll();
+        parentCache.invalidateAll();
     }
 
     @Override
@@ -589,6 +607,7 @@ public abstract class PostgisBaseFeatureStoreImpl
                 if (rows > 0) {
                     // TODO: invalidate only concerned keys
                     cache.invalidateAll();
+                    parentCache.invalidateAll();
                 }
                 return rows;
             }

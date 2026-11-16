@@ -128,23 +128,22 @@ public class SelectCommandStreamFilterQuery extends FilterQuery<SelectFilterQuer
                     systemFilter.getUniqueIDs().forEach(this::addParameter);
                 }
 
-                // handle internal IDS
+                // handle internal IDS without temporal-version row multiplication from JOIN sys
                 if (systemFilter.getInternalIDs() != null && !systemFilter.getInternalIDs().isEmpty()) {
                     StringBuilder sb = new StringBuilder("(");
+                    String idPlaceholders = placeholders(systemFilter.getInternalIDs().size());
 
-                    if (systemFilter.includeMembers()) {
-                        // Use join
-                        addJoin(sysDescTableName + " s ON (" + tableName +
-                                ".data->'system@id'->'internalID'->>'id')::bigint = s.id");
-
-                        sb.append("s.id IN (").append(placeholders(systemFilter.getInternalIDs().size())).append(")")
-                                .append(" OR s.parentid IN (").append(placeholders(systemFilter.getInternalIDs().size())).append(")");
+                    if (systemFilter.includeMembers() && sysDescTableName != null) {
+                        sb.append("(").append(tableName)
+                                .append(".data->'system@id'->'internalID'->>'id')::bigint IN (SELECT s.id FROM ")
+                                .append(sysDescTableName).append(" s WHERE s.id IN (").append(idPlaceholders)
+                                .append(") OR s.parentid IN (").append(idPlaceholders).append("))");
                         systemFilter.getInternalIDs().forEach(bigId -> addParameter(bigId.getIdAsLong()));
                         systemFilter.getInternalIDs().forEach(bigId -> addParameter(bigId.getIdAsLong()));
                     } else {
                         sb.append("(").append(tableName)
                                 .append(".data->'system@id'->'internalID'->>'id')::bigint IN (")
-                                .append(placeholders(systemFilter.getInternalIDs().size())).append(")");
+                                .append(idPlaceholders).append(")");
                         systemFilter.getInternalIDs().forEach(bigId -> addParameter(bigId.getIdAsLong()));
                     }
 

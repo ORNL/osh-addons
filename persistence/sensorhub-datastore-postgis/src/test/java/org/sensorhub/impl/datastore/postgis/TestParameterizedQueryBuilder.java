@@ -612,6 +612,59 @@ public class TestParameterizedQueryBuilder {
                 broadWildcardFilter.getCQLFilter()));
     }
 
+    @Test
+    public void testSystemFilterBatchesMemberLookupsAndAvoidsVersionMultiplyingJoin() {
+        org.sensorhub.api.datastore.system.ISystemDescStore sysStore =
+                (org.sensorhub.api.datastore.system.ISystemDescStore) Proxy.newProxyInstance(
+                        org.sensorhub.api.datastore.system.ISystemDescStore.class.getClassLoader(),
+                        new Class<?>[]{org.sensorhub.api.datastore.system.ISystemDescStore.class},
+                        (proxy, method, arguments) -> {
+                            if ("getDatastoreName".equals(method.getName()))
+                                return "sys";
+                            throw new UnsupportedOperationException(method.getName());
+                        });
+
+        QueryBuilderDataStreamStore dsBuilder = new QueryBuilderDataStreamStore("obs_datastreams");
+        dsBuilder.linkTo(sysStore);
+
+        DataStreamFilter uidFilter = new DataStreamFilter.Builder()
+                .withSystems(new SystemFilter.Builder()
+                        .withUniqueIDs("urn:osh:system:lane:lane-01", "urn:osh:system:lane:lane-02", INJECTION)
+                        .includeMembers(true)
+                        .build())
+                .build();
+        ParameterizedQuery uidQuery = dsBuilder.createParameterizedSelectEntriesQuery(uidFilter, null);
+        assertSqlDoesNotContainInjection(uidQuery);
+        assertFalse("Exact uniqueIDs must not emit per-lane correlated EXISTS loops",
+                uidQuery.sql().contains("EXISTS (SELECT 1 FROM sys"));
+        assertTrue(uidQuery.sql().contains("SELECT s.data->>'uniqueId' FROM sys s"));
+        assertEquals(6, uidQuery.parameters().size());
+
+        DataStreamFilter idFilter = new DataStreamFilter.Builder()
+                .withSystems(new SystemFilter.Builder()
+                        .withInternalIDs(BigId.fromLong(1, 10L), BigId.fromLong(1, 20L))
+                        .includeMembers(true)
+                        .build())
+                .build();
+        ParameterizedQuery idQuery = dsBuilder.createParameterizedSelectEntriesQuery(idFilter, null);
+        assertFalse("Member internalIDs must not JOIN temporal sys rows",
+                idQuery.sql().contains("JOIN sys"));
+        assertTrue(idQuery.sql().contains("IN (SELECT s.id FROM sys s WHERE s.id IN (?,?) OR s.parentid IN (?,?))"));
+        assertEquals(List.of(10L, 20L, 10L, 20L), idQuery.parameters());
+
+        QueryBuilderCommandStreamStore csBuilder = new QueryBuilderCommandStreamStore("cmd_commandstreams");
+        csBuilder.linkTo(sysStore);
+        CommandStreamFilter csFilter = new CommandStreamFilter.Builder()
+                .withSystems(new SystemFilter.Builder()
+                        .withInternalIDs(BigId.fromLong(1, 10L), BigId.fromLong(1, 20L))
+                        .includeMembers(true)
+                        .build())
+                .build();
+        ParameterizedQuery csQuery = csBuilder.createParameterizedSelectEntriesQuery(csFilter, null);
+        assertFalse(csQuery.sql().contains("JOIN sys"));
+        assertTrue(csQuery.sql().contains("IN (SELECT s.id FROM sys s WHERE s.id IN (?,?) OR s.parentid IN (?,?))"));
+    }
+
     private void assertSqlDoesNotContainInjection(ParameterizedQuery query) {
         assertFalse(query.sql().contains(INJECTION));
         assertTrue(query.parameters().stream().anyMatch(parameter -> parameter.toString().contains(INJECTION)));

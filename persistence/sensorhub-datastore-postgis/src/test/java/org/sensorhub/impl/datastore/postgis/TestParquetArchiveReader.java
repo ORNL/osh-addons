@@ -1117,6 +1117,19 @@ public class TestParquetArchiveReader {
         assertEquals(List.of(502L), containsMatches.stream().map(r -> r.observation().id()).toList());
     }
 
+    @Test
+    public void local9pCacheSizingScalesWithDiskHeadroomAndHonorsExplicitOverride() {
+        long giB = 1024L * 1024L * 1024L;
+        long miB = 1024L * 1024L;
+        assertEquals(8L * giB, ParquetArchiveReader.computeLocal9pCacheMaxBytes(500L * giB, null));
+        assertEquals(4L * giB, ParquetArchiveReader.computeLocal9pCacheMaxBytes(64L * giB, ""));
+        assertEquals(2L * giB, ParquetArchiveReader.computeLocal9pCacheMaxBytes(24L * giB, null));
+        assertEquals(1024L * miB, ParquetArchiveReader.computeLocal9pCacheMaxBytes(8L * giB, null));
+        assertEquals(256L * miB, ParquetArchiveReader.computeLocal9pCacheMaxBytes(512L * miB, null));
+        assertEquals(6L * giB, ParquetArchiveReader.computeLocal9pCacheMaxBytes(500L * giB, String.valueOf(6L * giB)));
+        assertEquals(2L * giB, ParquetArchiveReader.computeLocal9pCacheMaxBytes(Long.MAX_VALUE, "not-a-number"));
+    }
+
     private record TestRow(long id, long dataStreamId, String time, String resultJson) {
         private TestRow(long id, long dataStreamId, String time) {
             this(id, dataStreamId, time, "{\"value\":" + id + "}");
