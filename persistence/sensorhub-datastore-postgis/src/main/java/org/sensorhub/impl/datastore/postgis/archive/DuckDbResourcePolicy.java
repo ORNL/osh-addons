@@ -424,13 +424,34 @@ final class DuckDbResourcePolicy {
     private static final class AdmissionController {
         private final ReentrantLock lock = new ReentrantLock(true);
         private final Condition capacityChanged = lock.newCondition();
-        private final Deque<AdmissionRequest> waiting = new ArrayDeque<>();
+        private final java.util.LinkedList<AdmissionRequest> waiting = new java.util.LinkedList<>();
         private final TreeMap<Integer, Integer> registeredLimits = new TreeMap<>();
         private int active;
 
+        private static boolean isHighPriorityWaiter(String operation) {
+            return "point-query".equals(operation)
+                    || "archive-export".equals(operation)
+                    || "parity-verify".equals(operation)
+                    || "hot-delete".equals(operation);
+        }
+
+        private void enqueueRequest(AdmissionRequest request) {
+            if ("point-query".equals(request.operation())) {
+                int insertAt = 0;
+                for (AdmissionRequest queued : waiting) {
+                    if (!isHighPriorityWaiter(queued.operation())) {
+                        waiting.add(insertAt, request);
+                        return;
+                    }
+                    insertAt++;
+                }
+            }
+            waiting.addLast(request);
+        }
+
         AdmissionPermit acquire(int limit, int timeoutSeconds, String operation) throws Exception {
             long remaining = TimeUnit.SECONDS.toNanos(timeoutSeconds);
-            AdmissionRequest request = new AdmissionRequest();
+            AdmissionRequest request = new AdmissionRequest(operation);
             try {
                 lock.lockInterruptibly();
             } catch (InterruptedException interrupted) {
@@ -440,7 +461,7 @@ final class DuckDbResourcePolicy {
                                 operation, interrupted);
             }
             try {
-                waiting.addLast(request);
+                enqueueRequest(request);
                 addLimit(limit);
                 while (waiting.peekFirst() != request || active >= registeredLimits.firstKey()) {
                     if (remaining <= 0) {
@@ -498,7 +519,7 @@ final class DuckDbResourcePolicy {
         }
     }
 
-    private static final class AdmissionRequest {
+    private record AdmissionRequest(String operation) {
     }
 
     private static final class AdmissionPermit implements AutoCloseable {

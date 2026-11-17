@@ -416,7 +416,8 @@ public final class ParquetArchiveReader {
             if (objects.byFilename().isEmpty())
                 return Stream.empty();
             rows = openRowStream(objects, auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
-                    true, !javaCql, javaCql ? Long.MAX_VALUE : limit), generations.size());
+                    true, !javaCql, javaCql ? Long.MAX_VALUE : limit), generations.size(),
+                    queryOperationName(filter));
             if (cqlMatcher != null) {
                 rows = rows.filter(row -> cqlMatcher.test(row.observation().resultJson()));
             }
@@ -714,15 +715,31 @@ public final class ParquetArchiveReader {
         return clusters;
     }
 
+    private static String queryOperationName(ObsFilter filter) {
+        return filter != null
+                && filter.getInternalIDs() != null
+                && !filter.getInternalIDs().isEmpty()
+                && filter.getCQLFilter() == null
+                ? "point-query"
+                : "cold-query";
+    }
+
     private Stream<ArchivedRow> openRowStream(AuthorizedObjects objects,
                                               Function<AuthorizedObjects, QueryPlan> planFactory,
                                               int generationCount) {
+        return openRowStream(objects, planFactory, generationCount, "cold-query");
+    }
+
+    private Stream<ArchivedRow> openRowStream(AuthorizedObjects objects,
+                                              Function<AuthorizedObjects, QueryPlan> planFactory,
+                                              int generationCount,
+                                              String operationName) {
         DuckDbResourcePolicy.Session duckSession = null;
         PreparedStatement statement = null;
         ResultSet result = null;
         AuthorizedObjects stagedObjects = null;
         try {
-            duckSession = DuckDbResourcePolicy.open(config, "cold-query");
+            duckSession = DuckDbResourcePolicy.open(config, operationName);
             AuthorizedObjects activeObjects = objects;
             if (shouldProactivelyStage(objects, duckSession.operationDirectory())) {
                 stagedObjects = stageAuthorizedObjectsLocally(objects, duckSession.operationDirectory());
@@ -2862,7 +2879,7 @@ public final class ParquetArchiveReader {
             AuthorizedObjects stagedObjects = null;
             try {
                 if (sharedSession == null) {
-                    sharedSession = DuckDbResourcePolicy.open(config, "cold-query");
+                    sharedSession = DuckDbResourcePolicy.open(config, queryOperationName(filter));
                     openCursors.incrementAndGet();
                     sessionCountedInOpenCursors = true;
                 }
