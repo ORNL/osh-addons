@@ -44,7 +44,7 @@ public class QueryBuilderDataStreamStore extends QueryBuilder {
     }
 
     public String createIndexQuery() {
-        return "CREATE INDEX " + this.getStoreTableName() + "_data_idx on " + this.getStoreTableName() + " USING GIN(data)";
+        return "CREATE INDEX " + this.getStoreTableName() + "_data_idx on " + this.getStoreTableName() + " USING GIN(data) WITH (fastupdate = off)";
     }
 
     public String createUniqueIndexQuery() {
@@ -61,11 +61,11 @@ public class QueryBuilderDataStreamStore extends QueryBuilder {
     }
 
     public String createValidTimeBeginIndexQuery() {
-        return "CREATE INDEX "+this.getStoreTableName()+"_date_range_begin_idx ON " + this.getStoreTableName() + " USING GIN((data->'validTime'->'begin'))";
+        return "CREATE INDEX "+this.getStoreTableName()+"_date_range_begin_idx ON " + this.getStoreTableName() + " USING GIN((data->'validTime'->'begin')) WITH (fastupdate = off)";
     }
 
     public String createValidTimeEndIndexQuery() {
-        return "CREATE INDEX "+this.getStoreTableName()+"_date_range_end_idx ON " + this.getStoreTableName() + " USING GIN((data->'validTime'->'end'))";
+        return "CREATE INDEX "+this.getStoreTableName()+"_date_range_end_idx ON " + this.getStoreTableName() + " USING GIN((data->'validTime'->'end')) WITH (fastupdate = off)";
     }
 
     public String createTrigramExtensionQuery() {
@@ -73,17 +73,17 @@ public class QueryBuilderDataStreamStore extends QueryBuilder {
     }
 
     public String createTrigramDescriptionFullTextIndexQuery() {
-        return "CREATE INDEX "+this.getStoreTableName()+"_desc_full_text_datastream_idx ON  " + this.getStoreTableName() + " USING GIN ((data->'recordSchema'->>'description') gin_trgm_ops)";
+        return "CREATE INDEX "+this.getStoreTableName()+"_desc_full_text_datastream_idx ON  " + this.getStoreTableName() + " USING GIN ((data->'recordSchema'->>'description') gin_trgm_ops) WITH (fastupdate = off)";
     }
 
     //SELECT * from test_obs_datastreams where to_tsvector(data->'recordStruct'->'description') @@ to_tsquery('video | Air');
     public String createDescriptionFullTextIndexQuery() {
         return "CREATE INDEX "+this.getStoreTableName()+"_desc_full_text_datastream_idx ON " + this.getStoreTableName() + " USING " +
-                "GIN (to_tsvector('english', data->'recordSchema'->'description'))";
+                "GIN (to_tsvector('english', data->'recordSchema'->'description')) WITH (fastupdate = off)";
     }
 
     public String createSchemaFieldsIndexQuery() {
-        return "CREATE INDEX " + this.getStoreTableName() + "_fields_gin_idx ON " + this.getStoreTableName() + " USING GIN ((data->'recordSchema'->'fields'))";
+        return "CREATE INDEX " + this.getStoreTableName() + "_fields_gin_idx ON " + this.getStoreTableName() + " USING GIN ((data->'recordSchema'->'fields')) WITH (fastupdate = off)";
     }
 
     public String updateByIdQuery() {
@@ -114,11 +114,17 @@ public class QueryBuilderDataStreamStore extends QueryBuilder {
         String functionName = "update_datastream_ranges_" +
                 Integer.toUnsignedString(obsStore.getDatastoreName().hashCode(), 16);
         return "ALTER TABLE " + this.getStoreTableName() + " SET (" +
-                "fillfactor = 70, " +
+                "fillfactor = 50, " +
+                "toast_tuple_target = 128, " +
                 "autovacuum_vacuum_scale_factor = 0.0, " +
                 "autovacuum_vacuum_threshold = 100, " +
                 "autovacuum_analyze_scale_factor = 0.0, " +
                 "autovacuum_analyze_threshold = 100);\n" +
+                "ALTER INDEX IF EXISTS " + this.getStoreTableName() + "_data_idx SET (fastupdate = off);\n" +
+                "ALTER INDEX IF EXISTS " + this.getStoreTableName() + "_date_range_begin_idx SET (fastupdate = off);\n" +
+                "ALTER INDEX IF EXISTS " + this.getStoreTableName() + "_date_range_end_idx SET (fastupdate = off);\n" +
+                "ALTER INDEX IF EXISTS " + this.getStoreTableName() + "_desc_full_text_datastream_idx SET (fastupdate = off);\n" +
+                "ALTER INDEX IF EXISTS " + this.getStoreTableName() + "_fields_gin_idx SET (fastupdate = off);\n" +
                 "DROP TRIGGER IF EXISTS obs_update_datastream_ranges ON " + obsStore.getDatastoreName() + ";\n" +
                 "CREATE OR REPLACE FUNCTION " + functionName + "()\n" +
                 "RETURNS TRIGGER AS $$\n" +
