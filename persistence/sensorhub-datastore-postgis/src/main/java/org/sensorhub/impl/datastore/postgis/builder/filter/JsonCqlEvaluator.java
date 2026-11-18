@@ -1514,4 +1514,189 @@ public final class JsonCqlEvaluator {
             out.append(text.length()).append('#').append(text);
         }
     }
+
+    public static final int BIT_GAMMA_TRUE = 1;
+    public static final int BIT_GAMMA_FALSE = 1 << 1;
+    public static final int BIT_NEUTRON_TRUE = 1 << 2;
+    public static final int BIT_NEUTRON_FALSE = 1 << 3;
+    public static final int BIT_ADJ_ZERO = 1 << 4;
+    public static final int BIT_ADJ_GT_ZERO = 1 << 5;
+    public static final int BIT_FAULT_GAMMA_HIGH = 1 << 6;
+    public static final int BIT_FAULT_GAMMA_LOW = 1 << 7;
+    public static final int BIT_FAULT_NEUTRON = 1 << 8;
+    public static final int BIT_FAULT_EXT_OCC = 1 << 9;
+    public static final int BIT_TAMPER_TRUE = 1 << 10;
+    public static final int BIT_RS350_GAMMA = 1 << 11;
+    public static final int BIT_RS350_NEUTRON = 1 << 12;
+
+    private static final Set<String> SUMMARY_MASK_PROJECTED_KEYS = Set.of(
+            "gammaAlarm", "neutronAlarm", "adjudicatedIdsCount", "adjudicatedIds",
+            "alarmState", "tamperStatus", "derivedData");
+    private static final String[] SEG_GAMMA_ALARM = {"gammaAlarm"};
+    private static final String[] SEG_NEUTRON_ALARM = {"neutronAlarm"};
+    private static final String[] SEG_ADJ_COUNT = {"adjudicatedIdsCount"};
+    private static final String[] SEG_ALARM_STATE = {"alarmState"};
+    private static final String[] SEG_TAMPER_STATUS = {"tamperStatus"};
+    private static final String[] SEG_ALARM_CATEGORY = {"derivedData", "alarmCategory"};
+    private static final Pattern RS350_GAMMA_PATTERN = Pattern.compile(".*Gamma.*", Pattern.DOTALL);
+    private static final Pattern RS350_NEUTRON_PATTERN = Pattern.compile(".*Neutron.*", Pattern.DOTALL);
+
+    /**
+     * Computes a compact 4-byte non-negative bitmask capturing all 13 atomic
+     * summary-counter predicates over an immutable cold base observation's JSON,
+     * allowing PostgreSQL overlay/tombstone rows to answer summary inclusion-exclusion
+     * counts without duplicating cold JSONB payloads or touching Parquet files.
+     */
+    public static int computeSummaryMask(String resultJson) {
+        if (resultJson == null || resultJson.isBlank())
+            return 0;
+        JsonObject obj = parseProjectedJsonObject(resultJson, SUMMARY_MASK_PROJECTED_KEYS);
+        if (obj == null)
+            return 0;
+        int mask = 0;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "gammaAlarm", SEG_GAMMA_ALARM, Boolean.TRUE, null, null, obj))
+            mask |= BIT_GAMMA_TRUE;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "gammaAlarm", SEG_GAMMA_ALARM, Boolean.FALSE, null, null, obj))
+            mask |= BIT_GAMMA_FALSE;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "neutronAlarm", SEG_NEUTRON_ALARM, Boolean.TRUE, null, null, obj))
+            mask |= BIT_NEUTRON_TRUE;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "neutronAlarm", SEG_NEUTRON_ALARM, Boolean.FALSE, null, null, obj))
+            mask |= BIT_NEUTRON_FALSE;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "adjudicatedIdsCount", SEG_ADJ_COUNT, 0L, BigDecimal.ZERO, null, obj))
+            mask |= BIT_ADJ_ZERO;
+        if (evaluateCompiledComparison(ComparisonKind.GT, true, "adjudicatedIdsCount", SEG_ADJ_COUNT, 0L, BigDecimal.ZERO, null, obj))
+            mask |= BIT_ADJ_GT_ZERO;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "alarmState", SEG_ALARM_STATE, "Fault - Gamma High", null, null, obj))
+            mask |= BIT_FAULT_GAMMA_HIGH;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "alarmState", SEG_ALARM_STATE, "Fault - Gamma Low", null, null, obj))
+            mask |= BIT_FAULT_GAMMA_LOW;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "alarmState", SEG_ALARM_STATE, "Fault - Neutron", null, null, obj))
+            mask |= BIT_FAULT_NEUTRON;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "alarmState", SEG_ALARM_STATE, "Fault - Extended Occupancy", null, null, obj))
+            mask |= BIT_FAULT_EXT_OCC;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "tamperStatus", SEG_TAMPER_STATUS, Boolean.TRUE, null, null, obj))
+            mask |= BIT_TAMPER_TRUE;
+        if (matchesCompiledLike(obj, "derivedData.alarmCategory", SEG_ALARM_CATEGORY, RS350_GAMMA_PATTERN))
+            mask |= BIT_RS350_GAMMA;
+        if (matchesCompiledLike(obj, "derivedData.alarmCategory", SEG_ALARM_CATEGORY, RS350_NEUTRON_PATTERN))
+            mask |= BIT_RS350_NEUTRON;
+        return mask;
+    }
+
+    private static boolean matchesCompiledLike(JsonObject json, String path, String[] segments, Pattern compiled) {
+        JsonElement actual = resolveCompiled(json, path, segments);
+        if (actual == null || actual.isJsonNull())
+            return false;
+        if (actual.isJsonArray()) {
+            return StreamSupport.stream(actual.getAsJsonArray().spliterator(), false)
+                    .anyMatch(el -> el != null && el.isJsonPrimitive() &&
+                            compiled.matcher(el.getAsString()).matches());
+        }
+        if (!actual.isJsonPrimitive())
+            return false;
+        return compiled.matcher(actual.getAsString()).matches();
+    }
+
+    /**
+     * Evaluates {@code filter} directly against a precomputed {@link #computeSummaryMask(String)}
+     * when {@code filter} is composed solely of summary-mask predicates, or returns
+     * {@link Optional#empty()} when full JSON evaluation is required.
+     */
+    public static Optional<Boolean> tryEvaluateSummaryMask(Filter filter, int mask) {
+        if (filter == null || filter == Filter.INCLUDE)
+            return Optional.of(Boolean.TRUE);
+        if (filter == Filter.EXCLUDE)
+            return Optional.of(Boolean.FALSE);
+        if (filter instanceof And and) {
+            if (and.getChildren().isEmpty())
+                return Optional.empty();
+            boolean allTrue = true;
+            for (Filter child : and.getChildren()) {
+                Optional<Boolean> sub = tryEvaluateSummaryMask(child, mask);
+                if (sub.isEmpty())
+                    return Optional.empty();
+                if (!sub.get())
+                    allTrue = false;
+            }
+            return Optional.of(allTrue);
+        }
+        if (filter instanceof Or or) {
+            if (or.getChildren().isEmpty())
+                return Optional.empty();
+            boolean anyTrue = false;
+            for (Filter child : or.getChildren()) {
+                Optional<Boolean> sub = tryEvaluateSummaryMask(child, mask);
+                if (sub.isEmpty())
+                    return Optional.empty();
+                if (sub.get())
+                    anyTrue = true;
+            }
+            return Optional.of(anyTrue);
+        }
+        int bit = leafSummaryBit(filter);
+        if (bit == 0)
+            return Optional.empty();
+        return Optional.of((mask & bit) != 0);
+    }
+
+    /**
+     * Checks whether {@code filter} can be evaluated solely from a 4-byte
+     * {@link #computeSummaryMask(String)} without reading JSON payloads.
+     */
+    public static boolean supportsSummaryMaskEvaluation(Filter filter) {
+        return tryEvaluateSummaryMask(filter, 0).isPresent();
+    }
+
+    private static int leafSummaryBit(Filter filter) {
+        if (filter instanceof PropertyIsEqualTo eq) {
+            if (!(eq.getExpression1() instanceof PropertyName prop) ||
+                    !(eq.getExpression2() instanceof Literal lit) ||
+                    lit.getValue() == null)
+                return 0;
+            String name = prop.getPropertyName();
+            Object val = lit.getValue();
+            if (val instanceof Boolean boolVal) {
+                if ("gammaAlarm".equals(name))
+                    return boolVal ? BIT_GAMMA_TRUE : BIT_GAMMA_FALSE;
+                if ("neutronAlarm".equals(name))
+                    return boolVal ? BIT_NEUTRON_TRUE : BIT_NEUTRON_FALSE;
+                if ("tamperStatus".equals(name) && boolVal)
+                    return BIT_TAMPER_TRUE;
+                return 0;
+            }
+            if ("adjudicatedIdsCount".equals(name) && val instanceof Number && isZeroNumber(val))
+                return BIT_ADJ_ZERO;
+            if (eq.isMatchingCase() && "alarmState".equals(name) && val instanceof String text) {
+                return switch (text) {
+                    case "Fault - Gamma High" -> BIT_FAULT_GAMMA_HIGH;
+                    case "Fault - Gamma Low" -> BIT_FAULT_GAMMA_LOW;
+                    case "Fault - Neutron" -> BIT_FAULT_NEUTRON;
+                    case "Fault - Extended Occupancy" -> BIT_FAULT_EXT_OCC;
+                    default -> 0;
+                };
+            }
+            return 0;
+        }
+        if (filter instanceof PropertyIsGreaterThan gt &&
+                gt.getExpression1() instanceof PropertyName prop &&
+                gt.getExpression2() instanceof Literal lit &&
+                "adjudicatedIdsCount".equals(prop.getPropertyName()) &&
+                (lit.getValue() instanceof Number || lit.getValue() instanceof String) &&
+                isZeroNumber(lit.getValue())) {
+            return BIT_ADJ_GT_ZERO;
+        }
+        if (filter instanceof PropertyIsLike like &&
+                like.isMatchingCase() &&
+                "%".equals(like.getWildCard()) &&
+                "_".equals(like.getSingleChar()) &&
+                "\\".equals(like.getEscape()) &&
+                like.getExpression() instanceof PropertyName prop &&
+                "derivedData.alarmCategory".equals(prop.getPropertyName())) {
+            if ("%Gamma%".equals(like.getLiteral()))
+                return BIT_RS350_GAMMA;
+            if ("%Neutron%".equals(like.getLiteral()))
+                return BIT_RS350_NEUTRON;
+        }
+        return 0;
+    }
 }

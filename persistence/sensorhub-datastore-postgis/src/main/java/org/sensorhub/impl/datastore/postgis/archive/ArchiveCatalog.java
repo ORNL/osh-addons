@@ -457,6 +457,10 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_obs_overlay ADD COLUMN IF NOT EXISTS schema_sha256 text " +
                         "REFERENCES oscar_archive_schema_blob(schema_sha256)");
                 statement.execute("ALTER TABLE oscar_obs_overlay ALTER COLUMN schema_json DROP NOT NULL");
+                statement.execute("ALTER TABLE oscar_obs_overlay ADD COLUMN IF NOT EXISTS base_summary_mask integer");
+                statement.execute("ALTER TABLE oscar_obs_overlay ADD COLUMN IF NOT EXISTS base_datastream_id bigint");
+                statement.execute("ALTER TABLE oscar_obs_overlay ADD COLUMN IF NOT EXISTS base_foi_id bigint");
+                statement.execute("ALTER TABLE oscar_obs_overlay ADD COLUMN IF NOT EXISTS base_generation_sha256 text");
                 // Once the validated constraint is installed, invalid schema-less
                 // rows cannot be inserted. Avoid a history-sized repair scan on
                 // every restart for a site with years of adjudication overlays.
@@ -566,9 +570,21 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_tombstone ADD CONSTRAINT oscar_tombstone_observation_owner_check " +
                         "CHECK (subject_type <> 'OBSERVATION' OR generation_id IS NOT NULL)");
                 statement.execute("ALTER TABLE oscar_tombstone ADD COLUMN IF NOT EXISTS datastream_id bigint");
+                statement.execute("ALTER TABLE oscar_tombstone ADD COLUMN IF NOT EXISTS base_summary_mask integer");
+                statement.execute("ALTER TABLE oscar_tombstone ADD COLUMN IF NOT EXISTS base_foi_id bigint");
+                statement.execute("ALTER TABLE oscar_tombstone ADD COLUMN IF NOT EXISTS base_generation_sha256 text");
                 statement.execute("UPDATE oscar_tombstone tombstone SET datastream_id=overlay_row.datastream_id " +
                         "FROM oscar_obs_overlay overlay_row " +
                         "WHERE tombstone.datastream_id IS NULL AND tombstone.subject_type='OBSERVATION' " +
+                        "AND tombstone.store_key=overlay_row.store_key AND tombstone.id_scope=overlay_row.id_scope " +
+                        "AND tombstone.subject_id=overlay_row.observation_id::text");
+                statement.execute("UPDATE oscar_tombstone tombstone SET " +
+                        "base_summary_mask=overlay_row.base_summary_mask, " +
+                        "base_foi_id=overlay_row.base_foi_id, " +
+                        "base_generation_sha256=overlay_row.base_generation_sha256 " +
+                        "FROM oscar_obs_overlay overlay_row " +
+                        "WHERE tombstone.base_summary_mask IS NULL AND overlay_row.base_summary_mask IS NOT NULL " +
+                        "AND tombstone.subject_type='OBSERVATION' " +
                         "AND tombstone.store_key=overlay_row.store_key AND tombstone.id_scope=overlay_row.id_scope " +
                         "AND tombstone.subject_id=overlay_row.observation_id::text");
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_tombstone_generation_idx " +
@@ -2746,7 +2762,13 @@ public final class ArchiveCatalog {
     }
 
     public record OverlayBatchItem(UUID generationId, ArchivedObservation observation,
-                                   String schemaJson, String schemaSha256) {}
+                                   String schemaJson, String schemaSha256,
+                                   Integer baseSummaryMask, Long baseDataStreamId, Long baseFoiId) {
+        public OverlayBatchItem(UUID generationId, ArchivedObservation observation,
+                                String schemaJson, String schemaSha256) {
+            this(generationId, observation, schemaJson, schemaSha256, null, null, null);
+        }
+    }
 
     /**
      * Inserts any uncached schema blobs in ascending {@code schemaSha256} order
@@ -2785,8 +2807,11 @@ public final class ArchiveCatalog {
         if (items == null || items.isEmpty())
             return;
         try (PreparedStatement statement = connection.prepareStatement(
-                "INSERT INTO oscar_obs_overlay(store_key, id_scope, observation_id, generation_id, datastream_id, foi_id, phenomenon_time, result_time, result_json, schema_sha256) " +
-                        "SELECT ?, ?, ?, generation.id, ?, ?, ?, ?, ?::jsonb, ? " +
+                "INSERT INTO oscar_obs_overlay(store_key, id_scope, observation_id, generation_id, datastream_id, foi_id, " +
+                        "phenomenon_time, result_time, result_json, schema_sha256, " +
+                        "base_summary_mask, base_datastream_id, base_foi_id, base_generation_sha256) " +
+                        "SELECT ?, ?, ?, generation.id, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, " +
+                        "CASE WHEN ?::integer IS NOT NULL THEN generation.sha256 ELSE NULL END " +
                         "FROM oscar_archive_generation generation WHERE generation.id=? " +
                         "AND generation.store_key=? AND generation.id_scope=? " +
                         "AND generation.state IN ('ACTIVE','SEALED') " +
@@ -2794,7 +2819,13 @@ public final class ArchiveCatalog {
                         "generation_id=EXCLUDED.generation_id, datastream_id=EXCLUDED.datastream_id, " +
                         "foi_id=EXCLUDED.foi_id, phenomenon_time=EXCLUDED.phenomenon_time, " +
                         "result_time=EXCLUDED.result_time, result_json=EXCLUDED.result_json, " +
-                        "schema_json=NULL, schema_sha256=EXCLUDED.schema_sha256, updated_at=now()")) {
+                        "schema_json=NULL, schema_sha256=EXCLUDED.schema_sha256, " +
+                        "base_summary_mask=COALESCE(oscar_obs_overlay.base_summary_mask, EXCLUDED.base_summary_mask), " +
+                        "base_datastream_id=COALESCE(oscar_obs_overlay.base_datastream_id, EXCLUDED.base_datastream_id), " +
+                        "base_foi_id=CASE WHEN oscar_obs_overlay.base_summary_mask IS NOT NULL " +
+                        "THEN oscar_obs_overlay.base_foi_id ELSE EXCLUDED.base_foi_id END, " +
+                        "base_generation_sha256=COALESCE(oscar_obs_overlay.base_generation_sha256, EXCLUDED.base_generation_sha256), " +
+                        "updated_at=now()")) {
             for (OverlayBatchItem item : items) {
                 ArchivedObservation observation = item.observation();
                 statement.setString(1, storeKey);
@@ -2815,9 +2846,26 @@ public final class ArchiveCatalog {
                     UtcJdbcTime.setInstant(statement, 7, observation.resultTime());
                 statement.setString(8, observation.resultJson());
                 statement.setString(9, item.schemaSha256());
-                statement.setObject(10, item.generationId());
-                statement.setString(11, storeKey);
-                statement.setInt(12, idScope);
+                if (item.baseSummaryMask() == null) {
+                    statement.setNull(10, java.sql.Types.INTEGER);
+                    statement.setNull(11, java.sql.Types.BIGINT);
+                    statement.setNull(12, java.sql.Types.BIGINT);
+                    statement.setNull(13, java.sql.Types.INTEGER);
+                } else {
+                    statement.setInt(10, item.baseSummaryMask());
+                    if (item.baseDataStreamId() == null)
+                        statement.setLong(11, observation.dataStreamId());
+                    else
+                        statement.setLong(11, item.baseDataStreamId());
+                    if (item.baseFoiId() == null)
+                        statement.setNull(12, java.sql.Types.BIGINT);
+                    else
+                        statement.setLong(12, item.baseFoiId());
+                    statement.setInt(13, item.baseSummaryMask());
+                }
+                statement.setObject(14, item.generationId());
+                statement.setString(15, storeKey);
+                statement.setInt(16, idScope);
                 statement.addBatch();
             }
             int[] counts = statement.executeBatch();
@@ -2901,6 +2949,13 @@ public final class ArchiveCatalog {
     public void upsertOverlay(Connection connection, UUID generationId,
                               ArchivedObservation observation, String schemaJson,
                               String schemaHash) throws SQLException {
+        upsertOverlay(connection, generationId, observation, schemaJson, schemaHash, null, null, null);
+    }
+
+    public void upsertOverlay(Connection connection, UUID generationId,
+                              ArchivedObservation observation, String schemaJson,
+                              String schemaHash, Integer baseSummaryMask,
+                              Long baseDataStreamId, Long baseFoiId) throws SQLException {
         if (schemaJson == null || schemaJson.isBlank())
             throw new IllegalArgumentException("Archived observation overlays require an immutable schema snapshot");
         if (schemaHash == null || schemaHash.isBlank())
@@ -2915,7 +2970,8 @@ public final class ArchiveCatalog {
             }
         }
         upsertOverlaysBatch(connection, List.of(
-                new OverlayBatchItem(generationId, observation, schemaJson, schemaHash)));
+                new OverlayBatchItem(generationId, observation, schemaJson, schemaHash,
+                        baseSummaryMask, baseDataStreamId, baseFoiId)));
     }
 
     public Set<Long> activeTombstonedObservationIds(Connection connection,
@@ -4746,6 +4802,16 @@ public final class ArchiveCatalog {
                                      UUID generationId, Long dataStreamId, String reason, String policy,
                                      ActiveRemovalHolds holds)
             throws SQLException {
+        return tombstoneIfAbsent(connection, observationId, generationId, dataStreamId,
+                null, null, reason, policy, holds);
+    }
+
+    public boolean tombstoneIfAbsent(Connection connection, long observationId,
+                                     UUID generationId, Long dataStreamId,
+                                     Integer unmutatedBaseSummaryMask, Long unmutatedBaseFoiId,
+                                     String reason, String policy,
+                                     ActiveRemovalHolds holds)
+            throws SQLException {
         if (connection == null)
             throw new IllegalArgumentException("A transaction connection is required");
         if (generationId == null)
@@ -4753,8 +4819,34 @@ public final class ArchiveCatalog {
         requireTransaction(connection);
         requireRemovalAllowed(holds, observationId, generationId);
         try (PreparedStatement statement = connection.prepareStatement(
-                "INSERT INTO oscar_tombstone(store_key, id_scope, subject_type, subject_id, generation_id, datastream_id, reason, policy) " +
-                        "SELECT ?, ?, 'OBSERVATION', ?, generation.id, ?, ?, ? " +
+                "INSERT INTO oscar_tombstone(store_key, id_scope, subject_type, subject_id, generation_id, datastream_id, " +
+                        "base_summary_mask, base_foi_id, base_generation_sha256, reason, policy) " +
+                        "SELECT ?, ?, 'OBSERVATION', ?, generation.id, " +
+                        "COALESCE((SELECT ov.base_datastream_id FROM oscar_obs_overlay ov " +
+                        "WHERE ov.store_key=generation.store_key AND ov.id_scope=generation.id_scope " +
+                        "AND ov.observation_id=? AND ov.generation_id=generation.id), ?), " +
+                        "CASE WHEN EXISTS (SELECT 1 FROM oscar_obs_overlay ov " +
+                        "WHERE ov.store_key=generation.store_key AND ov.id_scope=generation.id_scope " +
+                        "AND ov.observation_id=? AND ov.generation_id=generation.id) " +
+                        "THEN (SELECT ov.base_summary_mask FROM oscar_obs_overlay ov " +
+                        "WHERE ov.store_key=generation.store_key AND ov.id_scope=generation.id_scope " +
+                        "AND ov.observation_id=? AND ov.generation_id=generation.id) " +
+                        "ELSE ? END, " +
+                        "CASE WHEN EXISTS (SELECT 1 FROM oscar_obs_overlay ov " +
+                        "WHERE ov.store_key=generation.store_key AND ov.id_scope=generation.id_scope " +
+                        "AND ov.observation_id=? AND ov.generation_id=generation.id) " +
+                        "THEN (SELECT ov.base_foi_id FROM oscar_obs_overlay ov " +
+                        "WHERE ov.store_key=generation.store_key AND ov.id_scope=generation.id_scope " +
+                        "AND ov.observation_id=? AND ov.generation_id=generation.id) " +
+                        "ELSE ? END, " +
+                        "CASE WHEN EXISTS (SELECT 1 FROM oscar_obs_overlay ov " +
+                        "WHERE ov.store_key=generation.store_key AND ov.id_scope=generation.id_scope " +
+                        "AND ov.observation_id=? AND ov.generation_id=generation.id) " +
+                        "THEN (SELECT ov.base_generation_sha256 FROM oscar_obs_overlay ov " +
+                        "WHERE ov.store_key=generation.store_key AND ov.id_scope=generation.id_scope " +
+                        "AND ov.observation_id=? AND ov.generation_id=generation.id) " +
+                        "WHEN ?::integer IS NOT NULL THEN generation.sha256 ELSE NULL END, " +
+                        "?, ? " +
                         "FROM oscar_archive_generation generation WHERE generation.id=? " +
                         "AND generation.store_key=? AND generation.id_scope=? " +
                         "AND generation.state IN ('ACTIVE','SEALED') " +
@@ -4762,15 +4854,34 @@ public final class ArchiveCatalog {
             statement.setString(1, storeKey);
             statement.setInt(2, idScope);
             statement.setString(3, Long.toString(observationId));
+            statement.setLong(4, observationId);
             if (dataStreamId == null)
-                statement.setNull(4, Types.BIGINT);
+                statement.setNull(5, Types.BIGINT);
             else
-                statement.setLong(4, dataStreamId);
-            statement.setString(5, reason);
-            statement.setString(6, policy);
-            statement.setObject(7, generationId);
-            statement.setString(8, storeKey);
-            statement.setInt(9, idScope);
+                statement.setLong(5, dataStreamId);
+            statement.setLong(6, observationId);
+            statement.setLong(7, observationId);
+            if (unmutatedBaseSummaryMask == null)
+                statement.setNull(8, Types.INTEGER);
+            else
+                statement.setInt(8, unmutatedBaseSummaryMask);
+            statement.setLong(9, observationId);
+            statement.setLong(10, observationId);
+            if (unmutatedBaseFoiId == null)
+                statement.setNull(11, Types.BIGINT);
+            else
+                statement.setLong(11, unmutatedBaseFoiId);
+            statement.setLong(12, observationId);
+            statement.setLong(13, observationId);
+            if (unmutatedBaseSummaryMask == null)
+                statement.setNull(14, Types.INTEGER);
+            else
+                statement.setInt(14, unmutatedBaseSummaryMask);
+            statement.setString(15, reason);
+            statement.setString(16, policy);
+            statement.setObject(17, generationId);
+            statement.setString(18, storeKey);
+            statement.setInt(19, idScope);
             int inserted = statement.executeUpdate();
             if (inserted == 1) {
                 deleteFromLatestIfPresent(connection, observationId);
@@ -4821,4 +4932,250 @@ public final class ArchiveCatalog {
 
     public record SchemaSnapshot(long dataStreamId, String json) {}
     public record ArchivedOverlay(UUID generationId, String schemaJson, ArchivedObservation observation) {}
+    public record MutatedBaseSummaryRow(
+            UUID generationId,
+            long observationId,
+            String generationSha256,
+            Long dataStreamId,
+            Long foiId,
+            Integer summaryMask) {}
+
+    /**
+     * Loads persisted 4-byte cold base summary bitmasks for all mutated
+     * (overlaid or tombstoned) observations across {@code generationIds} in a
+     * single indexed PostgreSQL round-trip.
+     */
+    public Map<UUID, Map<Long, MutatedBaseSummaryRow>> loadMutatedBaseSummariesByGeneration(
+            Collection<UUID> generationIds) {
+        if (generationIds == null || generationIds.isEmpty())
+            return Map.of();
+        String sql = "WITH target_gen(id) AS (SELECT unnest(?::uuid[])), " +
+                "raw_mutated AS (" +
+                "  SELECT ov.generation_id, ov.observation_id, ov.base_generation_sha256 AS gen_sha, " +
+                "         COALESCE(ov.base_datastream_id, ov.datastream_id) AS ds_id, " +
+                "         ov.base_foi_id AS foi_id, ov.base_summary_mask AS mask, 0 AS src_rank " +
+                "  FROM oscar_obs_overlay ov " +
+                "  JOIN target_gen tg ON tg.id=ov.generation_id " +
+                "  JOIN oscar_archive_generation g ON g.id=ov.generation_id " +
+                "  WHERE ov.store_key=? AND ov.id_scope=? " +
+                "    AND g.store_key=ov.store_key AND g.id_scope=ov.id_scope " +
+                "    AND g.state IN ('ACTIVE','SEALED') " +
+                "  UNION ALL " +
+                "  SELECT tb.generation_id, tb.subject_id::bigint AS observation_id, tb.base_generation_sha256 AS gen_sha, " +
+                "         tb.datastream_id AS ds_id, tb.base_foi_id AS foi_id, tb.base_summary_mask AS mask, 1 AS src_rank " +
+                "  FROM oscar_tombstone tb " +
+                "  JOIN target_gen tg ON tg.id=tb.generation_id " +
+                "  JOIN oscar_archive_generation g ON g.id=tb.generation_id " +
+                "  WHERE tb.store_key=? AND tb.id_scope=? " +
+                "    AND tb.subject_type='OBSERVATION' AND tb.subject_id ~ '^[0-9]+$' " +
+                "    AND g.store_key=tb.store_key AND g.id_scope=tb.id_scope " +
+                "    AND g.state IN ('ACTIVE','SEALED')" +
+                ") " +
+                "SELECT DISTINCT ON (generation_id, observation_id) " +
+                "       generation_id, observation_id, gen_sha, ds_id, foi_id, mask " +
+                "FROM raw_mutated " +
+                "ORDER BY generation_id, observation_id, (mask IS NULL) ASC, src_rank ASC";
+        Map<UUID, Map<Long, MutatedBaseSummaryRow>> byGeneration = new HashMap<>();
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            java.sql.Array genArray = connection.createArrayOf("uuid", generationIds.toArray());
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setArray(1, genArray);
+                statement.setString(2, storeKey);
+                statement.setInt(3, idScope);
+                statement.setString(4, storeKey);
+                statement.setInt(5, idScope);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next()) {
+                        UUID genId = result.getObject(1, UUID.class);
+                        long obsId = result.getLong(2);
+                        String genSha = result.getString(3);
+                        Long dsId = result.getObject(4, Long.class);
+                        Long foiId = result.getObject(5, Long.class);
+                        Integer mask = result.getObject(6, Integer.class);
+                        byGeneration.computeIfAbsent(genId, ignored -> new HashMap<>())
+                                .put(obsId, new MutatedBaseSummaryRow(genId, obsId, genSha, dsId, foiId, mask));
+                    }
+                }
+            } finally {
+                genArray.free();
+                connection.setReadOnly(oldReadOnly);
+            }
+            return byGeneration;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot load mutated observation base summary masks", e);
+        }
+    }
+
+    /**
+     * Persists backfilled 4-byte cold base summary bitmasks onto existing
+     * {@code oscar_obs_overlay} and {@code oscar_tombstone} rows whose mask was
+     * not yet populated (such as pre-upgrade overlays).
+     */
+    public void backfillMutatedBaseSummaries(List<MutatedBaseSummaryRow> rows) {
+        if (rows == null || rows.isEmpty())
+            return;
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            if (oldReadOnly)
+                connection.setReadOnly(false);
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                try (PreparedStatement ovStmt = connection.prepareStatement(
+                        "UPDATE oscar_obs_overlay SET " +
+                                "base_summary_mask=?, base_datastream_id=?, base_foi_id=?, base_generation_sha256=? " +
+                                "WHERE store_key=? AND id_scope=? AND generation_id=? AND observation_id=? " +
+                                "AND (base_summary_mask IS NULL OR base_generation_sha256 IS DISTINCT FROM ?)");
+                     PreparedStatement tbStmt = connection.prepareStatement(
+                             "UPDATE oscar_tombstone SET " +
+                                     "base_summary_mask=?, datastream_id=COALESCE(datastream_id, ?), " +
+                                     "base_foi_id=?, base_generation_sha256=? " +
+                                     "WHERE store_key=? AND id_scope=? AND subject_type='OBSERVATION' " +
+                                     "AND generation_id=? AND subject_id=? " +
+                                     "AND (base_summary_mask IS NULL OR base_generation_sha256 IS DISTINCT FROM ?)")) {
+                    for (MutatedBaseSummaryRow row : rows) {
+                        if (row.summaryMask() == null || row.generationSha256() == null)
+                            continue;
+                        ovStmt.setInt(1, row.summaryMask());
+                        if (row.dataStreamId() == null)
+                            ovStmt.setNull(2, Types.BIGINT);
+                        else
+                            ovStmt.setLong(2, row.dataStreamId());
+                        if (row.foiId() == null)
+                            ovStmt.setNull(3, Types.BIGINT);
+                        else
+                            ovStmt.setLong(3, row.foiId());
+                        ovStmt.setString(4, row.generationSha256());
+                        ovStmt.setString(5, storeKey);
+                        ovStmt.setInt(6, idScope);
+                        ovStmt.setObject(7, row.generationId());
+                        ovStmt.setLong(8, row.observationId());
+                        ovStmt.setString(9, row.generationSha256());
+                        ovStmt.addBatch();
+
+                        tbStmt.setInt(1, row.summaryMask());
+                        if (row.dataStreamId() == null)
+                            tbStmt.setNull(2, Types.BIGINT);
+                        else
+                            tbStmt.setLong(2, row.dataStreamId());
+                        if (row.foiId() == null)
+                            tbStmt.setNull(3, Types.BIGINT);
+                        else
+                            tbStmt.setLong(3, row.foiId());
+                        tbStmt.setString(4, row.generationSha256());
+                        tbStmt.setString(5, storeKey);
+                        tbStmt.setInt(6, idScope);
+                        tbStmt.setObject(7, row.generationId());
+                        tbStmt.setString(8, Long.toString(row.observationId()));
+                        tbStmt.setString(9, row.generationSha256());
+                        tbStmt.addBatch();
+                    }
+                    ovStmt.executeBatch();
+                    tbStmt.executeBatch();
+                }
+                connection.commit();
+            } catch (Exception e) {
+                connection.rollback();
+                throw e;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+                if (oldReadOnly)
+                    connection.setReadOnly(true);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot backfill mutated observation base summary masks", e);
+        }
+    }
+
+    /**
+     * Finds up to {@code maxGenerations} active/sealed archive generations that
+     * have at least one overlay or observation tombstone missing a valid
+     * {@code base_summary_mask}, returning the missing observation IDs per generation.
+     */
+    public java.util.LinkedHashMap<ArchiveGeneration, Set<Long>> findMutatedGenerationsMissingBaseSummary(
+            int maxGenerations) {
+        if (maxGenerations < 1)
+            return new java.util.LinkedHashMap<>();
+        String sql = "WITH missing AS (" +
+                "  SELECT ov.generation_id, ov.observation_id " +
+                "  FROM oscar_obs_overlay ov " +
+                "  JOIN oscar_archive_generation g ON g.id=ov.generation_id " +
+                "  WHERE ov.store_key=? AND ov.id_scope=? " +
+                "    AND g.store_key=ov.store_key AND g.id_scope=ov.id_scope " +
+                "    AND g.state IN ('ACTIVE','SEALED') " +
+                "    AND (ov.base_summary_mask IS NULL OR ov.base_generation_sha256 IS DISTINCT FROM g.sha256) " +
+                "  UNION " +
+                "  SELECT tb.generation_id, tb.subject_id::bigint AS observation_id " +
+                "  FROM oscar_tombstone tb " +
+                "  JOIN oscar_archive_generation g ON g.id=tb.generation_id " +
+                "  WHERE tb.store_key=? AND tb.id_scope=? " +
+                "    AND tb.subject_type='OBSERVATION' AND tb.subject_id ~ '^[0-9]+$' " +
+                "    AND g.store_key=tb.store_key AND g.id_scope=tb.id_scope " +
+                "    AND g.state IN ('ACTIVE','SEALED') " +
+                "    AND (tb.base_summary_mask IS NULL OR tb.base_generation_sha256 IS DISTINCT FROM g.sha256)" +
+                "), chosen_gens AS (" +
+                "  SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
+                "         g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, " +
+                "         g.min_result_time, g.max_result_time " +
+                "  FROM oscar_archive_generation g " +
+                "  WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                "    AND EXISTS (SELECT 1 FROM missing m WHERE m.generation_id=g.id) " +
+                "  ORDER BY g.window_start DESC " +
+                "  LIMIT ?" +
+                ") " +
+                "SELECT cg.id, cg.profile, cg.window_start, cg.window_end, cg.object_path, cg.sha256, " +
+                "       cg.row_count, cg.min_id, cg.max_id, cg.state, cg.parity_verified, " +
+                "       cg.min_result_time, cg.max_result_time, m.observation_id " +
+                "FROM chosen_gens cg " +
+                "JOIN missing m ON m.generation_id=cg.id " +
+                "ORDER BY cg.window_start DESC, cg.id, m.observation_id";
+        java.util.LinkedHashMap<ArchiveGeneration, Set<Long>> out = new java.util.LinkedHashMap<>();
+        Map<UUID, ArchiveGeneration> genById = new HashMap<>();
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, storeKey);
+                statement.setInt(2, idScope);
+                statement.setString(3, storeKey);
+                statement.setInt(4, idScope);
+                statement.setString(5, storeKey);
+                statement.setInt(6, idScope);
+                statement.setInt(7, maxGenerations);
+                try (ResultSet rs = statement.executeQuery()) {
+                    while (rs.next()) {
+                        UUID id = rs.getObject(1, UUID.class);
+                        ArchiveGeneration gen = genById.computeIfAbsent(id, ignored -> {
+                            try {
+                                return new ArchiveGeneration(
+                                        id,
+                                        rs.getString(2),
+                                        UtcJdbcTime.getInstant(rs, 3),
+                                        UtcJdbcTime.getInstant(rs, 4),
+                                        Path.of(rs.getString(5)),
+                                        rs.getString(6),
+                                        rs.getLong(7),
+                                        rs.getLong(8),
+                                        rs.getLong(9),
+                                        rs.getString(10),
+                                        rs.getBoolean(11),
+                                        UtcJdbcTime.getInstant(rs, 12),
+                                        UtcJdbcTime.getInstant(rs, 13));
+                            } catch (SQLException ex) {
+                                throw new IllegalStateException(ex);
+                            }
+                        });
+                        out.computeIfAbsent(gen, ignored -> new HashSet<>()).add(rs.getLong(14));
+                    }
+                }
+            } finally {
+                connection.setReadOnly(oldReadOnly);
+            }
+            return out;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect missing mutated observation base summary masks", e);
+        }
+    }
 }

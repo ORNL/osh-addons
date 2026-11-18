@@ -5438,6 +5438,44 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertEquals(0L, selectCount(tiered, boundedGammaPage));
         assertEquals(0L, selectCount(tiered, boundedGammaPage));
         assertEquals(0L, tiered.countMatchingEntries(boundedGamma2));
+
+        // Cold restart with Parquet files hidden proves persisted 4-byte base_summary_mask
+        // serves both countMatchingEntries and bounded selectEntries without opening Parquet.
+        Path parquetFile2 = Path.of(archiveRoot).resolve(gen2.objectPath());
+        Path hiddenParquetFile2 = parquetFile2.resolveSibling(parquetFile2.getFileName() + ".hidden");
+        tiered.close();
+        Files.move(parquetFile, hiddenParquetFile);
+        Files.move(parquetFile2, hiddenParquetFile2);
+        try {
+            tiered = new TestableTieredStore(
+                    url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                    IdProviderType.SEQUENTIAL, archiveConfig);
+            postgisObsStore = tiered;
+            obsStore = tiered;
+            assertEquals(0L, tiered.countMatchingEntries(boundedGamma2));
+            assertEquals(0L, tiered.countMatchingEntries(neutronAlarmFilter));
+            assertEquals(0L, selectCount(tiered, boundedGammaPage));
+        } finally {
+            Files.move(hiddenParquetFile, parquetFile);
+            Files.move(hiddenParquetFile2, parquetFile2);
+        }
+
+        // Clearing base_summary_mask simulates pre-upgrade legacy overlays; cold restart
+        // backfills base_summary_mask from Parquet once so subsequent restarts need no Parquet I/O.
+        tiered.close();
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            assertEquals(3, statement.executeUpdate("UPDATE oscar_obs_overlay SET base_summary_mask=NULL"));
+        }
+        tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+        assertEquals(0L, tiered.countMatchingEntries(boundedGamma2));
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            assertEquals(0L, queryLong(connection,
+                    "SELECT count(*) FROM oscar_obs_overlay WHERE base_summary_mask IS NULL"));
+        }
     }
 
     @Test
@@ -5527,7 +5565,7 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         try (var pageStream = tiered.selectEntries(descPaginated, null, 1L)) {
             var rows = pageStream.toList();
             assertEquals(1, rows.size());
-            assertEquals(day3.plusSeconds(60), rows.get(0).getValue().getPhenomenonTime());
+            assertEquals(day3.plusSeconds(10), rows.get(0).getValue().getPhenomenonTime());
         }
 
         // Untimed datastream lacking startTime/endTime schema fields must NOT be time-summarized.

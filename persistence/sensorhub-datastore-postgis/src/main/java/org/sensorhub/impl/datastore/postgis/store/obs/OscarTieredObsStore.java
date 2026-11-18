@@ -135,8 +135,9 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             .build();
     private final Cache<MutatedGenSummaryCountKey, Long> mutatedGenSummaryCounts = CacheBuilder.newBuilder()
             .maximumSize(16_384)
-            .expireAfterAccess(30, TimeUnit.MINUTES)
             .build();
+    private final AtomicBoolean storeClosed = new AtomicBoolean();
+    private final Thread baseSummaryBackfillThread;
     private final ColdPointReadCoalescer coldPointReadCoalescer = new ColdPointReadCoalescer();
     private final OverlayWriteCoalescer overlayWriteCoalescer = new OverlayWriteCoalescer();
     private final Map<Long, Boolean> immutableDataStreamCache = new ConcurrentHashMap<>();
@@ -194,7 +195,17 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             } else {
                 this.immutableStage = null;
             }
+            if (archiveConfig.enabled && archiveConfig.rootDirectory != null && !archiveConfig.rootDirectory.isBlank()) {
+                Thread backfill = new Thread(this::runBackgroundBaseSummaryBackfill,
+                        "oscar-base-summary-backfill-" + dataStoreName);
+                backfill.setDaemon(true);
+                backfill.start();
+                this.baseSummaryBackfillThread = backfill;
+            } else {
+                this.baseSummaryBackfillThread = null;
+            }
         } catch (RuntimeException | Error failure) {
+            storeClosed.set(true);
             try {
                 super.close();
             } catch (RuntimeException cleanupFailure) {
@@ -202,6 +213,21 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             }
             throw failure;
         }
+    }
+
+    @Override
+    public void close() {
+        storeClosed.set(true);
+        Thread backfill = this.baseSummaryBackfillThread;
+        if (backfill != null) {
+            backfill.interrupt();
+            try {
+                backfill.join(2_000L);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        super.close();
     }
 
     private static QueryBuilderObsStore tieredQueryBuilder(
@@ -2932,8 +2958,14 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     // The grace-period hot row is the immutable parity source.
                     // Logical updates live only in the generation-owned sparse
                     // overlay until lifecycle deletion removes that hot base.
+                    Integer baseMask = previous.fromOverlay()
+                            ? null
+                            : JsonCqlEvaluator.computeSummaryMask(previous.resultJson());
+                    Long baseDs = previous.fromOverlay() ? null : previous.dataStreamId();
+                    Long baseFoi = previous.fromOverlay() ? null : previous.foiId();
                     archiveCatalog.upsertOverlay(connection, previous.generationId(),
-                            overlay.observation(), overlay.schemaJson(), overlay.schemaSha256());
+                            overlay.observation(), overlay.schemaJson(), overlay.schemaSha256(),
+                            baseMask, baseDs, baseFoi);
                 } else {
                     updateLiveObservation(connection, key, observation,
                             overlay.observation().resultJson());
@@ -3092,11 +3124,19 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         continue;
                     LockedLogicalObservation baseLocked = initialById.get(id);
                     if (baseLocked.generationId() != null) {
+                        Integer baseMask = baseLocked.fromOverlay()
+                                ? null
+                                : JsonCqlEvaluator.computeSummaryMask(baseLocked.resultJson());
+                        Long baseDs = baseLocked.fromOverlay() ? null : baseLocked.dataStreamId();
+                        Long baseFoi = baseLocked.fromOverlay() ? null : baseLocked.foiId();
                         overlayBatchItems.add(new ArchiveCatalog.OverlayBatchItem(
                                 baseLocked.generationId(),
                                 finalItem.payload().observation(),
                                 finalItem.payload().schemaJson(),
-                                finalItem.payload().schemaSha256()));
+                                finalItem.payload().schemaSha256(),
+                                baseMask,
+                                baseDs,
+                                baseFoi));
                     } else {
                         updateLiveObservation(connection, finalItem.key(), finalItem.observation(),
                                 finalItem.payload().observation().resultJson());
@@ -3317,8 +3357,13 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     // Keep the immutable hot base through parity and grace
                     // deletion; the exact-generation tombstone is the logical
                     // deletion.
+                    Integer baseMask = previous.fromOverlay()
+                            ? null
+                            : JsonCqlEvaluator.computeSummaryMask(previous.resultJson());
+                    Long baseFoi = previous.fromOverlay() ? null : previous.foiId();
                     archiveCatalog.tombstoneIfAbsent(connection, observationId,
                             previous.generationId(), previous.dataStreamId(),
+                            baseMask, baseFoi,
                             "Removed through IObsStore",
                             "USER_OR_SYSTEM_DELETE", holds);
                     if (!archiveConfig.enabled) {
@@ -3774,8 +3819,13 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                             continue;
                         }
                         if (current.generationId() != null) {
+                            Integer baseMask = current.fromOverlay()
+                                    ? null
+                                    : JsonCqlEvaluator.computeSummaryMask(current.resultJson());
+                            Long baseFoi = current.fromOverlay() ? null : current.foiId();
                             boolean tombstoned = archiveCatalog.tombstoneIfAbsent(connection, id,
                                     current.generationId(), current.dataStreamId(),
+                                    baseMask, baseFoi,
                                     "Removed through IObsStore filter",
                                     "USER_OR_SYSTEM_DELETE", holds);
                             if (!archiveConfig.enabled) {
@@ -4111,7 +4161,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 return java.util.Optional.of(new LockedLogicalObservation(
                         generationId, resultJson, phenomenonTime, resultTime,
                         dataStreamId, foiId,
-                        toObservation(connection, generationId, schemaJson, archived)));
+                        toObservation(connection, generationId, schemaJson, archived),
+                        true));
             }
         }
     }
@@ -4156,7 +4207,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     locked.put(obsId, new LockedLogicalObservation(
                             generationId, resultJson, phenomenonTime, resultTime,
                             dataStreamId, foiId,
-                            toObservation(connection, generationId, schemaJson, archived)));
+                            toObservation(connection, generationId, schemaJson, archived),
+                            true));
                 }
             }
         } finally {
@@ -4433,7 +4485,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private record LockedLogicalObservation(UUID generationId, String resultJson,
                                             Instant phenomenonTime, Instant resultTime,
                                             long dataStreamId, Long foiId,
-                                            IObsData observation) {}
+                                            IObsData observation,
+                                            boolean fromOverlay) {
+        LockedLogicalObservation(UUID generationId, String resultJson,
+                                 Instant phenomenonTime, Instant resultTime,
+                                 long dataStreamId, Long foiId,
+                                 IObsData observation) {
+            this(generationId, resultJson, phenomenonTime, resultTime, dataStreamId, foiId, observation, false);
+        }
+    }
     private record LockedHotRow(long observationId, long dataStreamId, Long foiId,
                                 Instant phenomenonTime, Instant resultTime,
                                 String resultJson, UUID generationId) {}
@@ -4637,7 +4697,6 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             Set<Long> genMutated = mutatedByGen.get(generation.id());
             if (genMutated == null || genMutated.isEmpty())
                 continue;
-            archiveReader.verifyGenerationObject(generation);
             Set<Long> immutableMutated = Set.copyOf(genMutated);
             MutatedGenSummaryCountKey key = new MutatedGenSummaryCountKey(
                     generation.id(), generation.sha256(), immutableMutated, immutableStreams, cqlFilter);
@@ -4650,16 +4709,198 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 missTargets.put(generation.id(), immutableMutated);
             }
         }
-        if (!misses.isEmpty()) {
-            Map<UUID, Long> computed = archiveReader.countMatchingIdsCqlByGeneration(
-                    misses, missTargets, resolvedFilter, dataStreams, fois);
+        if (misses.isEmpty())
+            return byGeneration;
+
+        boolean canUseSummaryMask = JsonCqlEvaluator.supportsSummaryMaskEvaluation(cqlFilter);
+        List<ArchiveGeneration> parquetFallbackMisses = misses;
+        Map<UUID, Set<Long>> parquetFallbackTargets = missTargets;
+
+        if (canUseSummaryMask) {
+            List<UUID> missGenIds = misses.stream().map(ArchiveGeneration::id).toList();
+            Map<UUID, Map<Long, ArchiveCatalog.MutatedBaseSummaryRow>> persisted =
+                    archiveCatalog.loadMutatedBaseSummariesByGeneration(missGenIds);
+            List<ArchiveGeneration> unbackedGens = new ArrayList<>();
+            Map<UUID, Set<Long>> missingMaskIdsByGen = new HashMap<>();
+
             for (ArchiveGeneration generation : misses) {
+                Set<Long> genMutated = missTargets.get(generation.id());
+                Map<Long, ArchiveCatalog.MutatedBaseSummaryRow> rowsById = persisted.get(generation.id());
+                boolean allReady = rowsById != null;
+                Set<Long> missingIds = null;
+                if (rowsById == null) {
+                    missingIds = new HashSet<>(genMutated);
+                } else {
+                    for (Long obsId : genMutated) {
+                        ArchiveCatalog.MutatedBaseSummaryRow row = rowsById.get(obsId);
+                        if (row == null || row.summaryMask() == null || row.dataStreamId() == null ||
+                                !generation.sha256().equals(row.generationSha256())) {
+                            allReady = false;
+                            if (missingIds == null)
+                                missingIds = new HashSet<>();
+                            missingIds.add(obsId);
+                        }
+                    }
+                }
+                if (allReady) {
+                    long matched = countMatchingPersistedBaseMasks(
+                            genMutated, rowsById, dataStreams, fois, cqlFilter);
+                    mutatedGenSummaryCounts.put(missKeys.get(generation.id()), matched);
+                    byGeneration.put(generation.id(), matched);
+                } else {
+                    unbackedGens.add(generation);
+                    missingMaskIdsByGen.put(generation.id(), missingIds);
+                }
+            }
+
+            if (unbackedGens.isEmpty())
+                return byGeneration;
+
+            backfillBaseSummariesFromParquet(unbackedGens, missingMaskIdsByGen);
+            Map<UUID, Map<Long, ArchiveCatalog.MutatedBaseSummaryRow>> refreshed =
+                    archiveCatalog.loadMutatedBaseSummariesByGeneration(
+                            unbackedGens.stream().map(ArchiveGeneration::id).toList());
+            List<ArchiveGeneration> stillMissing = new ArrayList<>();
+            Map<UUID, Set<Long>> stillMissingTargets = new HashMap<>();
+            for (ArchiveGeneration generation : unbackedGens) {
+                Set<Long> genMutated = missTargets.get(generation.id());
+                Map<Long, ArchiveCatalog.MutatedBaseSummaryRow> rowsById = refreshed.get(generation.id());
+                boolean allReady = rowsById != null && genMutated.stream().allMatch(obsId -> {
+                    ArchiveCatalog.MutatedBaseSummaryRow row = rowsById.get(obsId);
+                    return row != null && row.summaryMask() != null && row.dataStreamId() != null &&
+                            generation.sha256().equals(row.generationSha256());
+                });
+                if (allReady) {
+                    long matched = countMatchingPersistedBaseMasks(
+                            genMutated, rowsById, dataStreams, fois, cqlFilter);
+                    mutatedGenSummaryCounts.put(missKeys.get(generation.id()), matched);
+                    byGeneration.put(generation.id(), matched);
+                } else {
+                    // An overlay/tombstone referencing a non-existent base ID in the generation
+                    // evaluates to 0 base matches; verify via targeted Parquet count once and cache.
+                    stillMissing.add(generation);
+                    stillMissingTargets.put(generation.id(), genMutated);
+                }
+            }
+            parquetFallbackMisses = stillMissing;
+            parquetFallbackTargets = stillMissingTargets;
+        }
+
+        if (!parquetFallbackMisses.isEmpty()) {
+            Map<UUID, Long> computed = archiveReader.countMatchingIdsCqlByGeneration(
+                    parquetFallbackMisses, parquetFallbackTargets, resolvedFilter, dataStreams, fois);
+            for (ArchiveGeneration generation : parquetFallbackMisses) {
                 long matched = computed.getOrDefault(generation.id(), 0L);
                 mutatedGenSummaryCounts.put(missKeys.get(generation.id()), matched);
                 byGeneration.put(generation.id(), matched);
             }
         }
         return byGeneration;
+    }
+
+    private static long countMatchingPersistedBaseMasks(
+            Set<Long> genMutated,
+            Map<Long, ArchiveCatalog.MutatedBaseSummaryRow> rowsById,
+            Set<Long> allowedDataStreams,
+            Set<Long> allowedFois,
+            org.geotools.api.filter.Filter cqlFilter) {
+        long matched = 0L;
+        for (Long obsId : genMutated) {
+            ArchiveCatalog.MutatedBaseSummaryRow row = rowsById.get(obsId);
+            if (row == null || row.summaryMask() == null || row.dataStreamId() == null)
+                continue;
+            if (allowedDataStreams != null && !allowedDataStreams.contains(row.dataStreamId()))
+                continue;
+            if (allowedFois != null) {
+                long foiKey = row.foiId() == null ? 0L : row.foiId();
+                if (!allowedFois.contains(foiKey))
+                    continue;
+            }
+            if (JsonCqlEvaluator.tryEvaluateSummaryMask(cqlFilter, row.summaryMask()).orElse(false)) {
+                matched = Math.addExact(matched, 1L);
+            }
+        }
+        return matched;
+    }
+
+    private void backfillBaseSummariesFromParquet(
+            List<ArchiveGeneration> generations,
+            Map<UUID, Set<Long>> missingIdsByGen) {
+        if (generations == null || generations.isEmpty())
+            return;
+        final int batchSize = 32;
+        for (int start = 0; start < generations.size(); start += batchSize) {
+            if (storeClosed.get())
+                return;
+            List<ArchiveGeneration> batch = generations.subList(start, Math.min(generations.size(), start + batchSize));
+            List<BigId> batchBigIds = batch.stream()
+                    .flatMap(g -> missingIdsByGen.getOrDefault(g.id(), Set.of()).stream())
+                    .distinct()
+                    .sorted()
+                    .map(id -> BigId.fromLong(idScope, id))
+                    .toList();
+            if (batchBigIds.isEmpty())
+                continue;
+            ObsFilter idFilter = new ObsFilter.Builder().withInternalIDs(batchBigIds).build();
+            List<ParquetArchiveReader.ArchivedRow> loaded =
+                    archiveReader.read(batch, idFilter, null, null, Long.MAX_VALUE);
+            if (loaded.isEmpty())
+                continue;
+            List<ArchiveCatalog.MutatedBaseSummaryRow> toPersist = new ArrayList<>(loaded.size());
+            for (ParquetArchiveReader.ArchivedRow row : loaded) {
+                Set<Long> expectedForGen = missingIdsByGen.get(row.generation().id());
+                if (expectedForGen == null || !expectedForGen.contains(row.observation().id()))
+                    continue;
+                int mask = JsonCqlEvaluator.computeSummaryMask(row.observation().resultJson());
+                toPersist.add(new ArchiveCatalog.MutatedBaseSummaryRow(
+                        row.generation().id(),
+                        row.observation().id(),
+                        row.generation().sha256(),
+                        row.observation().dataStreamId(),
+                        row.observation().foiId(),
+                        mask));
+            }
+            if (!toPersist.isEmpty()) {
+                archiveCatalog.backfillMutatedBaseSummaries(toPersist);
+            }
+        }
+    }
+
+    private void runBackgroundBaseSummaryBackfill() {
+        long totalRows = 0L;
+        long totalGens = 0L;
+        try {
+            while (!storeClosed.get() && !Thread.currentThread().isInterrupted()) {
+                java.util.LinkedHashMap<ArchiveGeneration, Set<Long>> missing =
+                        archiveCatalog.findMutatedGenerationsMissingBaseSummary(16);
+                if (missing.isEmpty())
+                    break;
+                List<ArchiveGeneration> gens = new ArrayList<>(missing.keySet());
+                Map<UUID, Set<Long>> idsByGen = new HashMap<>(gens.size());
+                long expectedBatchRows = 0L;
+                for (Map.Entry<ArchiveGeneration, Set<Long>> entry : missing.entrySet()) {
+                    idsByGen.put(entry.getKey().id(), entry.getValue());
+                    expectedBatchRows += entry.getValue().size();
+                }
+                backfillBaseSummariesFromParquet(gens, idsByGen);
+                java.util.LinkedHashMap<ArchiveGeneration, Set<Long>> checkAfter =
+                        archiveCatalog.findMutatedGenerationsMissingBaseSummary(1);
+                totalGens += gens.size();
+                totalRows += expectedBatchRows;
+                if (!checkAfter.isEmpty() && checkAfter.keySet().iterator().next().id().equals(gens.get(0).id())) {
+                    // Prevent spinning if a synthetic test generation lacks the referenced base ID in Parquet.
+                    break;
+                }
+            }
+            if (totalRows > 0L) {
+                LOG.info("Backfilled {} mutated cold base summary bitmask(s) across {} archive generation(s)",
+                        totalRows, totalGens);
+            }
+        } catch (Exception e) {
+            if (!storeClosed.get()) {
+                LOG.debug("Deferred background cold base summary backfill", e);
+            }
+        }
     }
 
     private String buildUnownedHotCountPredicate(boolean parentTableOnly, boolean hasMutations) {
