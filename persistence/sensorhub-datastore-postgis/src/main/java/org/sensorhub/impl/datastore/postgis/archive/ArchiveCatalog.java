@@ -516,6 +516,13 @@ public final class ArchiveCatalog {
                         "ON oscar_obs_overlay(generation_id)");
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_obs_overlay_query_idx " +
                         "ON oscar_obs_overlay(generation_id, phenomenon_time, observation_id)");
+                statement.execute("CREATE INDEX IF NOT EXISTS oscar_obs_overlay_phenomenon_keyset_idx " +
+                        "ON oscar_obs_overlay(store_key, id_scope, phenomenon_time DESC NULLS FIRST, observation_id ASC)");
+                statement.execute("CREATE INDEX IF NOT EXISTS oscar_obs_overlay_alarm_keyset_idx " +
+                        "ON oscar_obs_overlay(store_key, id_scope, " +
+                        "(CASE WHEN jsonb_typeof(result_json->'gammaAlarm') = 'boolean' THEN (result_json->>'gammaAlarm') ELSE 'other' END), " +
+                        "(CASE WHEN jsonb_typeof(result_json->'neutronAlarm') = 'boolean' THEN (result_json->>'neutronAlarm') ELSE 'other' END), " +
+                        "phenomenon_time DESC NULLS FIRST, observation_id ASC)");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_retention_hold (" +
                         "id uuid PRIMARY KEY, store_key text NOT NULL, id_scope integer NOT NULL, " +
                         "subject_type text NOT NULL, subject_id text NOT NULL, reason text NOT NULL, " +

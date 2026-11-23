@@ -103,9 +103,11 @@ public final class JsonCqlEvaluator {
     }
 
     /**
-     * Reject only explicit nonzero numeric adjudication counts. Arrays, missing
-     * fields, nulls and other types remain candidates for exact Java evaluation.
-     * The caller supplies a trusted PostgreSQL jsonb column expression.
+     * Appends a sound (zero-false-negative) PostgreSQL jsonb prefilter over
+     * {@code column} for boolean alarm predicates, adjudication-count predicates,
+     * and recursive {@code AND}/{@code OR} combinations. Arrays, non-boolean
+     * scalar encodings, missing fields (where applicable), and unsupported
+     * clauses remain candidates for exact Java evaluation.
      */
     public static boolean appendPostgresOverlayPrefilter(
             Filter filter, String column, StringBuilder sql) {
@@ -115,24 +117,82 @@ public final class JsonCqlEvaluator {
             sql.append(" AND FALSE");
             return true;
         }
-        if (!requiresUnadjudicated(filter))
+        String clause = buildPostgresOverlayPrefilter(filter, column);
+        if (clause == null)
             return false;
-        sql.append(" AND NOT COALESCE((jsonb_typeof(").append(column)
-                .append("->'adjudicatedIdsCount') = 'number' AND ")
-                .append(column).append("->'adjudicatedIdsCount' <> '0'::jsonb), false)");
+        sql.append(" AND (").append(clause).append(')');
         return true;
     }
 
-    private static boolean requiresUnadjudicated(Filter filter) {
-        if (filter instanceof And and)
-            return and.getChildren().stream().anyMatch(JsonCqlEvaluator::requiresUnadjudicated);
-        if (filter instanceof Or or)
-            return !or.getChildren().isEmpty() &&
-                    or.getChildren().stream().allMatch(JsonCqlEvaluator::requiresUnadjudicated);
-        return filter instanceof PropertyIsEqualTo eq &&
+    private static String buildPostgresOverlayPrefilter(Filter filter, String column) {
+        if (filter == null || filter == Filter.INCLUDE)
+            return null;
+        if (filter == Filter.EXCLUDE)
+            return "FALSE";
+        if (filter instanceof And and) {
+            List<String> clauses = new ArrayList<>();
+            for (Filter child : and.getChildren()) {
+                String sub = buildPostgresOverlayPrefilter(child, column);
+                if ("FALSE".equals(sub))
+                    return "FALSE";
+                if (sub != null)
+                    clauses.add("(" + sub + ")");
+            }
+            return clauses.isEmpty() ? null : String.join(" AND ", clauses);
+        }
+        if (filter instanceof Or or) {
+            if (or.getChildren().isEmpty())
+                return null;
+            List<String> clauses = new ArrayList<>();
+            for (Filter child : or.getChildren()) {
+                String sub = buildPostgresOverlayPrefilter(child, column);
+                if (sub == null)
+                    return null;
+                if (!"FALSE".equals(sub))
+                    clauses.add("(" + sub + ")");
+            }
+            return clauses.isEmpty() ? "FALSE" : String.join(" OR ", clauses);
+        }
+        if (filter instanceof PropertyIsEqualTo eq &&
                 eq.getExpression1() instanceof PropertyName property &&
+                eq.getExpression2() instanceof Literal literal) {
+            String path = property.getPropertyName();
+            Object expected = literal.getValue();
+            if ("adjudicatedIdsCount".equals(path) && isExactNumericZero(expected)) {
+                return "NOT COALESCE((jsonb_typeof(" + column + "->'adjudicatedIdsCount') = 'number' AND " +
+                        column + "->'adjudicatedIdsCount' <> '0'::jsonb), false) AND " +
+                        "NOT COALESCE((NOT (" + column + " ? 'adjudicatedIdsCount') OR jsonb_typeof(" +
+                        column + "->'adjudicatedIdsCount') = 'null') AND jsonb_typeof(" +
+                        column + "->'adjudicatedIds') = 'array' AND jsonb_array_length(" +
+                        column + "->'adjudicatedIds') <> 0, false)";
+            }
+            if (expected instanceof Boolean boolVal && path != null && SAFE_JSON_KEY.matcher(path).matches()) {
+                String boolStr = boolVal ? "true" : "false";
+                if ("gammaAlarm".equals(path) || "neutronAlarm".equals(path)) {
+                    return "(" + column + " ? '" + path + "' AND jsonb_typeof(" + column + "->'" + path + "') <> 'null' AND " +
+                            "(CASE WHEN jsonb_typeof(" + column + "->'" + path + "') = 'boolean' THEN (" +
+                            column + "->>'" + path + "') ELSE 'other' END) IN ('" + boolStr + "', 'other'))";
+                }
+                return "(" + column + " ? '" + path + "' AND jsonb_typeof(" + column + "->'" + path + "') <> 'null' AND " +
+                        "(jsonb_typeof(" + column + "->'" + path + "') <> 'boolean' OR " +
+                        column + "->'" + path + "' = '" + boolStr + "'::jsonb))";
+            }
+            return null;
+        }
+        if (filter instanceof PropertyIsGreaterThan gt &&
+                gt.getExpression1() instanceof PropertyName property &&
                 "adjudicatedIdsCount".equals(property.getPropertyName()) &&
-                eq.getExpression2() instanceof Literal literal && isExactNumericZero(literal.getValue());
+                gt.getExpression2() instanceof Literal literal &&
+                isExactNumericZero(literal.getValue())) {
+            return "NOT COALESCE((jsonb_typeof(" + column + "->'adjudicatedIdsCount') = 'number' AND " +
+                    column + "->'adjudicatedIdsCount' <= '0'::jsonb), false) AND " +
+                    "NOT COALESCE((NOT (" + column + " ? 'adjudicatedIdsCount') OR jsonb_typeof(" +
+                    column + "->'adjudicatedIdsCount') = 'null') AND (NOT (" +
+                    column + " ? 'adjudicatedIds') OR (jsonb_typeof(" +
+                    column + "->'adjudicatedIds') = 'array' AND jsonb_array_length(" +
+                    column + "->'adjudicatedIds') = 0)), false)";
+        }
+        return null;
     }
 
     private static boolean isExactNumericZero(Object value) {

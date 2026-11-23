@@ -4652,6 +4652,13 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             "gammaAlarm = true AND neutronAlarm = false AND adjudicatedIdsCount = 0",
             "gammaAlarm = false AND neutronAlarm = true AND adjudicatedIdsCount = 0"
         };
+        String[] eventLogExpressions = {
+            "gammaAlarm = true AND neutronAlarm = true",
+            "gammaAlarm = false AND neutronAlarm = true",
+            "gammaAlarm = true AND neutronAlarm = false",
+            "gammaAlarm = false AND neutronAlarm = false",
+            "adjudicatedIdsCount > 0"
+        };
         String[] values = {
             "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":0}",
             "{\"gammaAlarm\":false,\"neutronAlarm\":true,\"adjudicatedIdsCount\":0.0}",
@@ -4685,6 +4692,26 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                         }
                     }
                 }
+            }
+            for (String expression : eventLogExpressions) {
+                var filter = new ObsFilter.Builder().withCQLFilter(expression).build().getCQLFilter();
+                StringBuilder sql = new StringBuilder("SELECT true FROM (SELECT ?::jsonb AS data) AS t WHERE true");
+                assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                        .appendPostgresOverlayPrefilter(filter, "data", sql));
+                int prunedCount = 0;
+                for (String value : values) {
+                    boolean exact = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(filter, value);
+                    try (PreparedStatement stmt = connection.prepareStatement(sql.toString())) {
+                        stmt.setString(1, value);
+                        try (ResultSet result = stmt.executeQuery()) {
+                            boolean candidate = result.next();
+                            assertTrue(expression + " rejected " + value, !exact || candidate);
+                            if (!candidate)
+                                prunedCount++;
+                        }
+                    }
+                }
+                assertTrue("Expected selective pruning for " + expression, prunedCount > 0);
             }
             var stringZero = new ObsFilter.Builder().withCQLFilter("adjudicatedIdsCount = '0'")
                     .build().getCQLFilter();
