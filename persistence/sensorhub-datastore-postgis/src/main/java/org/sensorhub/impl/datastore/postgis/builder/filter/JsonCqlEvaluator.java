@@ -211,6 +211,13 @@ public final class JsonCqlEvaluator {
         return summaryCounterSpec(filter).map(SummaryCounterSpec::upperBoundExpr);
     }
 
+    private static final int STATUS_MASK_GAMMA_NEUTRON = 1 << 0;
+    private static final int STATUS_MASK_GAMMA_ONLY = 1 << 1;
+    private static final int STATUS_MASK_NEUTRON_ONLY = 1 << 2;
+    private static final int STATUS_MASK_NON_ALARM = 1 << 3;
+    private static final int STATUS_MASK_ANY_ALARM =
+            STATUS_MASK_GAMMA_NEUTRON | STATUS_MASK_GAMMA_ONLY | STATUS_MASK_NEUTRON_ONLY;
+
     public static Optional<SummaryCounterSpec> summaryCounterSpec(Filter filter) {
         if (filter == null || filter == Filter.INCLUDE) {
             String expr = "COALESCE(s.row_count, 0)";
@@ -220,6 +227,12 @@ public final class JsonCqlEvaluator {
             return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
         }
         if (filter instanceof PropertyIsEqualTo eq) {
+            if (eq.getExpression1() instanceof PropertyName prop &&
+                    eq.getExpression2() instanceof Literal lit &&
+                    "adjudicatedIdsCount".equals(prop.getPropertyName()) &&
+                    isZeroNumber(lit.getValue())) {
+                return resolveBaseAndSummarySpec(null, null, false, Boolean.FALSE);
+            }
             return singleEqualitySummaryCounter(eq)
                     .map(expr -> new SummaryCounterSpec(expr, expr, "s.summary_populated"));
         }
@@ -257,6 +270,10 @@ public final class JsonCqlEvaluator {
             if (isAnyAlarmOr(or)) {
                 String expr = "COALESCE(s.any_alarm_count, 0)";
                 return Optional.of(new SummaryCounterSpec(expr, expr, "s.summary_populated"));
+            }
+            Integer statusMask = extractDisjointStatusMask(or);
+            if (statusMask != null) {
+                return resolveDisjointStatusMaskSpec(statusMask, null);
             }
             Set<String> faultColumns = new LinkedHashSet<>();
             for (Filter child : or.getChildren()) {
@@ -307,6 +324,136 @@ public final class JsonCqlEvaluator {
         return hasGammaTrue && hasNeutronTrue;
     }
 
+    private static Integer extractDisjointStatusMask(Or or) {
+        List<Filter> disjuncts = new ArrayList<>();
+        flattenOrChildren(or, disjuncts);
+        if (disjuncts.isEmpty())
+            return null;
+        int mask = 0;
+        for (Filter disjunct : disjuncts) {
+            Integer pairMask = extractSingleStatusPairMask(disjunct);
+            if (pairMask == null)
+                return null;
+            mask |= pairMask;
+        }
+        return mask;
+    }
+
+    private static void flattenOrChildren(Filter filter, List<Filter> out) {
+        if (filter instanceof Or or) {
+            for (Filter child : or.getChildren())
+                flattenOrChildren(child, out);
+        } else {
+            out.add(filter);
+        }
+    }
+
+    private static Integer extractSingleStatusPairMask(Filter filter) {
+        if (!(filter instanceof And and))
+            return null;
+        List<Filter> parts = new ArrayList<>();
+        flattenAndChildren(and, parts);
+        if (parts.isEmpty())
+            return null;
+        Boolean gamma = null;
+        Boolean neutron = null;
+        for (Filter part : parts) {
+            if (!(part instanceof PropertyIsEqualTo eq) ||
+                    !(eq.getExpression1() instanceof PropertyName prop) ||
+                    !(eq.getExpression2() instanceof Literal lit) ||
+                    !(lit.getValue() instanceof Boolean boolVal))
+                return null;
+            String name = prop.getPropertyName();
+            if ("gammaAlarm".equals(name)) {
+                if (gamma != null && !gamma.equals(boolVal))
+                    return 0;
+                gamma = boolVal;
+            } else if ("neutronAlarm".equals(name)) {
+                if (neutron != null && !neutron.equals(boolVal))
+                    return 0;
+                neutron = boolVal;
+            } else {
+                return null;
+            }
+        }
+        if (gamma == null || neutron == null)
+            return null;
+        if (gamma && neutron)
+            return STATUS_MASK_GAMMA_NEUTRON;
+        if (gamma)
+            return STATUS_MASK_GAMMA_ONLY;
+        if (neutron)
+            return STATUS_MASK_NEUTRON_ONLY;
+        return STATUS_MASK_NON_ALARM;
+    }
+
+    private static Optional<SummaryCounterSpec> resolveDisjointStatusMaskSpec(
+            int statusMask, Boolean adjudicated) {
+        if (statusMask == 0)
+            return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
+        List<SummaryCounterSpec> terms = new ArrayList<>(4);
+        if ((statusMask & STATUS_MASK_GAMMA_NEUTRON) != 0)
+            resolveBaseAndSummarySpec(Boolean.TRUE, Boolean.TRUE, false, adjudicated).ifPresent(terms::add);
+        if ((statusMask & STATUS_MASK_GAMMA_ONLY) != 0)
+            resolveBaseAndSummarySpec(Boolean.TRUE, Boolean.FALSE, false, adjudicated).ifPresent(terms::add);
+        if ((statusMask & STATUS_MASK_NEUTRON_ONLY) != 0)
+            resolveBaseAndSummarySpec(Boolean.FALSE, Boolean.TRUE, false, adjudicated).ifPresent(terms::add);
+        if ((statusMask & STATUS_MASK_NON_ALARM) != 0)
+            resolveBaseAndSummarySpec(Boolean.FALSE, Boolean.FALSE, false, adjudicated).ifPresent(terms::add);
+
+        List<SummaryCounterSpec> nonZero = terms.stream()
+                .filter(spec -> !"0::bigint".equals(spec.upperBoundExpr()))
+                .toList();
+        if (nonZero.isEmpty())
+            return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
+        if (nonZero.size() == 1)
+            return Optional.of(nonZero.get(0));
+
+        List<String> uppers = new ArrayList<>(nonZero.size());
+        List<String> exacts = new ArrayList<>(nonZero.size());
+        Set<String> readies = new LinkedHashSet<>();
+        for (SummaryCounterSpec spec : nonZero) {
+            uppers.add(spec.upperBoundExpr());
+            exacts.add(spec.exactExpr());
+            if ("false".equals(spec.exactReadyExpr())) {
+                readies.clear();
+                readies.add("false");
+            } else if (!readies.contains("false") && !"true".equals(spec.exactReadyExpr())) {
+                readies.add(spec.exactReadyExpr());
+            }
+        }
+        String combinedReady;
+        if (readies.isEmpty())
+            combinedReady = "true";
+        else if (readies.size() == 1)
+            combinedReady = readies.iterator().next();
+        else
+            combinedReady = "(" + String.join(" AND ", readies) + ")";
+
+        return Optional.of(new SummaryCounterSpec(
+                "(" + String.join(" + ", uppers) + ")",
+                "(" + String.join(" + ", exacts) + ")",
+                combinedReady));
+    }
+
+    private static int constrainDisjointStatusMask(
+            int statusMask, Boolean gamma, Boolean neutron, boolean requireAnyAlarm) {
+        int masked = statusMask;
+        if (gamma != null) {
+            masked &= gamma
+                    ? (STATUS_MASK_GAMMA_NEUTRON | STATUS_MASK_GAMMA_ONLY)
+                    : (STATUS_MASK_NEUTRON_ONLY | STATUS_MASK_NON_ALARM);
+        }
+        if (neutron != null) {
+            masked &= neutron
+                    ? (STATUS_MASK_GAMMA_NEUTRON | STATUS_MASK_NEUTRON_ONLY)
+                    : (STATUS_MASK_GAMMA_ONLY | STATUS_MASK_NON_ALARM);
+        }
+        if (requireAnyAlarm)
+            masked &= STATUS_MASK_ANY_ALARM;
+        return masked;
+    }
+
     private static Optional<SummaryCounterSpec> andSummaryCounterSpec(And rootAnd) {
         List<Filter> conjuncts = new ArrayList<>();
         flattenAndChildren(rootAnd, conjuncts);
@@ -317,12 +464,20 @@ public final class JsonCqlEvaluator {
         Boolean neutron = null;
         boolean requireAnyAlarm = false;
         Boolean adjudicated = null; // false = unadjudicated (count=0), true = adjudicated (count>0)
+        Integer disjointStatusMask = null;
         boolean hasExtraConjuncts = false;
 
         for (Filter child : conjuncts) {
-            if (child instanceof Or or && isAnyAlarmOr(or)) {
-                requireAnyAlarm = true;
-                continue;
+            if (child instanceof Or or) {
+                if (isAnyAlarmOr(or)) {
+                    requireAnyAlarm = true;
+                    continue;
+                }
+                Integer orMask = extractDisjointStatusMask(or);
+                if (orMask != null) {
+                    disjointStatusMask = disjointStatusMask == null ? orMask : (disjointStatusMask & orMask);
+                    continue;
+                }
             }
             if (child instanceof PropertyIsEqualTo eq &&
                     eq.getExpression1() instanceof PropertyName prop &&
@@ -370,7 +525,11 @@ public final class JsonCqlEvaluator {
             return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
         }
 
-        Optional<SummaryCounterSpec> baseSpec = resolveBaseAndSummarySpec(gamma, neutron, requireAnyAlarm, adjudicated);
+        Optional<SummaryCounterSpec> baseSpec = disjointStatusMask != null
+                ? resolveDisjointStatusMaskSpec(
+                        constrainDisjointStatusMask(disjointStatusMask, gamma, neutron, requireAnyAlarm),
+                        adjudicated)
+                : resolveBaseAndSummarySpec(gamma, neutron, requireAnyAlarm, adjudicated);
         if (baseSpec.isEmpty())
             return Optional.empty();
         SummaryCounterSpec spec = baseSpec.get();
@@ -471,10 +630,18 @@ public final class JsonCqlEvaluator {
         Boolean neutron = null;
         boolean requireAnyAlarm = false;
         Boolean adjudicated = null;
+        Integer disjointStatusMask = null;
         for (Filter child : conjuncts) {
-            if (child instanceof Or or && isAnyAlarmOr(or)) {
-                requireAnyAlarm = true;
-                continue;
+            if (child instanceof Or or) {
+                if (isAnyAlarmOr(or)) {
+                    requireAnyAlarm = true;
+                    continue;
+                }
+                Integer orMask = extractDisjointStatusMask(or);
+                if (orMask != null) {
+                    disjointStatusMask = disjointStatusMask == null ? orMask : (disjointStatusMask & orMask);
+                    continue;
+                }
             }
             if (child instanceof PropertyIsEqualTo eq &&
                     eq.getExpression1() instanceof PropertyName prop &&
@@ -518,6 +685,11 @@ public final class JsonCqlEvaluator {
         }
         if (requireAnyAlarm && Boolean.FALSE.equals(gamma) && Boolean.FALSE.equals(neutron))
             return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
+        if (disjointStatusMask != null) {
+            return resolveDisjointStatusMaskSpec(
+                    constrainDisjointStatusMask(disjointStatusMask, gamma, neutron, requireAnyAlarm),
+                    adjudicated);
+        }
         return resolveBaseAndSummarySpec(gamma, neutron, requireAnyAlarm, adjudicated);
     }
 
@@ -561,7 +733,11 @@ public final class JsonCqlEvaluator {
 
         if (gamma != null && neutron != null) {
             if (!gamma && !neutron) {
-                return Optional.empty();
+                if (wantAdj) {
+                    return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
+                }
+                String expr = "COALESCE(s.non_alarm_occupancy_count, 0)";
+                return Optional.of(new SummaryCounterSpec(expr, expr, "s.summary_populated"));
             }
             String catCol;
             String splitCol;
@@ -584,6 +760,15 @@ public final class JsonCqlEvaluator {
         if ((requireAnyAlarm || wantAdj) && gamma == null && neutron == null) {
             String expr = "COALESCE(" + totalAdjCol + ", 0)";
             return Optional.of(new SummaryCounterSpec(expr, expr, "s.summary_populated"));
+        }
+
+        if (!wantAdj && !requireAnyAlarm && gamma == null && neutron == null) {
+            String occComplete = "(COALESCE(s.any_alarm_count, 0) + COALESCE(s.non_alarm_occupancy_count, 0) = COALESCE(s.row_count, 0))";
+            String occExact = "(COALESCE(s.unadjudicated_alarm_count, 0) + COALESCE(s.non_alarm_occupancy_count, 0))";
+            String upperBound = "(CASE WHEN " + occComplete + " THEN " + occExact +
+                    " ELSE GREATEST(COALESCE(s.row_count, 0) - COALESCE(s.adjudicated_alarm_count, 0), 0) END)";
+            String ready = "(s.summary_populated AND " + occComplete + ")";
+            return Optional.of(new SummaryCounterSpec(upperBound, occExact, ready));
         }
 
         if (Boolean.TRUE.equals(gamma) && neutron == null) {

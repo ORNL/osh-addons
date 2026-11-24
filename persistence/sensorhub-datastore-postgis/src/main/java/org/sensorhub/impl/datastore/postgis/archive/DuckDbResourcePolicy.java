@@ -388,6 +388,10 @@ final class DuckDbResourcePolicy {
             return operationDirectory;
         }
 
+        boolean shouldYield() {
+            return permit.shouldYield();
+        }
+
         @Override
         public synchronized void close() {
             if (closed)
@@ -418,8 +422,10 @@ final class DuckDbResourcePolicy {
     /**
      * Fair process-wide admission.  Every active and waiting request keeps its
      * configured cap registered, so independently configured stores cannot
-     * evade the smallest live cap.  FIFO admission prevents a stream of short
-     * queries from starving an exporter already waiting at the head.
+     * evade the smallest live cap.  FIFO admission within priority classes
+     * prevents a stream of short queries from starving an exporter, while
+     * reserving at least one session for interactive/lifecycle work whenever
+     * the effective global cap exceeds one.
      */
     private static final class AdmissionController {
         private final ReentrantLock lock = new ReentrantLock(true);
@@ -427,12 +433,20 @@ final class DuckDbResourcePolicy {
         private final java.util.LinkedList<AdmissionRequest> waiting = new java.util.LinkedList<>();
         private final TreeMap<Integer, Integer> registeredLimits = new TreeMap<>();
         private int active;
+        private int activeBackgroundCount;
 
         private static boolean isHighPriorityWaiter(String operation) {
             return "point-query".equals(operation)
                     || "archive-export".equals(operation)
                     || "parity-verify".equals(operation)
-                    || "hot-delete".equals(operation);
+                    || "hot-delete".equals(operation)
+                    || "export".equals(operation)
+                    || "export-verify".equals(operation);
+        }
+
+        static boolean isBackgroundCountOperation(String operation) {
+            return "cold-cql-count".equals(operation)
+                    || "cold-cql-id-count".equals(operation);
         }
 
         private void enqueueRequest(AdmissionRequest request) {
@@ -445,13 +459,54 @@ final class DuckDbResourcePolicy {
                     }
                     insertAt++;
                 }
+            } else if (!isBackgroundCountOperation(request.operation())) {
+                int insertAt = 0;
+                for (AdmissionRequest queued : waiting) {
+                    if (isBackgroundCountOperation(queued.operation())) {
+                        waiting.add(insertAt, request);
+                        return;
+                    }
+                    insertAt++;
+                }
             }
             waiting.addLast(request);
+        }
+
+        private AdmissionRequest firstEligibleWaiter(int globalCap) {
+            if (active >= globalCap)
+                return null;
+            int backgroundCap = Math.max(1, globalCap - 1);
+            for (AdmissionRequest queued : waiting) {
+                if (!isBackgroundCountOperation(queued.operation()) || activeBackgroundCount < backgroundCap)
+                    return queued;
+            }
+            return null;
+        }
+
+        boolean shouldBackgroundYield(boolean backgroundPermit) {
+            if (!backgroundPermit)
+                return false;
+            lock.lock();
+            try {
+                if (waiting.isEmpty())
+                    return false;
+                int globalCap = registeredLimits.isEmpty() ? Integer.MAX_VALUE : registeredLimits.firstKey();
+                if (globalCap <= 1)
+                    return true;
+                for (AdmissionRequest queued : waiting) {
+                    if (!isBackgroundCountOperation(queued.operation()))
+                        return true;
+                }
+                return false;
+            } finally {
+                lock.unlock();
+            }
         }
 
         AdmissionPermit acquire(int limit, int timeoutSeconds, String operation) throws Exception {
             long remaining = TimeUnit.SECONDS.toNanos(timeoutSeconds);
             AdmissionRequest request = new AdmissionRequest(operation);
+            boolean background = isBackgroundCountOperation(operation);
             try {
                 lock.lockInterruptibly();
             } catch (InterruptedException interrupted) {
@@ -463,7 +518,7 @@ final class DuckDbResourcePolicy {
             try {
                 enqueueRequest(request);
                 addLimit(limit);
-                while (waiting.peekFirst() != request || active >= registeredLimits.firstKey()) {
+                while (firstEligibleWaiter(registeredLimits.firstKey()) != request) {
                     if (remaining <= 0) {
                         waiting.remove(request);
                         removeLimit(limit);
@@ -474,10 +529,12 @@ final class DuckDbResourcePolicy {
                     }
                     remaining = capacityChanged.awaitNanos(remaining);
                 }
-                waiting.removeFirst();
+                waiting.remove(request);
                 active++;
+                if (background)
+                    activeBackgroundCount++;
                 capacityChanged.signalAll();
-                return new AdmissionPermit(this, limit);
+                return new AdmissionPermit(this, limit, background);
             } catch (InterruptedException interrupted) {
                 waiting.remove(request);
                 removeLimit(limit);
@@ -491,12 +548,14 @@ final class DuckDbResourcePolicy {
             }
         }
 
-        private void release(int limit) {
+        private void release(int limit, boolean background) {
             lock.lock();
             try {
-                if (active <= 0)
+                if (active <= 0 || (background && activeBackgroundCount <= 0))
                     throw new IllegalStateException("DuckDB admission permit released without an active session");
                 active--;
+                if (background)
+                    activeBackgroundCount--;
                 removeLimit(limit);
                 capacityChanged.signalAll();
             } finally {
@@ -519,17 +578,36 @@ final class DuckDbResourcePolicy {
         }
     }
 
-    private record AdmissionRequest(String operation) {
+    private static final class AdmissionRequest {
+        private final String operation;
+
+        private AdmissionRequest(String operation) {
+            this.operation = operation;
+        }
+
+        private String operation() {
+            return operation;
+        }
     }
 
     private static final class AdmissionPermit implements AutoCloseable {
         private final AdmissionController controller;
         private final int limit;
+        private final boolean background;
         private boolean closed;
 
-        private AdmissionPermit(AdmissionController controller, int limit) {
+        private AdmissionPermit(AdmissionController controller, int limit, boolean background) {
             this.controller = controller;
             this.limit = limit;
+            this.background = background;
+        }
+
+        boolean shouldYield() {
+            synchronized (this) {
+                if (closed)
+                    return false;
+            }
+            return controller.shouldBackgroundYield(background);
         }
 
         @Override
@@ -537,7 +615,7 @@ final class DuckDbResourcePolicy {
             if (closed)
                 return;
             closed = true;
-            controller.release(limit);
+            controller.release(limit, background);
         }
     }
 }

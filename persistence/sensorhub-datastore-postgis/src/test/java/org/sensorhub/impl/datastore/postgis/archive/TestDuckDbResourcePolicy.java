@@ -551,6 +551,89 @@ public class TestDuckDbResourcePolicy {
     }
 
     @Test
+    public void backgroundCqlCountReservesInteractiveSessionAndYieldsToNonBackgroundWaiters() throws Exception {
+        Path temporaryRoot = temporary.newFolder("background-isolation-spill").toPath();
+        TieredArchiveConfig config = config(temporaryRoot);
+        config.duckDbMaximumConcurrentSessions = 2;
+        config.duckDbSessionAcquireTimeoutSeconds = 1;
+
+        try (DuckDbResourcePolicy.Session firstCount = DuckDbResourcePolicy.open(config, "cold-cql-count")) {
+            assertFalse("Background count must not yield while no interactive waiter is queued",
+                    firstCount.shouldYield());
+
+            // A second concurrent cold-cql-count must NOT consume the reserved interactive slot.
+            SQLTransientException secondCountBlocked = assertThrows(SQLTransientException.class,
+                    () -> DuckDbResourcePolicy.open(config, "cold-cql-count"));
+            assertTrue(secondCountBlocked.getMessage().contains("capacity is busy"));
+
+            // An interactive cold-query must immediately acquire the reserved 2nd slot even while
+            // a second cold-cql-count waiter is queued ahead of it.
+            CountDownLatch countWaiterStarted = new CountDownLatch(1);
+            CountDownLatch countWaiterDone = new CountDownLatch(1);
+            AtomicReference<Throwable> countWaiterError = new AtomicReference<>();
+            TieredArchiveConfig longerWait = config(temporaryRoot);
+            longerWait.duckDbMaximumConcurrentSessions = 2;
+            longerWait.duckDbSessionAcquireTimeoutSeconds = 5;
+
+            Thread secondCountThread = new Thread(() -> {
+                countWaiterStarted.countDown();
+                try (DuckDbResourcePolicy.Session secondCount =
+                             DuckDbResourcePolicy.open(longerWait, "cold-cql-count")) {
+                    assertTrue(Files.isDirectory(secondCount.operationDirectory()));
+                } catch (Throwable err) {
+                    countWaiterError.set(err);
+                } finally {
+                    countWaiterDone.countDown();
+                }
+            }, "queued-background-count");
+            secondCountThread.setDaemon(true);
+            secondCountThread.start();
+            assertTrue(countWaiterStarted.await(2, TimeUnit.SECONDS));
+            Thread.sleep(75L);
+
+            long queryStart = System.nanoTime();
+            try (DuckDbResourcePolicy.Session interactiveQuery =
+                         DuckDbResourcePolicy.open(longerWait, "cold-query")) {
+                long acquireMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - queryStart);
+                assertTrue("Interactive cold-query must bypass capped cold-cql-count waiter immediately, took "
+                        + acquireMs + " ms", acquireMs < 750L);
+
+                // While both slots are held (1 cold-cql-count + 1 cold-query) and another cold-query
+                // queues, firstCount.shouldYield() must flip true so multi-batch counts yield cleanly.
+                CountDownLatch secondQueryQueued = new CountDownLatch(1);
+                CountDownLatch secondQueryAcquired = new CountDownLatch(1);
+                Thread secondInteractiveThread = new Thread(() -> {
+                    secondQueryQueued.countDown();
+                    try (DuckDbResourcePolicy.Session secondInteractive =
+                                 DuckDbResourcePolicy.open(longerWait, "cold-query")) {
+                        secondQueryAcquired.countDown();
+                    } catch (Throwable ignored) {
+                    }
+                }, "second-interactive-query");
+                secondInteractiveThread.setDaemon(true);
+                secondInteractiveThread.start();
+                assertTrue(secondQueryQueued.await(2, TimeUnit.SECONDS));
+                long yieldDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (!firstCount.shouldYield() && System.nanoTime() < yieldDeadline) {
+                    Thread.sleep(10L);
+                }
+                assertTrue("Active cold-cql-count must signal cooperative yield when cold-query is waiting",
+                        firstCount.shouldYield());
+
+                // Releasing firstCount must admit the waiting cold-query AHEAD of the waiting cold-cql-count.
+                firstCount.close();
+                assertTrue("Waiting cold-query must acquire ahead of queued cold-cql-count",
+                        secondQueryAcquired.await(2, TimeUnit.SECONDS));
+                secondInteractiveThread.join(2_000L);
+            }
+
+            assertTrue("Queued cold-cql-count must succeed after interactive queries complete",
+                    countWaiterDone.await(3, TimeUnit.SECONDS));
+            assertEquals(null, countWaiterError.get());
+        }
+    }
+
+    @Test
     public void rejectsDisabledResourceBoundsAndLinkedTemporaryRoot() throws Exception {
         Path temporaryRoot = temporary.newFolder("bad-spill").toPath();
         TieredArchiveConfig invalidBounds = config(temporaryRoot);
