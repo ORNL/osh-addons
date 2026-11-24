@@ -4686,6 +4686,36 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                     }
                 }
             }
+            String[] eventLogBuckets = {
+                "gammaAlarm = true OR neutronAlarm = true",
+                "gammaAlarm = true AND neutronAlarm = true",
+                "gammaAlarm = true AND neutronAlarm = false",
+                "gammaAlarm = false AND neutronAlarm = true",
+                "gammaAlarm = false AND neutronAlarm = false"
+            };
+            for (String expression : eventLogBuckets) {
+                var filter = new ObsFilter.Builder().withCQLFilter(expression).build().getCQLFilter();
+                StringBuilder sql = new StringBuilder("SELECT true FROM (SELECT ?::jsonb AS data) AS t WHERE ? = 1");
+                assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                        .appendPostgresOverlayPrefilter(filter, "data", sql));
+                assertFalse("Overlay prefilter must never emit bare JDBC '?' placeholders: " + sql,
+                        sql.substring("SELECT true FROM (SELECT ?::jsonb AS data) AS t WHERE ? = 1".length()).contains("?"));
+                int pruned = 0;
+                for (String value : values) {
+                    boolean exact = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.matches(filter, value);
+                    try (PreparedStatement stmt = connection.prepareStatement(sql.toString())) {
+                        stmt.setString(1, value);
+                        stmt.setInt(2, 1);
+                        try (ResultSet result = stmt.executeQuery()) {
+                            boolean candidate = result.next();
+                            assertTrue(expression + " rejected " + value, !exact || candidate);
+                            if (!candidate)
+                                pruned++;
+                        }
+                    }
+                }
+                assertTrue("Expected overlay prefilter pruning for " + expression, pruned > 0);
+            }
             var stringZero = new ObsFilter.Builder().withCQLFilter("adjudicatedIdsCount = '0'")
                     .build().getCQLFilter();
             assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
