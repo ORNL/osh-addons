@@ -972,22 +972,42 @@ public final class ParquetArchiveReader {
         if (filter.getLimit() == Long.MAX_VALUE) {
             return countCqlUnboundedWithCache(generations, filter, allowedDataStreams, allowedFois, exclusions);
         }
-        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "cold-cql-count")) {
+        DuckDbResourcePolicy.Session duckSession = null;
+        try {
             for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_CQL_PAYLOAD_BATCH)) {
+                throwIfInterruptedOrCancelled();
                 AuthorizedObjects objects = authorize(batch);
                 if (objects.byFilename().isEmpty())
                     continue;
+                if (duckSession == null)
+                    duckSession = DuckDbResourcePolicy.open(config, "cold-cql-count");
                 total = Math.addExact(total, countCqlAuthorizedBatch(
                         duckSession, objects, batch.size(), filter, allowedDataStreams, allowedFois, exclusions, null));
-                if (total >= filter.getLimit())
+                if (total >= filter.getLimit()) {
+                    duckSession.close();
+                    duckSession = null;
                     return filter.getLimit();
+                }
+                if (duckSession.shouldYield()) {
+                    duckSession.close();
+                    duckSession = null;
+                }
+            }
+            if (duckSession != null) {
+                duckSession.close();
+                duckSession = null;
             }
             return total;
         } catch (IllegalStateException | IllegalArgumentException e) {
+            closeAndSuppress(duckSession, e);
             throw e;
         } catch (Exception e) {
+            closeAndSuppress(duckSession, e);
             throw new IllegalStateException("Cannot count CQL matches from " + generations.size() +
                     " archive generation(s)", e);
+        } catch (Error err) {
+            closeAndSuppress(duckSession, err);
+            throw err;
         }
     }
 
@@ -997,6 +1017,7 @@ public final class ParquetArchiveReader {
             Set<Long> allowedDataStreams,
             Set<Long> allowedFois,
             Set<Long> exclusions) {
+        throwIfInterruptedOrCancelled();
         AuthorizedObjects allAuthorized = authorize(generations);
         if (allAuthorized.byFilename().isEmpty())
             return 0;
@@ -1046,8 +1067,10 @@ public final class ParquetArchiveReader {
         if (uncached.isEmpty())
             return total;
 
-        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "cold-cql-count")) {
+        DuckDbResourcePolicy.Session duckSession = null;
+        try {
             for (List<ArchiveGeneration> batch : batchWindowClusters(uncached, MAX_CQL_PAYLOAD_BATCH)) {
+                throwIfInterruptedOrCancelled();
                 Map<String, ArchiveGeneration> batchMap = new LinkedHashMap<>(batch.size() * 2);
                 for (ArchiveGeneration generation : batch) {
                     String filename = filenameByGenId.get(generation.id());
@@ -1056,6 +1079,8 @@ public final class ParquetArchiveReader {
                 }
                 if (batchMap.isEmpty())
                     continue;
+                if (duckSession == null)
+                    duckSession = DuckDbResourcePolicy.open(config, "cold-cql-count");
                 Map<UUID, Long> perGenCounts = cacheKeyByGenId.isEmpty() ? null : new HashMap<>(batch.size() * 2);
                 AuthorizedObjects batchObjects = new AuthorizedObjects(batchMap, allAuthorized.stampsByGenId());
                 long batchTotal = countCqlAuthorizedBatch(
@@ -1072,13 +1097,26 @@ public final class ParquetArchiveReader {
                         }
                     }
                 }
+                if (duckSession.shouldYield()) {
+                    duckSession.close();
+                    duckSession = null;
+                }
+            }
+            if (duckSession != null) {
+                duckSession.close();
+                duckSession = null;
             }
             return total;
         } catch (IllegalStateException | IllegalArgumentException e) {
+            closeAndSuppress(duckSession, e);
             throw e;
         } catch (Exception e) {
+            closeAndSuppress(duckSession, e);
             throw new IllegalStateException("Cannot count CQL matches from " + uncached.size() +
                     " archive generation(s)", e);
+        } catch (Error err) {
+            closeAndSuppress(duckSession, err);
+            throw err;
         }
     }
 
@@ -1161,6 +1199,7 @@ public final class ParquetArchiveReader {
             countsByGen.put(generation.id(), 0L);
         }
         for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_CQL_PAYLOAD_BATCH)) {
+            throwIfInterruptedOrCancelled();
             List<Long> sortedIds = batch.stream()
                     .flatMap(gen -> targetIdsByGeneration.getOrDefault(gen.id(), Set.of()).stream())
                     .distinct()
@@ -1211,6 +1250,8 @@ public final class ParquetArchiveReader {
                     }
                 }
             }
+        } catch (IllegalStateException | IllegalArgumentException e) {
+            throw e;
         } catch (Exception e) {
             throw new IllegalStateException("Cannot count targeted CQL matches from " + generations.size() +
                     " archive generation(s)", e);
@@ -1952,8 +1993,14 @@ public final class ParquetArchiveReader {
                     failure = execError.getCause() != null ? execError.getCause() : execError;
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                if (failure == null)
-                    failure = new IllegalStateException("Interrupted while authorizing archive objects", interrupted);
+                for (Future<?> remaining : futures)
+                    remaining.cancel(true);
+                if (failure == null) {
+                    java.util.concurrent.CancellationException cancelled =
+                            new java.util.concurrent.CancellationException("Interrupted while authorizing archive objects");
+                    cancelled.initCause(interrupted);
+                    failure = cancelled;
+                }
             }
         }
         if (failure instanceof RuntimeException runtimeError)
@@ -2650,6 +2697,12 @@ public final class ParquetArchiveReader {
         }
     }
 
+    private static void throwIfInterruptedOrCancelled() {
+        ConnectionManager.throwIfCancellableOperationCancelled();
+        if (Thread.currentThread().isInterrupted())
+            throw new java.util.concurrent.CancellationException("Archive query thread was interrupted");
+    }
+
     /**
      * Checks cancellation on both sides of a raw DuckDB result-set advance.
      * Statement.cancel() remains responsible for interrupting a next() call
@@ -2657,9 +2710,9 @@ public final class ParquetArchiveReader {
      * covers results that DuckDB materialized before cancellation arrived.
      */
     private static boolean nextCancellable(ResultSet result) throws SQLException {
-        ConnectionManager.throwIfCancellableOperationCancelled();
+        throwIfInterruptedOrCancelled();
         boolean available = result.next();
-        ConnectionManager.throwIfCancellableOperationCancelled();
+        throwIfInterruptedOrCancelled();
         return available;
     }
 
@@ -2870,6 +2923,7 @@ public final class ParquetArchiveReader {
         }
 
         private void openNextBatch(AuthorizedObjects objects, List<ArchiveGeneration> activeGenerations) {
+            throwIfInterruptedOrCancelled();
             boolean javaCql = filter.getCQLFilter() != null;
             final long clusterLimit = javaCql ? Long.MAX_VALUE : remaining;
             Function<AuthorizedObjects, QueryPlan> planFactory = auth -> queryPlan(

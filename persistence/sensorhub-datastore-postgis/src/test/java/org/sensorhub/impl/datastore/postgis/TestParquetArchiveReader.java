@@ -1130,6 +1130,130 @@ public class TestParquetArchiveReader {
         assertEquals(2L * giB, ParquetArchiveReader.computeLocal9pCacheMaxBytes(Long.MAX_VALUE, "not-a-number"));
     }
 
+    @Test
+    public void nonAlarmAdjudicatedAndMultiStatusSummarySpecsPreventColdBucketFallback() throws Exception {
+        // Priority Bucket 4 under Adjudicated (adjudicatedIdsCount > 0 AND gamma=false AND neutron=false) -> 0::bigint
+        ObsFilter adjBucket4 = new ObsFilter.Builder()
+                .withCQLFilter("(adjudicatedIdsCount > 0) AND (gammaAlarm = false AND neutronAlarm = false)")
+                .build();
+        JsonCqlEvaluator.SummaryCounterSpec adjBucket4Spec =
+                JsonCqlEvaluator.summaryCounterSpec(adjBucket4.getCQLFilter()).orElseThrow();
+        assertEquals("0::bigint", adjBucket4Spec.upperBoundExpr());
+        assertEquals("0::bigint", adjBucket4Spec.exactExpr());
+        assertEquals("true", adjBucket4Spec.exactReadyExpr());
+
+        // Priority Bucket 4 under Unadjudicated (adjudicatedIdsCount = 0 AND gamma=false AND neutron=false) -> non_alarm_occupancy_count
+        ObsFilter unadjBucket4 = new ObsFilter.Builder()
+                .withCQLFilter("(adjudicatedIdsCount = 0) AND (gammaAlarm = false AND neutronAlarm = false)")
+                .build();
+        JsonCqlEvaluator.SummaryCounterSpec unadjBucket4Spec =
+                JsonCqlEvaluator.summaryCounterSpec(unadjBucket4.getCQLFilter()).orElseThrow();
+        assertEquals("COALESCE(s.non_alarm_occupancy_count, 0)", unadjBucket4Spec.exactExpr());
+        assertEquals("s.summary_populated", unadjBucket4Spec.exactReadyExpr());
+
+        // Top-level unadjudicated filter (Newest first mode)
+        ObsFilter bareUnadj = new ObsFilter.Builder()
+                .withCQLFilter("adjudicatedIdsCount = 0")
+                .build();
+        JsonCqlEvaluator.SummaryCounterSpec bareUnadjSpec =
+                JsonCqlEvaluator.summaryCounterSpec(bareUnadj.getCQLFilter()).orElseThrow();
+        assertEquals("(COALESCE(s.unadjudicated_alarm_count, 0) + COALESCE(s.non_alarm_occupancy_count, 0))",
+                bareUnadjSpec.exactExpr());
+        assertTrue(bareUnadjSpec.exactReadyExpr().contains("s.non_alarm_occupancy_count"));
+
+        // Multi-Status isAnyOf [Gamma, Neutron] in Newest first mode and Priority mode buckets
+        String gammaOrNeutronOnly = "(gammaAlarm = true AND neutronAlarm = false) OR (gammaAlarm = false AND neutronAlarm = true)";
+        ObsFilter multiStatusNewest = new ObsFilter.Builder()
+                .withCQLFilter(gammaOrNeutronOnly)
+                .build();
+        JsonCqlEvaluator.SummaryCounterSpec multiSpec =
+                JsonCqlEvaluator.summaryCounterSpec(multiStatusNewest.getCQLFilter()).orElseThrow();
+        assertEquals("(COALESCE(s.gamma_alarm_count, 0) + COALESCE(s.neutron_alarm_count, 0))",
+                multiSpec.exactExpr());
+        assertEquals("s.summary_populated", multiSpec.exactReadyExpr());
+
+        // Intersected with disjoint Priority Bucket 1 (Gamma & Neutron) and Bucket 4 (None) -> 0::bigint
+        ObsFilter multiBucket1 = new ObsFilter.Builder()
+                .withCQLFilter("(" + gammaOrNeutronOnly + ") AND (gammaAlarm = true AND neutronAlarm = true)")
+                .build();
+        assertEquals("0::bigint",
+                JsonCqlEvaluator.summaryCounterSpec(multiBucket1.getCQLFilter()).orElseThrow().upperBoundExpr());
+        ObsFilter multiBucket4 = new ObsFilter.Builder()
+                .withCQLFilter("(" + gammaOrNeutronOnly + ") AND (gammaAlarm = false AND neutronAlarm = false)")
+                .build();
+        assertEquals("0::bigint",
+                JsonCqlEvaluator.summaryCounterSpec(multiBucket4.getCQLFilter()).orElseThrow().upperBoundExpr());
+
+        // Intersected with Priority Bucket 2 (Gamma) + Adjudicated + extra numeric predicate maxGamma >= 50
+        ObsFilter multiAdjNumeric = new ObsFilter.Builder()
+                .withCQLFilter("(" + gammaOrNeutronOnly + ") AND adjudicatedIdsCount > 0 AND (gammaAlarm = true AND neutronAlarm = false) AND maxGamma >= 50")
+                .build();
+        JsonCqlEvaluator.SummaryCounterSpec multiAdjNumericSpec =
+                JsonCqlEvaluator.summaryCounterSpec(multiAdjNumeric.getCQLFilter()).orElseThrow();
+        assertTrue(multiAdjNumericSpec.upperBoundExpr().contains("s.adjudicated_gamma_alarm_count"));
+        assertEquals("0::bigint", multiAdjNumericSpec.exactExpr());
+        assertEquals("false", multiAdjNumericSpec.exactReadyExpr());
+
+        // Time-contained multi-status summary spec
+        ObsFilter multiTimeContained = new ObsFilter.Builder()
+                .withCQLFilter("(" + gammaOrNeutronOnly + ") AND startTime >= '2026-11-01T00:00:00Z' AND endTime <= '2026-11-10T00:00:00Z'")
+                .build();
+        JsonCqlEvaluator.TimeContainedSummarySpec tcMulti =
+                JsonCqlEvaluator.timeContainedSummarySpec(multiTimeContained.getCQLFilter()).orElseThrow();
+        assertEquals("(COALESCE(s.gamma_alarm_count, 0) + COALESCE(s.neutron_alarm_count, 0))",
+                tcMulti.exactExpr());
+    }
+
+    @Test
+    public void multiBatchCountCqlHonorsThreadInterruptionWithoutCorruptingCache() throws Exception {
+        Path root = temporary.newFolder("cql-interrupt-batches").toPath();
+        java.util.List<ArchiveGeneration> generations = new java.util.ArrayList<>();
+        Instant base = Instant.parse("2026-01-01T00:00:00Z");
+        // 70 distinct non-overlapping windows -> 2 batches (64 + 6)
+        for (int i = 0; i < 70; i++) {
+            Instant start = base.plusSeconds(i * 3600L);
+            Path object = root.resolve("gen-" + i + ".parquet");
+            try (Connection duck = DriverManager.getConnection("jdbc:duckdb:");
+                 Statement stmt = duck.createStatement()) {
+                stmt.execute("CREATE TABLE rows (id_scope INTEGER, id_value BIGINT, datastream_scope INTEGER, " +
+                        "datastream_id BIGINT, foi_scope INTEGER, foi_id BIGINT, phenomenon_time TIMESTAMP, " +
+                        "result_time TIMESTAMP, result_json VARCHAR, archive_version INTEGER, profile VARCHAR)");
+                long obsId = 10_000L + i;
+                try (PreparedStatement ins = duck.prepareStatement(
+                        "INSERT INTO rows VALUES (4, ?, 4, 10, NULL, NULL, ?, ?, ?, 1, 'RAW_GATED')")) {
+                    ins.setLong(1, obsId);
+                    ins.setTimestamp(2, java.sql.Timestamp.from(start.plusSeconds(5)));
+                    ins.setTimestamp(3, java.sql.Timestamp.from(start.plusSeconds(5)));
+                    ins.setString(4, "{\"maxGamma\":99.5}");
+                    ins.executeUpdate();
+                }
+                stmt.execute("COPY rows TO '" + object.toString().replace("'", "''") + "' (FORMAT PARQUET, COMPRESSION ZSTD)");
+            }
+            generations.add(new ArchiveGeneration(
+                    UUID.randomUUID(), "RAW_GATED", start, start.plusSeconds(600),
+                    root.relativize(object), ArchiveExporter.sha256(object),
+                    1L, 10_000L + i, 10_000L + i, "ACTIVE", true));
+        }
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+        ObsFilter numericFilter = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(4, 10L))
+                .withCQLFilter("maxGamma >= 50")
+                .build();
+
+        // Pre-interrupt current thread and verify countCql aborts before scanning batches.
+        Thread.currentThread().interrupt();
+        try {
+            assertThrows(CancellationException.class,
+                    () -> reader.countCql(generations, numericFilter, Set.of(10L), null, Set.of()));
+        } finally {
+            Thread.interrupted(); // clear interrupt flag
+        }
+
+        // Subsequent un-interrupted call must return full exact count across all 70 generations.
+        assertEquals(70L, reader.countCql(generations, numericFilter, Set.of(10L), null, Set.of()));
+    }
+
     private record TestRow(long id, long dataStreamId, String time, String resultJson) {
         private TestRow(long id, long dataStreamId, String time) {
             this(id, dataStreamId, time, "{\"value\":" + id + "}");
