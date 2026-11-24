@@ -1687,6 +1687,60 @@ public final class JsonCqlEvaluator {
         return tryEvaluateSummaryMask(filter, 0).isPresent();
     }
 
+    /**
+     * Extracts canonical summary-mask conjuncts for {@code filter} when {@code filter}
+     * is directly evaluable via {@link #tryEvaluateSummaryMask(Filter, int)}, or when
+     * {@code timeContainedEligible} is {@code true} and {@link #timeContainedSummarySpec(Filter)}
+     * proves that {@code startTime}/{@code endTime}/{@code samplingTime} range bounds are
+     * already satisfied for the target time-contained generations. Returns {@code null}
+     * when full JSON payload evaluation is required.
+     */
+    public static List<Filter> extractSummaryMaskConjuncts(Filter filter, boolean timeContainedEligible) {
+        if (filter == null || filter == Filter.INCLUDE)
+            return List.of();
+        if (supportsSummaryMaskEvaluation(filter)) {
+            List<Filter> flat = new ArrayList<>();
+            flattenAndChildren(filter, flat);
+            return List.copyOf(flat);
+        }
+        if (!timeContainedEligible || timeContainedSummarySpec(filter).isEmpty())
+            return null;
+        List<Filter> conjuncts = new ArrayList<>();
+        flattenAndChildren(filter, conjuncts);
+        List<Filter> nonTimeConjuncts = new ArrayList<>();
+        for (Filter child : conjuncts) {
+            if ((child instanceof PropertyIsLessThan ||
+                    child instanceof PropertyIsLessThanOrEqualTo ||
+                    child instanceof PropertyIsGreaterThan ||
+                    child instanceof PropertyIsGreaterThanOrEqualTo) &&
+                    ((BinaryComparisonOperator) child).getExpression1() instanceof PropertyName prop &&
+                    ((BinaryComparisonOperator) child).getExpression2() instanceof Literal lit &&
+                    lit.getValue() instanceof String) {
+                String name = prop.getPropertyName();
+                if ("startTime".equals(name) || "endTime".equals(name) || "samplingTime".equals(name))
+                    continue;
+            }
+            if (!supportsSummaryMaskEvaluation(child))
+                return null;
+            nonTimeConjuncts.add(child);
+        }
+        return List.copyOf(nonTimeConjuncts);
+    }
+
+    public static Optional<Boolean> tryEvaluateSummaryMaskConjuncts(List<Filter> conjuncts, int mask) {
+        if (conjuncts == null)
+            return Optional.empty();
+        boolean allTrue = true;
+        for (Filter child : conjuncts) {
+            Optional<Boolean> sub = tryEvaluateSummaryMask(child, mask);
+            if (sub.isEmpty())
+                return Optional.empty();
+            if (!sub.get())
+                allTrue = false;
+        }
+        return Optional.of(allTrue);
+    }
+
     private static int leafSummaryBit(Filter filter) {
         if (filter instanceof PropertyIsEqualTo eq) {
             if (!(eq.getExpression1() instanceof PropertyName prop) ||

@@ -894,4 +894,31 @@ public class TestArchiveLifecycleInvariants {
             return '\0';
         throw new AssertionError("Unhandled primitive " + type);
     }
+
+    @Test
+    public void timeContainedSummaryMaskConjunctsShareCacheKeysAndAvoidPayloadDecoding() throws Exception {
+        var direct = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("gammaAlarm = true AND neutronAlarm = true")
+                .build().getCQLFilter();
+        var windowA = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("startTime >= '2026-10-01T00:00:00Z' AND endTime <= '2026-11-24T12:00:00Z' AND gammaAlarm = true AND neutronAlarm = true")
+                .build().getCQLFilter();
+        var windowB = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("startTime >= '2026-10-02T05:13:47Z' AND endTime <= '2026-11-24T13:45:12Z' AND gammaAlarm = true AND neutronAlarm = true")
+                .build().getCQLFilter();
+
+        var directConjuncts = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.extractSummaryMaskConjuncts(direct, true);
+        var windowAConjuncts = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.extractSummaryMaskConjuncts(windowA, true);
+        var windowBConjuncts = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.extractSummaryMaskConjuncts(windowB, true);
+
+        assertTrue(directConjuncts != null);
+        assertEquals(directConjuncts, windowAConjuncts);
+        assertEquals(windowAConjuncts, windowBConjuncts);
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.extractSummaryMaskConjuncts(windowA, false) == null);
+
+        int gnMask = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.computeSummaryMask("{\"gammaAlarm\":true,\"neutronAlarm\":true,\"adjudicatedIdsCount\":0}");
+        int gOnlyMask = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.computeSummaryMask("{\"gammaAlarm\":true,\"neutronAlarm\":false,\"adjudicatedIdsCount\":0}");
+        assertEquals(java.util.Optional.of(Boolean.TRUE), org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMaskConjuncts(windowAConjuncts, gnMask));
+        assertEquals(java.util.Optional.of(Boolean.FALSE), org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMaskConjuncts(windowAConjuncts, gOnlyMask));
+    }
 }
