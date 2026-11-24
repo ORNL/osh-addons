@@ -103,11 +103,12 @@ public final class JsonCqlEvaluator {
     }
 
     /**
-     * Appends a sound (zero-false-negative) PostgreSQL jsonb prefilter over
-     * {@code column} for boolean alarm predicates, adjudication-count predicates,
-     * and recursive {@code AND}/{@code OR} combinations. Arrays, non-boolean
-     * scalar encodings, missing fields (where applicable), and unsupported
-     * clauses remain candidates for exact Java evaluation.
+     * Reject only explicit nonzero numeric adjudication counts and explicit
+     * opposite boolean alarm flags. Arrays, missing fields, nulls and other
+     * types remain candidates for exact Java evaluation. The caller supplies a
+     * trusted PostgreSQL jsonb column expression; never emit bare {@code ?}
+     * operators here because JDBC {@code PreparedStatement} parses {@code ?} as
+     * a positional bind parameter.
      */
     public static boolean appendPostgresOverlayPrefilter(
             Filter filter, String column, StringBuilder sql) {
@@ -159,38 +160,17 @@ public final class JsonCqlEvaluator {
             String path = property.getPropertyName();
             Object expected = literal.getValue();
             if ("adjudicatedIdsCount".equals(path) && isExactNumericZero(expected)) {
-                return "NOT COALESCE((jsonb_typeof(" + column + "->'adjudicatedIdsCount') = 'number' AND " +
-                        column + "->'adjudicatedIdsCount' <> '0'::jsonb), false) AND " +
-                        "NOT COALESCE((NOT (" + column + " ? 'adjudicatedIdsCount') OR jsonb_typeof(" +
-                        column + "->'adjudicatedIdsCount') = 'null') AND jsonb_typeof(" +
-                        column + "->'adjudicatedIds') = 'array' AND jsonb_array_length(" +
-                        column + "->'adjudicatedIds') <> 0, false)";
+                return "NOT COALESCE((jsonb_typeof(" + column +
+                        "->'adjudicatedIdsCount') = 'number' AND " +
+                        column + "->'adjudicatedIdsCount' <> '0'::jsonb), false)";
             }
-            if (expected instanceof Boolean boolVal && path != null && SAFE_JSON_KEY.matcher(path).matches()) {
-                String boolStr = boolVal ? "true" : "false";
-                if ("gammaAlarm".equals(path) || "neutronAlarm".equals(path)) {
-                    return "(" + column + " ? '" + path + "' AND jsonb_typeof(" + column + "->'" + path + "') <> 'null' AND " +
-                            "(CASE WHEN jsonb_typeof(" + column + "->'" + path + "') = 'boolean' THEN (" +
-                            column + "->>'" + path + "') ELSE 'other' END) IN ('" + boolStr + "', 'other'))";
-                }
-                return "(" + column + " ? '" + path + "' AND jsonb_typeof(" + column + "->'" + path + "') <> 'null' AND " +
-                        "(jsonb_typeof(" + column + "->'" + path + "') <> 'boolean' OR " +
-                        column + "->'" + path + "' = '" + boolStr + "'::jsonb))";
+            if (("gammaAlarm".equals(path) || "neutronAlarm".equals(path)) &&
+                    expected instanceof Boolean boolVal) {
+                String expectedJson = boolVal ? "'true'::jsonb" : "'false'::jsonb";
+                return "NOT COALESCE((jsonb_typeof(" + column + "->'" + path +
+                        "') = 'boolean' AND " + column + "->'" + path +
+                        "' <> " + expectedJson + "), false)";
             }
-            return null;
-        }
-        if (filter instanceof PropertyIsGreaterThan gt &&
-                gt.getExpression1() instanceof PropertyName property &&
-                "adjudicatedIdsCount".equals(property.getPropertyName()) &&
-                gt.getExpression2() instanceof Literal literal &&
-                isExactNumericZero(literal.getValue())) {
-            return "NOT COALESCE((jsonb_typeof(" + column + "->'adjudicatedIdsCount') = 'number' AND " +
-                    column + "->'adjudicatedIdsCount' <= '0'::jsonb), false) AND " +
-                    "NOT COALESCE((NOT (" + column + " ? 'adjudicatedIdsCount') OR jsonb_typeof(" +
-                    column + "->'adjudicatedIdsCount') = 'null') AND (NOT (" +
-                    column + " ? 'adjudicatedIds') OR (jsonb_typeof(" +
-                    column + "->'adjudicatedIds') = 'array' AND jsonb_array_length(" +
-                    column + "->'adjudicatedIds') = 0)), false)";
         }
         return null;
     }
