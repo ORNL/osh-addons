@@ -107,7 +107,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private static final int POINT_READ_COALESCER_BATCH = 64;
     private static final int OVERLAY_WRITE_COALESCER_BATCH = 64;
     private static final int MAX_EAGER_NON_COLD_OFFSET_ROWS = 4_096;
-    private static final long MIN_SUMMARY_SKIP_OFFSET = 32L;
+    private static final long EAGER_NON_COLD_COMPLETE_FLOOR = 1_024L;
+    private static final long MIN_SUMMARY_SKIP_OFFSET = 15L;
 
     private final TieredArchiveConfig archiveConfig;
     private final ArchiveCatalog archiveCatalog;
@@ -984,7 +985,10 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         boolean effectiveHasMutations = mutationCount > 0L;
         boolean hasOverlays = mutationCounts.overlayCount() > 0L;
 
-        long probeCap = Math.min(filter.getLimit(), MAX_EAGER_NON_COLD_OFFSET_ROWS + 1L);
+        long eagerCompleteFloor = Math.min(EAGER_NON_COLD_COMPLETE_FLOOR, MAX_EAGER_NON_COLD_OFFSET_ROWS);
+        long probeCap = filter.getLimit() <= eagerCompleteFloor
+                ? eagerCompleteFloor + 1L
+                : Math.min(filter.getLimit(), MAX_EAGER_NON_COLD_OFFSET_ROWS + 1L);
         ObsFilter nonColdFilter = ObsFilter.Builder.from(resolvedFilter).withLimit(probeCap).build();
         int initialNonColdPageSize = adaptiveInitialPageSize(Math.min(probeCap, STREAM_FETCH_SIZE));
 
@@ -1011,16 +1015,28 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             return selectTieredEntries(filter, fields, hasMutations).skip(offset);
         }
 
+        boolean nonColdComplete = hotUnowned.size() < probeCap && overlayEntries.size() < probeCap;
         Comparator<Entry<BigId, IObsData>> comparator = entryComparator(filter);
+        List<Entry<BigId, IObsData>> allNonCold = null;
         List<Entry<BigId, IObsData>> nonCold;
         if (overlayEntries.isEmpty()) {
+            allNonCold = nonColdComplete ? hotUnowned : null;
             nonCold = hotUnowned.size() > filter.getLimit()
                     ? hotUnowned.subList(0, (int) filter.getLimit())
                     : hotUnowned;
         } else if (hotUnowned.isEmpty()) {
+            allNonCold = nonColdComplete ? overlayEntries : null;
             nonCold = overlayEntries.size() > filter.getLimit()
                     ? overlayEntries.subList(0, (int) filter.getLimit())
                     : overlayEntries;
+        } else if (nonColdComplete) {
+            try (Stream<Entry<BigId, IObsData>> mergedNonCold =
+                         mergeSorted(hotUnowned.stream(), overlayEntries.stream(), comparator)) {
+                allNonCold = mergedNonCold.toList();
+            }
+            nonCold = allNonCold.size() > filter.getLimit()
+                    ? allNonCold.subList(0, (int) filter.getLimit())
+                    : allNonCold;
         } else {
             try (Stream<Entry<BigId, IObsData>> mergedNonCold =
                          mergeSorted(hotUnowned.stream(), overlayEntries.stream(), comparator)) {
@@ -1028,15 +1044,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             }
         }
 
-        boolean nonColdComplete = nonCold.size() < filter.getLimit();
-        Instant hotBoundaryTime = !nonColdComplete && filter.getLimit() > 0L
+        Instant hotBoundaryTime = filter.getLimit() > 0L && nonCold.size() >= filter.getLimit()
                 ? nonCold.get((int) filter.getLimit() - 1).getValue().getPhenomenonTime()
                 : null;
         boolean descending = filter.getPhenomenonTime() != null &&
                 filter.getPhenomenonTime().descendingOrder();
+        List<Entry<BigId, IObsData>> precedingSource = allNonCold != null ? allNonCold : nonCold;
         ToLongBiFunction<Instant, Instant> nonColdPrecedingFn = nonColdComplete
                 ? (clusterMinStart, clusterMaxEnd) -> countPrecedingNonCold(
-                        nonCold, descending, clusterMinStart, clusterMaxEnd)
+                        precedingSource, descending, clusterMinStart, clusterMaxEnd)
                 : null;
 
         ColdOffsetStream coldPlan = streamColdBasesWithSkip(
@@ -4635,14 +4651,22 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                                     .filter(generation -> mutatedByGen.containsKey(generation.id()))
                                     .toList();
                             if (!mutatedGens.isEmpty()) {
+                                Set<Long> parquetMutatedIds = mutatedGens.stream()
+                                        .flatMap(g -> mutatedByGen.getOrDefault(g.id(), Set.of()).stream())
+                                        .collect(Collectors.toSet());
                                 mutatedMatchingCold = archiveReader.countMatchingIds(
-                                        mutatedGens, idScope, allMutatedIds, resolvedFilter, dataStreams, fois);
+                                        mutatedGens, idScope, parquetMutatedIds, resolvedFilter, dataStreams, fois);
                             }
                         }
                         scannedColdCount = Math.subtractExact(rawCold, mutatedMatchingCold);
                     } else {
+                        Set<Long> parquetMutatedIds = mutatedByGen.isEmpty()
+                                ? Set.of()
+                                : parquetCandidates.stream()
+                                        .flatMap(g -> mutatedByGen.getOrDefault(g.id(), Set.of()).stream())
+                                        .collect(Collectors.toSet());
                         scannedColdCount = archiveReader.countCql(
-                                parquetCandidates, resolvedFilter, dataStreams, fois, allMutatedIds);
+                                parquetCandidates, resolvedFilter, dataStreams, fois, parquetMutatedIds);
                     }
                 }
                 coldUnmutatedCount = Math.addExact(summarizedColdCount, scannedColdCount);
@@ -4663,7 +4687,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             String generationSha256,
             Set<Long> mutatedIds,
             Set<Long> dataStreams,
-            org.geotools.api.filter.Filter cqlFilter) {}
+            Object filterKey) {}
 
     private long countMutatedSummaryBaseMatches(
             List<ArchiveGeneration> exactMutatedCandidates,
@@ -4689,6 +4713,10 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             return Map.of();
         Set<Long> immutableStreams = dataStreams == null ? null : Set.copyOf(dataStreams);
         org.geotools.api.filter.Filter cqlFilter = resolvedFilter.getCQLFilter();
+        List<org.geotools.api.filter.Filter> maskConjuncts =
+                JsonCqlEvaluator.extractSummaryMaskConjuncts(cqlFilter, true);
+        boolean canUseSummaryMask = maskConjuncts != null;
+        Object filterCacheKey = canUseSummaryMask ? maskConjuncts : cqlFilter;
         Map<UUID, Long> byGeneration = new HashMap<>(exactMutatedCandidates.size());
         List<ArchiveGeneration> misses = new ArrayList<>();
         Map<UUID, MutatedGenSummaryCountKey> missKeys = new HashMap<>();
@@ -4699,7 +4727,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 continue;
             Set<Long> immutableMutated = Set.copyOf(genMutated);
             MutatedGenSummaryCountKey key = new MutatedGenSummaryCountKey(
-                    generation.id(), generation.sha256(), immutableMutated, immutableStreams, cqlFilter);
+                    generation.id(), generation.sha256(), immutableMutated, immutableStreams, filterCacheKey);
             Long cached = mutatedGenSummaryCounts.getIfPresent(key);
             if (cached != null) {
                 byGeneration.put(generation.id(), cached);
@@ -4712,7 +4740,6 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         if (misses.isEmpty())
             return byGeneration;
 
-        boolean canUseSummaryMask = JsonCqlEvaluator.supportsSummaryMaskEvaluation(cqlFilter);
         List<ArchiveGeneration> parquetFallbackMisses = misses;
         Map<UUID, Set<Long>> parquetFallbackTargets = missTargets;
 
@@ -4744,7 +4771,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 }
                 if (allReady) {
                     long matched = countMatchingPersistedBaseMasks(
-                            genMutated, rowsById, dataStreams, fois, cqlFilter);
+                            genMutated, rowsById, dataStreams, fois, maskConjuncts);
                     mutatedGenSummaryCounts.put(missKeys.get(generation.id()), matched);
                     byGeneration.put(generation.id(), matched);
                 } else {
@@ -4772,7 +4799,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 });
                 if (allReady) {
                     long matched = countMatchingPersistedBaseMasks(
-                            genMutated, rowsById, dataStreams, fois, cqlFilter);
+                            genMutated, rowsById, dataStreams, fois, maskConjuncts);
                     mutatedGenSummaryCounts.put(missKeys.get(generation.id()), matched);
                     byGeneration.put(generation.id(), matched);
                 } else {
@@ -4803,7 +4830,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             Map<Long, ArchiveCatalog.MutatedBaseSummaryRow> rowsById,
             Set<Long> allowedDataStreams,
             Set<Long> allowedFois,
-            org.geotools.api.filter.Filter cqlFilter) {
+            List<org.geotools.api.filter.Filter> maskConjuncts) {
         long matched = 0L;
         for (Long obsId : genMutated) {
             ArchiveCatalog.MutatedBaseSummaryRow row = rowsById.get(obsId);
@@ -4816,7 +4843,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 if (!allowedFois.contains(foiKey))
                     continue;
             }
-            if (JsonCqlEvaluator.tryEvaluateSummaryMask(cqlFilter, row.summaryMask()).orElse(false)) {
+            if (JsonCqlEvaluator.tryEvaluateSummaryMaskConjuncts(maskConjuncts, row.summaryMask()).orElse(false)) {
                 matched = Math.addExact(matched, 1L);
             }
         }
