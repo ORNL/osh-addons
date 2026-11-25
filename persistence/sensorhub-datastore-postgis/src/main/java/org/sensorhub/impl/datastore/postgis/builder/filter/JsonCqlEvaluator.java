@@ -1147,9 +1147,90 @@ public final class JsonCqlEvaluator {
             return Optional.empty();
         if ("FALSE".equals(node.sql()))
             return Optional.of(node);
+        ExactDuckDbPredicate fastGuard = buildFastStrposGuard(filter, column);
+        if (fastGuard != null && !"TRUE".equals(fastGuard.sql())) {
+            List<Object> combined = new ArrayList<>(fastGuard.parameters().size() + node.parameters().size());
+            combined.addAll(fastGuard.parameters());
+            combined.addAll(node.parameters());
+            String caseSql = "CASE WHEN ((" + fastGuard.sql() + ") OR strpos(" + column + ", '\\u') > 0) " +
+                    "THEN (json_type(" + column + ") = 'OBJECT' AND (" + node.sql() + ")) " +
+                    "ELSE FALSE END";
+            return Optional.of(new ExactDuckDbPredicate(caseSql, combined));
+        }
         return Optional.of(new ExactDuckDbPredicate(
                 "json_type(" + column + ") = 'OBJECT' AND (" + node.sql() + ")",
                 node.parameters()));
+    }
+
+    /**
+     * Builds a pure SIMD {@code strpos}-only sound pre-guard (zero {@code yyjson} parses)
+     * for {@code CASE WHEN ... THEN ... ELSE FALSE END} selection-vector pruning in DuckDB.
+     */
+    private static ExactDuckDbPredicate buildFastStrposGuard(Filter filter, String column) {
+        if (filter == null || filter == Filter.INCLUDE)
+            return new ExactDuckDbPredicate("TRUE", List.of());
+        if (filter == Filter.EXCLUDE)
+            return new ExactDuckDbPredicate("FALSE", List.of());
+        if (filter instanceof And and) {
+            List<String> parts = new ArrayList<>();
+            List<Object> params = new ArrayList<>();
+            for (Filter child : and.getChildren()) {
+                ExactDuckDbPredicate sub = buildFastStrposGuard(child, column);
+                if (sub == null || "TRUE".equals(sub.sql()))
+                    continue;
+                if ("FALSE".equals(sub.sql()))
+                    return sub;
+                parts.add("(" + sub.sql() + ")");
+                params.addAll(sub.parameters());
+            }
+            return parts.isEmpty()
+                    ? new ExactDuckDbPredicate("TRUE", List.of())
+                    : new ExactDuckDbPredicate(String.join(" AND ", parts), params);
+        }
+        if (filter instanceof Or or) {
+            if (or.getChildren().isEmpty())
+                return new ExactDuckDbPredicate("FALSE", List.of());
+            List<String> parts = new ArrayList<>();
+            List<Object> params = new ArrayList<>();
+            for (Filter child : or.getChildren()) {
+                ExactDuckDbPredicate sub = buildFastStrposGuard(child, column);
+                if (sub == null || "TRUE".equals(sub.sql()))
+                    return new ExactDuckDbPredicate("TRUE", List.of());
+                if (!"FALSE".equals(sub.sql())) {
+                    parts.add("(" + sub.sql() + ")");
+                    params.addAll(sub.parameters());
+                }
+            }
+            return parts.isEmpty()
+                    ? new ExactDuckDbPredicate("FALSE", List.of())
+                    : new ExactDuckDbPredicate(String.join(" OR ", parts), params);
+        }
+        if (filter instanceof BinaryComparisonOperator cmp &&
+                cmp.getExpression1() instanceof PropertyName property &&
+                cmp.getExpression2() instanceof Literal literal) {
+            String path = property.getPropertyName();
+            Object expected = literal.getValue();
+            if (path == null || expected == null)
+                return null;
+            String leafKey = extractSafeLeafKey(path);
+            if ("adjudicatedIdsCount".equals(path)) {
+                return new ExactDuckDbPredicate(
+                        "strpos(" + column + ", 'adjudicatedIds') > 0", List.of());
+            }
+            if (cmp instanceof PropertyIsEqualTo && expected instanceof Boolean boolVal) {
+                String tok = boolVal ? "true" : "false";
+                if (leafKey != null) {
+                    return new ExactDuckDbPredicate(
+                            "strpos(" + column + ", ?) > 0 AND strpos(" + column + ", ?) > 0",
+                            List.of(tok, leafKey));
+                }
+                return new ExactDuckDbPredicate("strpos(" + column + ", ?) > 0", List.of(tok));
+            }
+            if (leafKey != null) {
+                return new ExactDuckDbPredicate("strpos(" + column + ", ?) > 0", List.of(leafKey));
+            }
+        }
+        return null;
     }
 
     private static ExactDuckDbPredicate buildExactDuckDbNode(Filter filter, String column) {
