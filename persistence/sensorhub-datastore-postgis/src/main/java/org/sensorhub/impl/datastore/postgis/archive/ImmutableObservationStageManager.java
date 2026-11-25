@@ -685,7 +685,7 @@ public final class ImmutableObservationStageManager {
         boolean existingParquetPrimary;
         try (PreparedStatement check = connection.prepareStatement(
                 "SELECT EXISTS (SELECT 1 FROM " + ROUTE_TABLE +
-                        " WHERE store_key=? AND id_scope=? AND immutable=true)")) {
+                        " WHERE store_key=? AND id_scope=?)")) {
             check.setString(1, storeKey);
             check.setInt(2, idScope);
             try (ResultSet rs = check.executeQuery()) {

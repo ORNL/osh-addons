@@ -9,13 +9,14 @@ fresh OSCAR databases. Ordinary PostGIS stores and the default
 - PostgreSQL provides a short-lived, crash-recoverable landing tier. A write becomes durable
   when the normal OSH store `commit()` completes; `add()` alone is not a
   durability boundary because the batch store intentionally buffers writes.
-- Only output names in `archive.outputNames` are eligible (by default all 22
+- Only output names in `archive.outputNames` are eligible (by default all 26
   operational and evidentiary streams: `gammaCounts`, `gammaThreshold`,
   `neutronCounts`, `setupGamma`, `setupNeutron`, `speed`, `backgroundReport`,
   `foregroundReport`, `status`, `emlContextual`, `emlScanContextual`,
   `emlAnalysis`, `dailyFile`, `connectionStatus`, `occupancyStatus`, `tamper`,
   `occupancy`, `adjudication`, `report`, `siteStatistics`, `nationalSummary`,
-  `vehicleOcr`).
+  `vehicleOcr`, `location`, `alarm`, `KromekDetectorRadiometricsV1Report`,
+  `KromekSerialRadiometricStatusReport`).
   Static singleton configuration streams (`sensorLocation`, `adjudicationCodes`,
   `siteInfo`) remain in `ONLY oscar.obs`. Mutations to archived observations
   (such as appending an adjudication ID onto an archived `occupancy` row) are
@@ -177,7 +178,11 @@ does not provide.
       "report",
       "siteStatistics",
       "nationalSummary",
-      "vehicleOcr"
+      "vehicleOcr",
+      "location",
+      "alarm",
+      "KromekDetectorRadiometricsV1Report",
+      "KromekSerialRadiometricStatusReport"
     ]
   }
 }

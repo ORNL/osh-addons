@@ -187,13 +187,23 @@ public class TieredArchiveConfig {
             "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
             "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary");
 
-    private static final List<String> DEFAULT_OUTPUT_NAMES = List.of(
+    private static final List<String> PREVIOUS_22_DEFAULT_OUTPUT_NAMES = List.of(
             "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
             "speed", "backgroundReport", "foregroundReport", "status",
             "emlContextual", "emlScanContextual", "emlAnalysis",
             "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
             "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary",
             "vehicleOcr");
+
+    private static final List<String> DEFAULT_OUTPUT_NAMES = List.of(
+            "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
+            "speed", "backgroundReport", "foregroundReport", "status",
+            "emlContextual", "emlScanContextual", "emlAnalysis",
+            "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
+            "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary",
+            "vehicleOcr",
+            "location", "alarm",
+            "KromekDetectorRadiometricsV1Report", "KromekSerialRadiometricStatusReport");
 
     @DisplayInfo(label = "Archive output names", desc = "Only high-volume raw/rollup streams are cold-tiered by default")
     public List<String> outputNames = new ArrayList<>(DEFAULT_OUTPUT_NAMES);
@@ -290,7 +300,8 @@ public class TieredArchiveConfig {
                             "maximumGenerationsPerCycle so parity backlog cannot grow by configuration");
         if (outputNames != null && (outputNames.equals(LEGACY_DEFAULT_OUTPUT_NAMES) ||
                 outputNames.equals(PREVIOUS_DEFAULT_OUTPUT_NAMES) ||
-                outputNames.equals(PREVIOUS_21_DEFAULT_OUTPUT_NAMES)))
+                outputNames.equals(PREVIOUS_21_DEFAULT_OUTPUT_NAMES) ||
+                outputNames.equals(PREVIOUS_22_DEFAULT_OUTPUT_NAMES)))
             outputNames = new ArrayList<>(DEFAULT_OUTPUT_NAMES);
         if (isParquetPrimary() && (outputNames == null || outputNames.isEmpty()))
             throw new IllegalArgumentException("At least one immutable archive output name is required");
