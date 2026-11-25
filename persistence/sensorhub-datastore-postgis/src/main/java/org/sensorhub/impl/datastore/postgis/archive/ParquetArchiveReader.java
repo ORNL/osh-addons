@@ -650,8 +650,8 @@ public final class ParquetArchiveReader {
     private static final int MAX_INLINE_MUTATION_EXCLUSIONS = 4_096;
     private static final int MAX_INLINE_CQL_AGGREGATE_EXCLUSIONS = 64;
     private static final int MAX_RESULT_TIME_METADATA_BATCH = 64;
-    private static final int MAX_CQL_PAYLOAD_BATCH = 128;
-    private static final int MAX_CQL_AGGREGATE_BATCH = 256;
+    private static final int MAX_CQL_PAYLOAD_BATCH = 64;
+    private static final int MAX_CQL_AGGREGATE_BATCH = 64;
     private static final int LOCAL_STAGE_COPY_RETRIES = 3;
 
     /**
@@ -1230,6 +1230,15 @@ public final class ParquetArchiveReader {
                 throwIfInterruptedOrCancelled();
                 Map<String, ArchiveGeneration> batchMap = new LinkedHashMap<>(batch.size() * 2);
                 for (ArchiveGeneration generation : batch) {
+                    CqlGenerationCountKey key = cacheKeyByGenId.get(generation.id());
+                    if (key != null) {
+                        Long concurrentHit = cqlGenerationCounts.getIfPresent(key);
+                        if (concurrentHit != null) {
+                            cqlCountCacheHits.incrementAndGet();
+                            total = Math.addExact(total, concurrentHit);
+                            continue;
+                        }
+                    }
                     String filename = filenameByGenId.get(generation.id());
                     if (filename != null)
                         batchMap.put(filename, generation);
@@ -1242,20 +1251,37 @@ public final class ParquetArchiveReader {
                     if (useSessionTempExclusions) {
                         populateTempExcludedIds(duckSession.connection(), sessionExclusionList);
                     }
+                    if (!cacheKeyByGenId.isEmpty()) {
+                        Iterator<Map.Entry<String, ArchiveGeneration>> recheck = batchMap.entrySet().iterator();
+                        while (recheck.hasNext()) {
+                            ArchiveGeneration gen = recheck.next().getValue();
+                            CqlGenerationCountKey key = cacheKeyByGenId.get(gen.id());
+                            if (key != null) {
+                                Long afterAcquireHit = cqlGenerationCounts.getIfPresent(key);
+                                if (afterAcquireHit != null) {
+                                    cqlCountCacheHits.incrementAndGet();
+                                    total = Math.addExact(total, afterAcquireHit);
+                                    recheck.remove();
+                                }
+                            }
+                        }
+                        if (batchMap.isEmpty())
+                            continue;
+                    }
                 }
                 cqlCountScannedGenerations.addAndGet(batchMap.size());
-                Map<UUID, Long> perGenCounts = cacheKeyByGenId.isEmpty() ? null : new HashMap<>(batch.size() * 2);
+                Map<UUID, Long> perGenCounts = cacheKeyByGenId.isEmpty() ? null : new HashMap<>(batchMap.size() * 2);
                 AuthorizedObjects batchObjects = new AuthorizedObjects(batchMap, allAuthorized.stampsByGenId());
                 List<Long> batchSortedExclusions = useSessionTempExclusions
                         ? List.of()
                         : resolveBatchSortedExclusions(
                                 batchMap.values(), allSortedExclusions, excludedIdsByGeneration);
                 long batchTotal = countCqlAuthorizedBatch(
-                        duckSession, batchObjects, batch.size(), filter, allowedDataStreams, allowedFois,
+                        duckSession, batchObjects, batchMap.size(), filter, allowedDataStreams, allowedFois,
                         exclusions, batchSortedExclusions, useSessionTempExclusions, exactPredicate, perGenCounts);
                 total = Math.addExact(total, batchTotal);
                 if (perGenCounts != null) {
-                    for (ArchiveGeneration generation : batch) {
+                    for (ArchiveGeneration generation : batchMap.values()) {
                         CqlGenerationCountKey key = cacheKeyByGenId.get(generation.id());
                         if (key != null) {
                             cqlGenerationCounts.put(key, perGenCounts.getOrDefault(generation.id(), 0L));
