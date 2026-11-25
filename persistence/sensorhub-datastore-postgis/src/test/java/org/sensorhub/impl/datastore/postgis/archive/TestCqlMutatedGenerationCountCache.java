@@ -438,6 +438,60 @@ public class TestCqlMutatedGenerationCountCache {
                 1L, reader.cqlCountScannedGenerationsForTesting());
     }
 
+    @Test
+    public void exactDuckDbAggregatePushdownMatchesJavaEvaluatorAcrossEdgeCases() throws Exception {
+        Path root = temporary.newFolder("exact-duckdb-cql-agg-archive").toPath();
+        Path duckTmp = temporary.getRoot().toPath().resolve("exact-duckdb-cql-agg-tmp");
+        TieredArchiveConfig config = singleSessionConfig(root, duckTmp);
+        ParquetArchiveReader reader = new ParquetArchiveReader(root, config);
+
+        Instant t0 = Instant.parse("2026-03-01T00:00:00Z");
+        List<FixtureRow> rows = List.of(
+                // 1: nested maxGamma=120 must NOT match root maxGamma=25 >= 50
+                new FixtureRow(1L, 10L, t0.plusSeconds(10), t0.plusSeconds(10),
+                        "{\"nested\":{\"maxGamma\":120},\"gammaAlarm\":true,\"neutronAlarm\":false,\"maxGamma\":25.0,\"adjudicatedIds\":[]}"),
+                // 2: matches multi-Status + maxGamma >= 50 (adjudicatedIds empty array fallback)
+                new FixtureRow(2L, 10L, t0.plusSeconds(20), t0.plusSeconds(20),
+                        "{\"gammaAlarm\":true,\"neutronAlarm\":false,\"maxGamma\":50.0,\"adjudicatedIds\":[]}"),
+                // 3: matches neutron-only branch + maxGamma >= 50 (excluded by mutation ID test)
+                new FixtureRow(3L, 10L, t0.plusSeconds(30), t0.plusSeconds(30),
+                        "{\"gammaAlarm\":false,\"neutronAlarm\":true,\"maxGamma\":88.25,\"adjudicatedIdsCount\":null,\"adjudicatedIds\":[\"code:9\"]}"),
+                // 4: gamma+neutron both true -> excluded by disjoint Gamma-only OR Neutron-only filter
+                new FixtureRow(4L, 10L, t0.plusSeconds(40), t0.plusSeconds(40),
+                        "{\"gammaAlarm\":true,\"neutronAlarm\":true,\"maxGamma\":250.0,\"adjudicatedIdsCount\":0}"),
+                // 5: Unicode escape in key/value must still match
+                new FixtureRow(5L, 10L, t0.plusSeconds(50), t0.plusSeconds(50),
+                        "{\"\\u0067ammaAlarm\":true,\"neutronAlarm\":false,\"maxGamma\":61.5,\"alarmState\":\"\\u0046ault - Gamma High\"}")
+        );
+        ArchiveGeneration gen = writeParquetGeneration(root, "datasets/observations/agg.parquet",
+                t0, t0.plusSeconds(600), rows);
+
+        ObsFilter multiStatusMaxGamma = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(4, 10L))
+                .withCQLFilter("(((gammaAlarm=true AND neutronAlarm=false) OR (gammaAlarm=false AND neutronAlarm=true)) AND maxGamma>=50)")
+                .build();
+        assertTrue(JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(multiStatusMaxGamma.getCQLFilter()));
+        assertTrue(JsonCqlEvaluator.tryBuildExactDuckDbPredicate(multiStatusMaxGamma.getCQLFilter(), "result_json").isPresent());
+
+        assertEquals(3L, reader.countCql(List.of(gen), multiStatusMaxGamma, Set.of(10L), null, Set.of()));
+        assertEquals(2L, reader.countCql(List.of(gen), multiStatusMaxGamma, Set.of(10L), null, Set.of(3L)));
+
+        ObsFilter adjFallbackZero = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(4, 10L))
+                .withCQLFilter("adjudicatedIdsCount = 0 AND maxGamma >= 50")
+                .build();
+        assertTrue(JsonCqlEvaluator.tryBuildExactDuckDbPredicate(adjFallbackZero.getCQLFilter(), "result_json").isPresent());
+        // Rows 2 (adjudicatedIds:[]) and 4 (adjudicatedIdsCount:0) match; row 3 has adjudicatedIds:["code:9"] (len=1); row 5 lacks adjudicatedIds
+        assertEquals(2L, reader.countCql(List.of(gen), adjFallbackZero, Set.of(10L), null, Set.of()));
+
+        ObsFilter adjFallbackPositive = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(4, 10L))
+                .withCQLFilter("adjudicatedIdsCount > 0")
+                .build();
+        assertTrue(JsonCqlEvaluator.tryBuildExactDuckDbPredicate(adjFallbackPositive.getCQLFilter(), "result_json").isPresent());
+        assertEquals(1L, reader.countCql(List.of(gen), adjFallbackPositive, Set.of(10L), null, Set.of()));
+    }
+
     private static TieredArchiveConfig singleSessionConfig(Path root, Path duckTmp) {
         TieredArchiveConfig config = new TieredArchiveConfig();
         config.rootDirectory = root.toAbsolutePath().normalize().toString();

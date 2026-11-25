@@ -41,7 +41,12 @@ import java.util.stream.StreamSupport;
 /** Evaluates the supported OSCAR CQL subset directly against archived JSON. */
 public final class JsonCqlEvaluator {
     private static final Pattern SAFE_JSON_KEY = Pattern.compile("^[A-Za-z0-9_-]+$");
+    private static final Pattern SAFE_JSON_DOLLAR_PATH = Pattern.compile("^[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)*$");
     private static final Pattern SAFE_JSON_STRING_LITERAL = Pattern.compile("^[A-Za-z0-9 _.:-]+$");
+    private static final Set<String> EXACT_DUCKDB_SCALAR_KEYS = Set.of(
+            "gammaAlarm", "neutronAlarm", "tamperStatus",
+            "alarmState", "eventId", "laneId",
+            "maxGamma", "maxNeutron", "occupancyCount", "neutronBackground");
     private static final Pattern RFC3339_INSTANT = Pattern.compile(
             "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T" +
             "([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?" +
@@ -1072,10 +1077,263 @@ public final class JsonCqlEvaluator {
                             "strpos(" + column + ", '\"adjudicatedIds\": []') > 0)";
                     return new PrefilterClause(expr, List.of(), true);
                 }
+                if (expected instanceof Number &&
+                        !"adjudicatedIdsCount".equals(property.getPropertyName()) &&
+                        SAFE_JSON_DOLLAR_PATH.matcher(property.getPropertyName()).matches()) {
+                    String dec = formatExactDecimal38_9(expected);
+                    if (dec != null) {
+                        String jsonPath = "'$." + property.getPropertyName() + "'";
+                        List<Object> params = new ArrayList<>(2);
+                        StringBuilder expr = new StringBuilder();
+                        if (leafKey != null) {
+                            expr.append("strpos(").append(column).append(", ?) > 0 AND ");
+                            params.add(leafKey);
+                        }
+                        expr.append("(json_type(").append(column).append(", ").append(jsonPath)
+                                .append(") = 'ARRAY' OR (json_type(").append(column).append(", ").append(jsonPath)
+                                .append(") IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND TRY_CAST(json_extract(")
+                                .append(column).append(", ").append(jsonPath)
+                                .append(") AS DECIMAL(38, 9)) = CAST(? AS DECIMAL(38, 9))))");
+                        params.add(dec);
+                        return new PrefilterClause(expr.toString(), params, true);
+                    }
+                }
+            } else if ((comparison instanceof PropertyIsGreaterThan ||
+                    comparison instanceof PropertyIsGreaterThanOrEqualTo ||
+                    comparison instanceof PropertyIsLessThan ||
+                    comparison instanceof PropertyIsLessThanOrEqualTo) &&
+                    !"adjudicatedIdsCount".equals(property.getPropertyName()) &&
+                    SAFE_JSON_DOLLAR_PATH.matcher(property.getPropertyName()).matches() &&
+                    (expected instanceof Number ||
+                            (expected instanceof String text && parseRfc3339Instant(text) == null))) {
+                String dec = formatExactDecimal38_9(expected);
+                if (dec != null) {
+                    String sqlOp = sqlComparisonOp(comparison);
+                    String jsonPath = "'$." + property.getPropertyName() + "'";
+                    List<Object> params = new ArrayList<>(2);
+                    StringBuilder expr = new StringBuilder();
+                    if (leafKey != null) {
+                        expr.append("strpos(").append(column).append(", ?) > 0 AND ");
+                        params.add(leafKey);
+                    }
+                    expr.append("json_type(").append(column).append(", ").append(jsonPath)
+                            .append(") IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND TRY_CAST(json_extract(")
+                            .append(column).append(", ").append(jsonPath)
+                            .append(") AS DECIMAL(38, 9)) ").append(sqlOp).append(" CAST(? AS DECIMAL(38, 9))");
+                    params.add(dec);
+                    return new PrefilterClause(expr.toString(), params, true);
+                }
             }
             return leafKey == null ? null : leafKeyPrefilter(property.getPropertyName(), column);
         }
         return null;
+    }
+
+    public record ExactDuckDbPredicate(String sql, List<Object> parameters) {}
+
+    /**
+     * Compiles {@code filter} into an exact DuckDB SQL predicate over JSON column
+     * {@code column} when every AST node is 100% equivalent to {@link #matches(Filter, String)},
+     * allowing {@code countCql} to aggregate {@code GROUP BY filename} natively inside
+     * DuckDB without transferring {@code result_json} strings across JDBC/JNI.
+     */
+    public static Optional<ExactDuckDbPredicate> tryBuildExactDuckDbPredicate(Filter filter, String column) {
+        if (filter == null || filter == Filter.INCLUDE)
+            return Optional.of(new ExactDuckDbPredicate("TRUE", List.of()));
+        if (filter == Filter.EXCLUDE)
+            return Optional.of(new ExactDuckDbPredicate("FALSE", List.of()));
+        ExactDuckDbPredicate node = buildExactDuckDbNode(filter, column);
+        if (node == null)
+            return Optional.empty();
+        if ("FALSE".equals(node.sql()))
+            return Optional.of(node);
+        return Optional.of(new ExactDuckDbPredicate(
+                "json_type(" + column + ") = 'OBJECT' AND (" + node.sql() + ")",
+                node.parameters()));
+    }
+
+    private static ExactDuckDbPredicate buildExactDuckDbNode(Filter filter, String column) {
+        if (filter == Filter.INCLUDE)
+            return new ExactDuckDbPredicate("TRUE", List.of());
+        if (filter == Filter.EXCLUDE)
+            return new ExactDuckDbPredicate("FALSE", List.of());
+        if (filter instanceof And and) {
+            if (and.getChildren().isEmpty())
+                return new ExactDuckDbPredicate("TRUE", List.of());
+            List<String> clauses = new ArrayList<>(and.getChildren().size());
+            List<Object> params = new ArrayList<>();
+            for (Filter child : and.getChildren()) {
+                ExactDuckDbPredicate sub = buildExactDuckDbNode(child, column);
+                if (sub == null)
+                    return null;
+                if ("FALSE".equals(sub.sql()))
+                    return new ExactDuckDbPredicate("FALSE", List.of());
+                if (!"TRUE".equals(sub.sql())) {
+                    clauses.add("(" + sub.sql() + ")");
+                    params.addAll(sub.parameters());
+                }
+            }
+            return clauses.isEmpty()
+                    ? new ExactDuckDbPredicate("TRUE", List.of())
+                    : new ExactDuckDbPredicate(String.join(" AND ", clauses), params);
+        }
+        if (filter instanceof Or or) {
+            if (or.getChildren().isEmpty())
+                return new ExactDuckDbPredicate("FALSE", List.of());
+            List<String> clauses = new ArrayList<>(or.getChildren().size());
+            List<Object> params = new ArrayList<>();
+            for (Filter child : or.getChildren()) {
+                ExactDuckDbPredicate sub = buildExactDuckDbNode(child, column);
+                if (sub == null)
+                    return null;
+                if ("TRUE".equals(sub.sql()))
+                    return new ExactDuckDbPredicate("TRUE", List.of());
+                if (!"FALSE".equals(sub.sql())) {
+                    clauses.add("(" + sub.sql() + ")");
+                    params.addAll(sub.parameters());
+                }
+            }
+            return clauses.isEmpty()
+                    ? new ExactDuckDbPredicate("FALSE", List.of())
+                    : new ExactDuckDbPredicate(String.join(" OR ", clauses), params);
+        }
+        if (filter instanceof Not not) {
+            ExactDuckDbPredicate sub = buildExactDuckDbNode(not.getFilter(), column);
+            if (sub == null)
+                return null;
+            return new ExactDuckDbPredicate("NOT (" + sub.sql() + ")", sub.parameters());
+        }
+        if (filter instanceof BinaryComparisonOperator cmp) {
+            if (!(cmp.getExpression1() instanceof PropertyName property) ||
+                    !(cmp.getExpression2() instanceof Literal literal))
+                return null;
+            String path = property.getPropertyName();
+            Object expected = literal.getValue();
+            if (expected == null || path == null || !SAFE_JSON_DOLLAR_PATH.matcher(path).matches())
+                return null;
+            String jsonPath = "'$." + path + "'";
+            String leafKey = extractSafeLeafKey(path);
+
+            if ("adjudicatedIdsCount".equals(path)) {
+                String sqlOp = sqlComparisonOp(cmp);
+                if (sqlOp == null)
+                    return null;
+                if (cmp instanceof PropertyIsEqualTo && !(expected instanceof Number))
+                    return null;
+                String dec = formatExactDecimal38_9(expected);
+                if (dec == null)
+                    return null;
+                String expr = "(CASE " +
+                        "WHEN json_type(" + column + ", '$.adjudicatedIdsCount') IN ('UBIGINT', 'BIGINT', 'DOUBLE') " +
+                        "THEN TRY_CAST(json_extract(" + column + ", '$.adjudicatedIdsCount') AS DECIMAL(38, 9)) " +
+                        "WHEN (json_type(" + column + ", '$.adjudicatedIdsCount') IS NULL OR " +
+                        "json_type(" + column + ", '$.adjudicatedIdsCount') = 'NULL') AND " +
+                        "json_type(" + column + ", '$.adjudicatedIds') = 'ARRAY' " +
+                        "THEN CAST(json_array_length(json_extract(" + column + ", '$.adjudicatedIds')) AS DECIMAL(38, 9)) " +
+                        "ELSE NULL END " + sqlOp + " CAST(? AS DECIMAL(38, 9)))";
+                return new ExactDuckDbPredicate(expr, List.of(dec));
+            }
+
+            if (cmp instanceof PropertyIsGreaterThan ||
+                    cmp instanceof PropertyIsGreaterThanOrEqualTo ||
+                    cmp instanceof PropertyIsLessThan ||
+                    cmp instanceof PropertyIsLessThanOrEqualTo) {
+                if (expected instanceof String text && parseRfc3339Instant(text) != null)
+                    return null;
+                String dec = formatExactDecimal38_9(expected);
+                if (dec == null)
+                    return null;
+                String sqlOp = sqlComparisonOp(cmp);
+                List<Object> params = new ArrayList<>(2);
+                StringBuilder sb = new StringBuilder("(");
+                if (leafKey != null) {
+                    sb.append("(strpos(").append(column).append(", ?) > 0 OR strpos(")
+                            .append(column).append(", '\\u') > 0) AND ");
+                    params.add(leafKey);
+                }
+                sb.append("json_type(").append(column).append(", ").append(jsonPath)
+                        .append(") IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND TRY_CAST(json_extract(")
+                        .append(column).append(", ").append(jsonPath)
+                        .append(") AS DECIMAL(38, 9)) ").append(sqlOp).append(" CAST(? AS DECIMAL(38, 9)))");
+                params.add(dec);
+                return new ExactDuckDbPredicate(sb.toString(), params);
+            }
+
+            if (cmp instanceof PropertyIsEqualTo && EXACT_DUCKDB_SCALAR_KEYS.contains(path)) {
+                if (expected instanceof Boolean boolVal) {
+                    String token = boolVal ? "true" : "false";
+                    String expr = "((strpos(" + column + ", ?) > 0 OR strpos(" + column + ", '\\u') > 0) AND " +
+                            "json_type(" + column + ", " + jsonPath + ") = 'BOOLEAN' AND " +
+                            "CAST(json_extract(" + column + ", " + jsonPath + ") AS BOOLEAN) = ?)";
+                    return new ExactDuckDbPredicate(expr, List.of(token, boolVal));
+                }
+                if (expected instanceof Number) {
+                    String dec = formatExactDecimal38_9(expected);
+                    if (dec == null)
+                        return null;
+                    String expr = "((strpos(" + column + ", ?) > 0 OR strpos(" + column + ", '\\u') > 0) AND " +
+                            "json_type(" + column + ", " + jsonPath + ") IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND " +
+                            "TRY_CAST(json_extract(" + column + ", " + jsonPath +
+                            ") AS DECIMAL(38, 9)) = CAST(? AS DECIMAL(38, 9)))";
+                    return new ExactDuckDbPredicate(expr, List.of(path, dec));
+                }
+                if (expected instanceof String text) {
+                    List<Object> params = new ArrayList<>(2);
+                    StringBuilder sb = new StringBuilder("(");
+                    if (!text.isEmpty() && SAFE_JSON_STRING_LITERAL.matcher(text).matches()) {
+                        if (cmp.isMatchingCase()) {
+                            sb.append("(strpos(").append(column).append(", ?) > 0 OR strpos(")
+                                    .append(column).append(", '\\u') > 0) AND ");
+                            params.add(text);
+                        } else {
+                            sb.append("(strpos(lower(").append(column).append("), ?) > 0 OR strpos(")
+                                    .append(column).append(", '\\u') > 0) AND ");
+                            params.add(text.toLowerCase(Locale.ROOT));
+                        }
+                    }
+                    sb.append("json_type(").append(column).append(", ").append(jsonPath).append(") = 'VARCHAR' AND ");
+                    if (cmp.isMatchingCase()) {
+                        sb.append("json_extract_string(").append(column).append(", ").append(jsonPath).append(") = ?)");
+                        params.add(text);
+                    } else {
+                        sb.append("lower(json_extract_string(").append(column).append(", ").append(jsonPath)
+                                .append(")) = lower(?))");
+                        params.add(text);
+                    }
+                    return new ExactDuckDbPredicate(sb.toString(), params);
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String sqlComparisonOp(BinaryComparisonOperator cmp) {
+        if (cmp instanceof PropertyIsEqualTo)
+            return "=";
+        if (cmp instanceof PropertyIsGreaterThan)
+            return ">";
+        if (cmp instanceof PropertyIsGreaterThanOrEqualTo)
+            return ">=";
+        if (cmp instanceof PropertyIsLessThan)
+            return "<";
+        if (cmp instanceof PropertyIsLessThanOrEqualTo)
+            return "<=";
+        return null;
+    }
+
+    private static String formatExactDecimal38_9(Object value) {
+        if (!(value instanceof Number || value instanceof String))
+            return null;
+        try {
+            BigDecimal bd = new BigDecimal(value.toString()).stripTrailingZeros();
+            int scale = Math.max(0, bd.scale());
+            int integerDigits = bd.precision() - bd.scale();
+            if (scale > 9 || integerDigits > 29)
+                return null;
+            return bd.toPlainString();
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
     }
 
     /**

@@ -650,6 +650,7 @@ public final class ParquetArchiveReader {
     private static final int MAX_INLINE_MUTATION_EXCLUSIONS = 4_096;
     private static final int MAX_RESULT_TIME_METADATA_BATCH = 64;
     private static final int MAX_CQL_PAYLOAD_BATCH = 128;
+    private static final int MAX_CQL_AGGREGATE_BATCH = 512;
     private static final int LOCAL_STAGE_COPY_RETRIES = 3;
 
     /**
@@ -1062,10 +1063,18 @@ public final class ParquetArchiveReader {
                     exclusions, excludedIdsByGeneration, summariesByGeneration);
         }
 
+        JsonCqlEvaluator.ExactDuckDbPredicate exactPredicate = filter.getCQLFilter() != null
+                ? JsonCqlEvaluator.tryBuildExactDuckDbPredicate(filter.getCQLFilter(), "result_json").orElse(null)
+                : null;
+        NavigableSet<Long> allSortedExclusions = exclusions.isEmpty()
+                ? Collections.emptyNavigableSet()
+                : new TreeSet<>(exclusions);
+
         long total = 0;
         DuckDbResourcePolicy.Session duckSession = null;
         try {
-            for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_CQL_PAYLOAD_BATCH)) {
+            int batchSize = exactPredicate != null ? MAX_CQL_AGGREGATE_BATCH : MAX_CQL_PAYLOAD_BATCH;
+            for (List<ArchiveGeneration> batch : batchWindowClusters(generations, batchSize)) {
                 throwIfInterruptedOrCancelled();
                 AuthorizedObjects objects = authorize(batch);
                 if (objects.byFilename().isEmpty())
@@ -1089,9 +1098,12 @@ public final class ParquetArchiveReader {
                     cqlCountDuckDbSessionOpens.incrementAndGet();
                 }
                 cqlCountScannedGenerations.addAndGet(unprunedMap.size());
+                List<Long> batchSortedExclusions = resolveBatchSortedExclusions(
+                        unprunedMap.values(), allSortedExclusions, excludedIdsByGeneration);
                 total = Math.addExact(total, countCqlAuthorizedBatch(
                         duckSession, activeBatch, unprunedMap.size(), filter,
-                        allowedDataStreams, allowedFois, exclusions, null));
+                        allowedDataStreams, allowedFois, exclusions, batchSortedExclusions,
+                        exactPredicate, null));
                 if (total >= filter.getLimit()) {
                     duckSession.close();
                     duckSession = null;
@@ -1192,9 +1204,17 @@ public final class ParquetArchiveReader {
         if (uncached.isEmpty())
             return total;
 
+        JsonCqlEvaluator.ExactDuckDbPredicate exactPredicate = filter.getCQLFilter() != null
+                ? JsonCqlEvaluator.tryBuildExactDuckDbPredicate(filter.getCQLFilter(), "result_json").orElse(null)
+                : null;
+        NavigableSet<Long> allSortedExclusions = excludedNav != null
+                ? excludedNav
+                : (exclusions.isEmpty() ? Collections.emptyNavigableSet() : new TreeSet<>(exclusions));
+        int batchSize = exactPredicate != null ? MAX_CQL_AGGREGATE_BATCH : MAX_CQL_PAYLOAD_BATCH;
+
         DuckDbResourcePolicy.Session duckSession = null;
         try {
-            for (List<ArchiveGeneration> batch : batchWindowClusters(uncached, MAX_CQL_PAYLOAD_BATCH)) {
+            for (List<ArchiveGeneration> batch : batchWindowClusters(uncached, batchSize)) {
                 throwIfInterruptedOrCancelled();
                 Map<String, ArchiveGeneration> batchMap = new LinkedHashMap<>(batch.size() * 2);
                 for (ArchiveGeneration generation : batch) {
@@ -1211,9 +1231,11 @@ public final class ParquetArchiveReader {
                 cqlCountScannedGenerations.addAndGet(batchMap.size());
                 Map<UUID, Long> perGenCounts = cacheKeyByGenId.isEmpty() ? null : new HashMap<>(batch.size() * 2);
                 AuthorizedObjects batchObjects = new AuthorizedObjects(batchMap, allAuthorized.stampsByGenId());
+                List<Long> batchSortedExclusions = resolveBatchSortedExclusions(
+                        batchMap.values(), allSortedExclusions, excludedIdsByGeneration);
                 long batchTotal = countCqlAuthorizedBatch(
                         duckSession, batchObjects, batch.size(), filter, allowedDataStreams, allowedFois,
-                        exclusions, perGenCounts);
+                        exclusions, batchSortedExclusions, exactPredicate, perGenCounts);
                 total = Math.addExact(total, batchTotal);
                 if (perGenCounts != null) {
                     for (ArchiveGeneration generation : batch) {
@@ -1518,6 +1540,39 @@ public final class ParquetArchiveReader {
         return new QueryPlan(sql.toString(), parameters);
     }
 
+    private static List<Long> resolveBatchSortedExclusions(
+            Collection<ArchiveGeneration> batchGenerations,
+            NavigableSet<Long> allSortedExclusions,
+            Map<UUID, Set<Long>> excludedIdsByGeneration) {
+        if (excludedIdsByGeneration != null) {
+            NavigableSet<Long> scoped = new TreeSet<>();
+            for (ArchiveGeneration gen : batchGenerations) {
+                Set<Long> genIds = excludedIdsByGeneration.get(gen.id());
+                if (genIds != null && !genIds.isEmpty())
+                    scoped.addAll(genIds);
+            }
+            return scoped.isEmpty() ? List.of() : List.copyOf(scoped);
+        }
+        if (allSortedExclusions == null || allSortedExclusions.isEmpty())
+            return List.of();
+        long minId = Long.MAX_VALUE;
+        long maxId = Long.MIN_VALUE;
+        for (ArchiveGeneration gen : batchGenerations) {
+            if (gen.rowCount() <= 0L)
+                continue;
+            if (gen.minimumId() > gen.maximumId())
+                return List.copyOf(allSortedExclusions);
+            if (gen.minimumId() < minId)
+                minId = gen.minimumId();
+            if (gen.maximumId() > maxId)
+                maxId = gen.maximumId();
+        }
+        if (minId > maxId)
+            return List.of();
+        NavigableSet<Long> slice = allSortedExclusions.subSet(minId, true, maxId, true);
+        return slice.isEmpty() ? List.of() : List.copyOf(slice);
+    }
+
     private long countCqlAuthorizedBatch(
             DuckDbResourcePolicy.Session duckSession,
             AuthorizedObjects objects,
@@ -1526,22 +1581,40 @@ public final class ParquetArchiveReader {
             Set<Long> allowedDataStreams,
             Set<Long> allowedFois,
             Set<Long> excludedIds,
+            List<Long> batchSortedExclusions,
+            JsonCqlEvaluator.ExactDuckDbPredicate exactPredicate,
             Map<UUID, Long> perGenCounts) {
+        boolean useExactAggregate = exactPredicate != null &&
+                batchSortedExclusions.size() <= MAX_INLINE_MUTATION_EXCLUSIONS;
         try {
             if (shouldProactivelyStage(objects, duckSession.operationDirectory())) {
                 AuthorizedObjects staged = stageAuthorizedObjectsLocally(objects, duckSession.operationDirectory());
                 try {
-                    return executeCountCqlPlan(
-                            duckSession, cqlCountPlan(staged, filter, allowedDataStreams, allowedFois),
-                            staged, filter, excludedIds, false, perGenCounts);
+                    return useExactAggregate
+                            ? executeExactAggregateCountCqlPlan(
+                                    duckSession,
+                                    cqlExactAggregateCountPlan(
+                                            staged, filter, allowedDataStreams, allowedFois,
+                                            batchSortedExclusions, exactPredicate),
+                                    staged, filter, false, perGenCounts)
+                            : executeCountCqlPlan(
+                                    duckSession, cqlCountPlan(staged, filter, allowedDataStreams, allowedFois),
+                                    staged, filter, excludedIds, false, perGenCounts);
                 } finally {
                     cleanupStagedBatchObjects(staged);
                 }
             }
             try {
-                return executeCountCqlPlan(
-                        duckSession, cqlCountPlan(objects, filter, allowedDataStreams, allowedFois),
-                        objects, filter, excludedIds, true, perGenCounts);
+                return useExactAggregate
+                        ? executeExactAggregateCountCqlPlan(
+                                duckSession,
+                                cqlExactAggregateCountPlan(
+                                        objects, filter, allowedDataStreams, allowedFois,
+                                        batchSortedExclusions, exactPredicate),
+                                objects, filter, true, perGenCounts)
+                        : executeCountCqlPlan(
+                                duckSession, cqlCountPlan(objects, filter, allowedDataStreams, allowedFois),
+                                objects, filter, excludedIds, true, perGenCounts);
             } catch (Exception directError) {
                 if (!isTransientReadMemoryError(directError))
                     throw directError;
@@ -1549,9 +1622,16 @@ public final class ParquetArchiveReader {
                     perGenCounts.clear();
                 AuthorizedObjects staged = stageAuthorizedObjectsLocally(objects, duckSession.operationDirectory());
                 try {
-                    return executeCountCqlPlan(
-                            duckSession, cqlCountPlan(staged, filter, allowedDataStreams, allowedFois),
-                            staged, filter, excludedIds, false, perGenCounts);
+                    return useExactAggregate
+                            ? executeExactAggregateCountCqlPlan(
+                                    duckSession,
+                                    cqlExactAggregateCountPlan(
+                                            staged, filter, allowedDataStreams, allowedFois,
+                                            batchSortedExclusions, exactPredicate),
+                                    staged, filter, false, perGenCounts)
+                            : executeCountCqlPlan(
+                                    duckSession, cqlCountPlan(staged, filter, allowedDataStreams, allowedFois),
+                                    staged, filter, excludedIds, false, perGenCounts);
                 } finally {
                     cleanupStagedBatchObjects(staged);
                 }
@@ -1577,6 +1657,84 @@ public final class ParquetArchiveReader {
                 Files.deleteIfExists(parent);
             } catch (Exception ignored) {
             }
+        }
+    }
+
+    private QueryPlan cqlExactAggregateCountPlan(
+            AuthorizedObjects objects,
+            ObsFilter filter,
+            Set<Long> allowedDataStreams,
+            Set<Long> allowedFois,
+            List<Long> batchSortedExclusions,
+            JsonCqlEvaluator.ExactDuckDbPredicate exactPredicate) {
+        String fileList = objects.byFilename().keySet().stream()
+                .map(path -> "'" + sqlLiteral(path) + "'")
+                .collect(Collectors.joining(","));
+        StringBuilder sql = new StringBuilder("SELECT filename, COUNT(*) FROM read_parquet([")
+                .append(fileList).append("], filename=true) WHERE true");
+        List<Object> parameters = new ArrayList<>();
+        if (filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty())
+            appendIn(sql, "id_value", filter.getInternalIDs().stream().map(BigId::getIdAsLong).toList(), parameters);
+        if (!batchSortedExclusions.isEmpty())
+            appendNotIn(sql, "id_value", batchSortedExclusions, parameters);
+        if (allowedDataStreams != null)
+            appendIn(sql, "datastream_id", allowedDataStreams, parameters);
+        if (allowedFois != null) {
+            Set<Long> explicitFois = allowedFois.stream().filter(id -> id != 0L).collect(Collectors.toSet());
+            if (allowedFois.contains(0L)) {
+                sql.append(" AND (foi_id IS NULL");
+                if (!explicitFois.isEmpty()) {
+                    sql.append(" OR foi_id IN (");
+                    appendPlaceholders(sql, explicitFois.size());
+                    sql.append(')');
+                    parameters.addAll(explicitFois);
+                }
+                sql.append(')');
+            } else {
+                appendIn(sql, "foi_id", explicitFois, parameters);
+            }
+        }
+        appendTime(sql, "phenomenon_time", filter.getPhenomenonTime(), parameters);
+        appendTime(sql, "result_time", filter.getResultTime(), parameters);
+        if ("FALSE".equals(exactPredicate.sql())) {
+            sql.append(" AND FALSE");
+        } else if (!"TRUE".equals(exactPredicate.sql())) {
+            sql.append(" AND (").append(exactPredicate.sql()).append(')');
+            parameters.addAll(exactPredicate.parameters());
+        }
+        sql.append(" GROUP BY filename");
+        return new QueryPlan(sql.toString(), parameters);
+    }
+
+    private long executeExactAggregateCountCqlPlan(
+            DuckDbResourcePolicy.Session duckSession,
+            QueryPlan plan,
+            AuthorizedObjects objects,
+            ObsFilter filter,
+            boolean directRead,
+            Map<UUID, Long> perGenCounts) throws Exception {
+        if (directRead)
+            maybeInjectDirectReadFault(objects);
+        long matched = 0;
+        try (PreparedStatement statement = ConnectionManager.trackCancellableStatement(
+                     duckSession.connection().prepareStatement(plan.sql()), "DuckDB cold CQL aggregate count")) {
+            bind(statement, plan.parameters());
+            try (ResultSet result = statement.executeQuery()) {
+                while (nextCancellable(result)) {
+                    String filename = result.getString(1);
+                    long fileCount = result.getLong(2);
+                    if (fileCount <= 0L)
+                        continue;
+                    if (perGenCounts != null) {
+                        ArchiveGeneration generation = generationForFilename(objects, filename);
+                        perGenCounts.merge(generation.id(), fileCount, Math::addExact);
+                    }
+                    matched = Math.addExact(matched, fileCount);
+                    if (filter.getLimit() != Long.MAX_VALUE && matched >= filter.getLimit())
+                        return filter.getLimit();
+                }
+            }
+            return matched;
         }
     }
 
