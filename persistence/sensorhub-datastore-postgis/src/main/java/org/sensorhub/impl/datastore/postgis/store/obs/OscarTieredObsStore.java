@@ -81,6 +81,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -1132,9 +1133,9 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 .build();
         if (plan.overflowCandidates().isEmpty()) {
             return new ColdOffsetStream(
-                    streamColdBasesFromPreprunedCandidates(
+                    lazyStream(() -> streamColdBasesFromPreprunedCandidates(
                             plan.primaryCandidates(), coldStreamFilter, remainingReaderLimit,
-                            dataStreams, null, hasMutations, mutationBatchSize),
+                            dataStreams, null, hasMutations, mutationBatchSize)),
                     skipped);
         }
         java.util.concurrent.atomic.AtomicLong emitted = new java.util.concurrent.atomic.AtomicLong();
@@ -1261,8 +1262,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 hotEntries = hotStream.toList();
             }
             hot = hotEntries.stream();
-            cold = streamColdBasesForLatest(tierFilter, tierLimit,
-                    dataStreams, fois, hotEntries, effectiveHasMutations);
+            cold = lazyStream(() -> streamColdBasesForLatest(tierFilter, tierLimit,
+                    dataStreams, fois, hotEntries, effectiveHasMutations));
         } else if (boundedMerge && filter.getLimit() <= STREAM_FETCH_SIZE) {
             List<Entry<BigId, IObsData>> hotEntries;
             try (Stream<Entry<BigId, IObsData>> hotStream =
@@ -1277,15 +1278,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             Instant hotBoundaryTime = (filter.getLimit() > 0 && hotEntries.size() >= filter.getLimit())
                     ? hotEntries.get((int) filter.getLimit() - 1).getValue().getPhenomenonTime()
                     : null;
-            cold = streamColdBases(tierFilter, filter.getLimit(), tierLimit,
-                    dataStreams, fois, effectiveHasMutations, mutationBatchSize, hotBoundaryTime);
+            cold = lazyStream(() -> streamColdBases(tierFilter, filter.getLimit(), tierLimit,
+                    dataStreams, fois, effectiveHasMutations, mutationBatchSize, hotBoundaryTime));
         } else {
             hot = super.selectEntries(tierFilter, (Set<ObsField>) null,
                     false, initialHotPageSize);
             if (effectiveHasMutations)
                 hot = excludeMutated(hot, entry -> entry.getKey().getIdAsLong(), mutationBatchSize);
-            cold = streamColdBases(tierFilter, filter.getLimit(), tierLimit,
-                    dataStreams, fois, effectiveHasMutations, mutationBatchSize, null);
+            cold = lazyStream(() -> streamColdBases(tierFilter, filter.getLimit(), tierLimit,
+                    dataStreams, fois, effectiveHasMutations, mutationBatchSize, null));
         }
         boolean smallPlainRead = !latest && filter.getCQLFilter() == null &&
                 filter.getValuePredicate() == null &&
@@ -1296,7 +1297,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 : 1_000;
         Stream<Entry<BigId, IObsData>> overlays = parentTableOnly
                 ? Stream.empty()
-                : streamOverlays(tierFilter, dataStreams, fois, hasOverlays, overlayInitialPageSize);
+                : lazyStream(() -> streamOverlays(tierFilter, dataStreams, fois, hasOverlays, overlayInitialPageSize));
 
         // Each source is already ordered by phenomenon time and ID. Merge it
         // lazily so cold payloads are never accumulated in a JVM collection.
@@ -2258,8 +2259,39 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 .onClose(iterator::close);
     }
 
+    /**
+     * Defers opening a resource-backed stream (such as a cold DuckDB Parquet
+     * cursor or JDBC overlay cursor) until terminal iteration actually begins,
+     * while propagating explicit {@link Stream#close()} if opened.
+     */
+    static <T> Stream<T> lazyStream(Supplier<Stream<T>> supplier) {
+        AtomicReference<Stream<T>> opened = new AtomicReference<>();
+        AtomicBoolean closed = new AtomicBoolean();
+        Supplier<Spliterator<T>> spliteratorSupplier = () -> {
+            if (closed.get())
+                return Spliterators.emptySpliterator();
+            Stream<T> delegate = supplier.get();
+            opened.set(delegate);
+            if (closed.get()) {
+                Stream<T> raced = opened.getAndSet(null);
+                if (raced != null)
+                    raced.close();
+                return Spliterators.emptySpliterator();
+            }
+            return delegate.spliterator();
+        };
+        return StreamSupport.stream(spliteratorSupplier,
+                        Spliterator.ORDERED | Spliterator.NONNULL, false)
+                .onClose(() -> {
+                    closed.set(true);
+                    Stream<T> delegate = opened.getAndSet(null);
+                    if (delegate != null)
+                        delegate.close();
+                });
+    }
+
     /** Closes the upstream stream as soon as its externally visible limit is reached. */
-    private static <T> Stream<T> limitAndClose(Stream<T> source, long limit) {
+    static <T> Stream<T> limitAndClose(Stream<T> source, long limit) {
         if (limit == Long.MAX_VALUE)
             return source;
         if (limit < 0) {
@@ -2272,11 +2304,16 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 .onClose(iterator::close);
     }
 
+    static <T> Stream<T> mergeSortedForTest(
+            Stream<T> preferred, Stream<T> other, Comparator<? super T> comparator) {
+        return mergeSorted(preferred, other, comparator);
+    }
+
     private static final class MergingIterator<T> implements Iterator<T>, AutoCloseable {
         private final Stream<T> leftStream;
         private final Stream<T> rightStream;
-        private final Iterator<T> left;
-        private final Iterator<T> right;
+        private Iterator<T> left;
+        private Iterator<T> right;
         private final Comparator<? super T> comparator;
         private final AtomicBoolean closed = new AtomicBoolean();
         private T leftValue;
@@ -2290,8 +2327,6 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         Comparator<? super T> comparator) {
             this.leftStream = leftStream;
             this.rightStream = rightStream;
-            this.left = leftStream.iterator();
-            this.right = rightStream.iterator();
             this.comparator = comparator;
         }
 
@@ -2349,6 +2384,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
         private void loadLeft() {
             if (!leftReady && !leftEnded) {
+                if (left == null)
+                    left = leftStream.iterator();
                 if (left.hasNext()) {
                     leftValue = left.next();
                     leftReady = true;
@@ -2360,6 +2397,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
         private void loadRight() {
             if (!rightReady && !rightEnded) {
+                if (right == null)
+                    right = rightStream.iterator();
                 if (right.hasNext()) {
                     rightValue = right.next();
                     rightReady = true;
@@ -2389,7 +2428,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         static final int LOOKUP_BATCH_SIZE = 1_000;
 
         private final Stream<T> source;
-        private final Iterator<T> sourceIterator;
+        private Iterator<T> sourceIterator;
         private final ToLongFunction<T> idExtractor;
         private final Function<Collection<Long>, Set<Long>> exclusionLookup;
         private final ArrayDeque<T> ready = new ArrayDeque<>();
@@ -2401,7 +2440,6 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                                   Function<Collection<Long>, Set<Long>> exclusionLookup,
                                   int initialBatchSize) {
             this.source = source;
-            this.sourceIterator = source.iterator();
             this.idExtractor = idExtractor;
             this.exclusionLookup = exclusionLookup;
             this.currentBatchSize = Math.min(LOOKUP_BATCH_SIZE, Math.max(1, initialBatchSize));
@@ -2424,6 +2462,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         }
 
         private void fillPage() {
+            if (sourceIterator == null)
+                sourceIterator = source.iterator();
             int batchTarget = currentBatchSize;
             List<T> page = new ArrayList<>(batchTarget);
             List<Long> ids = new ArrayList<>(batchTarget);
@@ -2464,14 +2504,13 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
     private static final class ClosingLimitIterator<T> implements Iterator<T>, AutoCloseable {
         private final Stream<T> source;
-        private final Iterator<T> iterator;
+        private Iterator<T> iterator;
         private final long limit;
         private final AtomicBoolean closed = new AtomicBoolean();
         private long emitted;
 
         ClosingLimitIterator(Stream<T> source, long limit) {
             this.source = source;
-            this.iterator = source.iterator();
             this.limit = limit;
             if (limit == 0)
                 close();
@@ -2482,6 +2521,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             if (closed.get() || emitted >= limit)
                 return false;
             try {
+                if (iterator == null)
+                    iterator = source.iterator();
                 boolean available = iterator.hasNext();
                 if (!available)
                     close();
