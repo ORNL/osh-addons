@@ -20,6 +20,7 @@ import org.geotools.api.filter.PropertyIsLike;
 import org.geotools.api.filter.PropertyIsNotEqualTo;
 import org.geotools.api.filter.expression.Literal;
 import org.geotools.api.filter.expression.PropertyName;
+import org.sensorhub.impl.datastore.postgis.archive.ParquetArchiveReader;
 
 import java.io.StringReader;
 import java.math.BigDecimal;
@@ -291,6 +292,29 @@ public final class JsonCqlEvaluator {
             if (!faultColumns.isEmpty()) {
                 String expr = "(" + String.join(" + ", faultColumns) + ")";
                 return Optional.of(new SummaryCounterSpec(expr, expr, "s.summary_populated"));
+            }
+            if (!or.getChildren().isEmpty()) {
+                List<String> childUpperExprs = new ArrayList<>(or.getChildren().size());
+                boolean allChildrenBounded = true;
+                for (Filter child : or.getChildren()) {
+                    Optional<SummaryCounterSpec> childSpec = summaryCounterSpec(child);
+                    if (childSpec.isEmpty() || "COALESCE(s.row_count, 0)".equals(childSpec.get().upperBoundExpr())) {
+                        allChildrenBounded = false;
+                        break;
+                    }
+                    if (!"0::bigint".equals(childSpec.get().upperBoundExpr())) {
+                        childUpperExprs.add(childSpec.get().upperBoundExpr());
+                    }
+                }
+                if (allChildrenBounded) {
+                    if (childUpperExprs.isEmpty()) {
+                        return Optional.of(new SummaryCounterSpec("0::bigint", "0::bigint", "true"));
+                    }
+                    String sumUpper = childUpperExprs.size() == 1
+                            ? childUpperExprs.get(0)
+                            : "(" + String.join(" + ", childUpperExprs) + ")";
+                    return Optional.of(new SummaryCounterSpec(sumUpper, "0::bigint", "false"));
+                }
             }
         }
         return Optional.empty();
@@ -582,7 +606,22 @@ public final class JsonCqlEvaluator {
                         maxContainedEnd = maxContainedEnd == null || safeEnd.isBefore(maxContainedEnd)
                                 ? safeEnd : maxContainedEnd;
                     } else {
-                        Instant safeStart = parsed.plus(safetyMargin);
+                        Instant safeStart;
+                        if ("endTime".equals(name)) {
+                            // Occupancy records always satisfy endTime >= phenomenonTime across
+                            // Rapiscan, Aspect, and RS350 streams, so any generation whose windowStart
+                            // lies after the cutoff (with 1 ms tolerance for millisecond ISO rendering)
+                            // tautologically satisfies the endTime lower bound for every row.
+                            if (child instanceof PropertyIsGreaterThan) {
+                                safeStart = parsed.plusMillis(1L);
+                            } else {
+                                safeStart = parsed.getNano() % 1_000_000 == 0
+                                        ? parsed
+                                        : parsed.plusMillis(1L);
+                            }
+                        } else {
+                            safeStart = parsed.plus(safetyMargin);
+                        }
                         minContainedStart = minContainedStart == null || safeStart.isAfter(minContainedStart)
                                 ? safeStart : minContainedStart;
                     }
@@ -1977,5 +2016,92 @@ public final class JsonCqlEvaluator {
                 return BIT_RS350_NEUTRON;
         }
         return 0;
+    }
+
+    /**
+     * Conservatively proves whether boolean algebra over {@code filter} and
+     * {@code summary} strictly guarantees zero matching base rows in the
+     * generation without opening DuckDB. Never infers zero matches from inside
+     * {@link Not} or {@link PropertyIsNotEqualTo} predicates or unpopulated
+     * summaries.
+     */
+    public static boolean isGuaranteedZeroMatchBySummary(
+            Filter filter, ParquetArchiveReader.GenerationSummary summary) {
+        if (filter == Filter.EXCLUDE)
+            return true;
+        if (summary == null || !summary.populated())
+            return false;
+        if (summary.rowCount() <= 0L)
+            return true;
+        return isZeroMatchNode(filter, summary);
+    }
+
+    private static boolean isZeroMatchNode(
+            Filter filter, ParquetArchiveReader.GenerationSummary summary) {
+        if (filter == Filter.EXCLUDE)
+            return true;
+        if (filter == null || filter == Filter.INCLUDE)
+            return summary.rowCount() <= 0L;
+        if (filter instanceof Or or) {
+            if (or.getChildren().isEmpty())
+                return false;
+            for (Filter child : or.getChildren()) {
+                if (!isZeroMatchNode(child, summary))
+                    return false;
+            }
+            return true;
+        }
+        if (filter instanceof And and) {
+            List<Filter> conjuncts = new ArrayList<>();
+            flattenAndChildren(and, conjuncts);
+            if (conjuncts.isEmpty())
+                return false;
+            Boolean gamma = null;
+            Boolean neutron = null;
+            for (Filter child : conjuncts) {
+                if (isZeroMatchNode(child, summary))
+                    return true;
+                if (child instanceof PropertyIsEqualTo eq &&
+                        eq.getExpression1() instanceof PropertyName prop &&
+                        eq.getExpression2() instanceof Literal lit &&
+                        lit.getValue() instanceof Boolean boolVal) {
+                    String name = prop.getPropertyName();
+                    if ("gammaAlarm".equals(name)) {
+                        if (gamma != null && !gamma.equals(boolVal))
+                            return true;
+                        gamma = boolVal;
+                    } else if ("neutronAlarm".equals(name)) {
+                        if (neutron != null && !neutron.equals(boolVal))
+                            return true;
+                        neutron = boolVal;
+                    }
+                }
+            }
+            if (gamma != null && neutron != null) {
+                if (gamma && !neutron)
+                    return summary.gammaAlarmCount() <= 0L;
+                if (!gamma && neutron)
+                    return summary.neutronAlarmCount() <= 0L;
+                if (gamma)
+                    return summary.gammaNeutronAlarmCount() <= 0L;
+                return false;
+            }
+            if (Boolean.TRUE.equals(gamma))
+                return summary.gammaTrueCount() <= 0L;
+            if (Boolean.TRUE.equals(neutron))
+                return summary.neutronTrueCount() <= 0L;
+            return false;
+        }
+        if (filter instanceof PropertyIsEqualTo eq &&
+                eq.getExpression1() instanceof PropertyName prop &&
+                eq.getExpression2() instanceof Literal lit &&
+                Boolean.TRUE.equals(lit.getValue())) {
+            String name = prop.getPropertyName();
+            if ("gammaAlarm".equals(name))
+                return summary.gammaTrueCount() <= 0L;
+            if ("neutronAlarm".equals(name))
+                return summary.neutronTrueCount() <= 0L;
+        }
+        return false;
     }
 }

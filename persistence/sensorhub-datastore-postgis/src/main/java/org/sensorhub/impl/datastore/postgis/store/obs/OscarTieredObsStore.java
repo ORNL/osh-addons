@@ -4654,9 +4654,6 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         ? archiveCatalog.mutatedObservationIdsByGeneration(
                                 candidates.stream().map(ArchiveGeneration::id).toList())
                         : Map.of();
-                Set<Long> allMutatedIds = mutatedByGen.isEmpty()
-                        ? Set.of()
-                        : mutatedByGen.values().stream().flatMap(Set::stream).collect(Collectors.toSet());
                 List<ArchiveGeneration> parquetCandidates = candidates;
                 long summarizedColdCount = 0L;
                 if (fois == null && oneId == null && minId == null && maxId == null &&
@@ -4680,6 +4677,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                                         fois);
                         summarizedColdCount = Math.subtractExact(summaryPlan.summarizedCount(), mutatedSummaryMatches);
                         parquetCandidates = summaryPlan.remainingCandidates();
+                    }
+                } else if (fois != null && oneId == null && minId == null && maxId == null &&
+                        resolvedFilter.getCQLFilter() != null &&
+                        (resolvedFilter.getResultTime() == null || !resolvedFilter.getResultTime().isLatestTime())) {
+                    String summaryExpr = JsonCqlEvaluator.summaryCounterExpression(
+                            resolvedFilter.getCQLFilter()).orElse(null);
+                    if (summaryExpr != null) {
+                        parquetCandidates = archiveCatalog.pruneZeroMatchSummaryCandidates(
+                                candidates, dataStreams, summaryExpr, null);
                     }
                 }
                 long scannedColdCount = 0L;
@@ -4707,7 +4713,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                                         .flatMap(g -> mutatedByGen.getOrDefault(g.id(), Set.of()).stream())
                                         .collect(Collectors.toSet());
                         scannedColdCount = archiveReader.countCql(
-                                parquetCandidates, resolvedFilter, dataStreams, fois, parquetMutatedIds);
+                                parquetCandidates, resolvedFilter, dataStreams, fois,
+                                parquetMutatedIds, mutatedByGen, null);
                     }
                 }
                 coldUnmutatedCount = Math.addExact(summarizedColdCount, scannedColdCount);
