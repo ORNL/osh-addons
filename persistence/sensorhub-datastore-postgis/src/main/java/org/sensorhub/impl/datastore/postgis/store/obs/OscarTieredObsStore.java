@@ -138,6 +138,10 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private final Cache<MutatedGenSummaryCountKey, Long> mutatedGenSummaryCounts = CacheBuilder.newBuilder()
             .maximumSize(16_384)
             .build();
+    private final Cache<LegacyColdLatestKey, java.util.Optional<Entry<BigId, IObsData>>> legacyColdLatestCache =
+            CacheBuilder.newBuilder()
+                    .maximumSize(4_096)
+                    .build();
     private final AtomicBoolean storeClosed = new AtomicBoolean();
     private final Thread baseSummaryBackfillThread;
     private final ColdPointReadCoalescer coldPointReadCoalescer = new ColdPointReadCoalescer();
@@ -1376,81 +1380,110 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         Map<UUID, ArchiveGeneration> candidateById = new HashMap<>();
         Set<Long> coldDataStreams = new HashSet<>();
         Set<UUID> neededGenerationIds = new HashSet<>();
+        List<Entry<BigId, IObsData>> cachedColdEntries = new ArrayList<>();
+        boolean canUseIndexedColdLatest = fois == null && minResultTime == null &&
+                bounds.start().equals(MIN_ARCHIVE_TIME) &&
+                bounds.end().equals(MAX_ARCHIVE_TIME);
 
         if (!hotStreams.isEmpty()) {
-            Instant minHotTime = hotTimeByStream.values().stream()
-                    .min(Comparator.naturalOrder())
-                    .orElse(null);
-            List<ArchiveGeneration> hotCandidates;
-            Set<Long> archivedHotStreams = hotStreams;
-            if (latestResult && minHotTime != null) {
-                hotCandidates = archiveCatalog.candidatesPotentiallyNewerThanResultTime(
-                        bounds.start(), bounds.end(), hotStreams, minHotTime);
-                if (!hotCandidates.isEmpty() && hotStreams.size() > 1) {
-                    archivedHotStreams = archiveCatalog.filterPresentDataStreams(
-                            bounds.start(), bounds.end(), hotStreams);
-                }
-            } else if (!latestResult && minHotTime != null) {
-                archivedHotStreams = archiveCatalog.filterPresentDataStreams(
-                        bounds.start(), bounds.end(), hotStreams);
-                Instant effectiveStart = minHotTime.isAfter(bounds.start()) ? minHotTime : bounds.start();
-                hotCandidates = !archivedHotStreams.isEmpty() && effectiveStart.isBefore(bounds.end())
-                        ? archiveCatalog.candidates(
-                                effectiveStart, bounds.end(), null, null, null, archivedHotStreams, minResultTime)
-                        : List.of();
-            } else {
-                archivedHotStreams = archiveCatalog.filterPresentDataStreams(
-                        bounds.start(), bounds.end(), hotStreams);
-                hotCandidates = !archivedHotStreams.isEmpty()
-                        ? archiveCatalog.candidates(
-                                bounds.start(), bounds.end(), null, null, null, archivedHotStreams, minResultTime)
-                        : List.of();
-            }
-            for (ArchiveGeneration generation : hotCandidates)
-                candidateById.put(generation.id(), generation);
-
-            boolean inspectedResultTimes = false;
-            if (!hotCandidates.isEmpty()) {
-                for (Long streamId : archivedHotStreams) {
+            Set<Long> unresolvedHotStreams = new HashSet<>(hotStreams);
+            if (canUseIndexedColdLatest) {
+                Map<Long, ArchiveCatalog.ArchivedOverlay> indexedHotLatest =
+                        archiveCatalog.loadVerifiedColdLatestByDataStream(idScope, hotStreams);
+                for (Map.Entry<Long, ArchiveCatalog.ArchivedOverlay> entry : indexedHotLatest.entrySet()) {
+                    long streamId = entry.getKey();
                     Instant hotTime = hotTimeByStream.get(streamId);
-                    if (latestResult) {
-                        inspectedResultTimes = true;
-                        List<ArchiveGeneration> newer = archiveReader.generationsPotentiallyNewerThanResultTime(
-                                hotCandidates, hotTime);
-                        if (!newer.isEmpty()) {
-                            coldDataStreams.add(streamId);
-                            for (ArchiveGeneration generation : newer)
-                                neededGenerationIds.add(generation.id());
-                        }
+                    if (hotTime == null)
+                        continue;
+                    ArchiveCatalog.ArchivedOverlay latestCold = entry.getValue();
+                    ArchivedObservation obs = latestCold.observation();
+                    Instant coldTime = latestResult ? obs.resultTime() : obs.phenomenonTime();
+                    if (coldTime == null || !coldTime.isAfter(hotTime)) {
+                        unresolvedHotStreams.remove(streamId);
                     } else {
-                        boolean anyNewer = false;
-                        for (ArchiveGeneration generation : hotCandidates) {
-                            if (generation.end().isAfter(hotTime)) {
-                                anyNewer = true;
-                                neededGenerationIds.add(generation.id());
-                            }
+                        IObsData decoded = toObservation(latestCold.generationId(), latestCold.schemaJson(), obs);
+                        if (matchesObservation(filter, hotStreams, fois, obs.id(), obs.resultJson(), decoded)) {
+                            cachedColdEntries.add(Map.entry(BigId.fromLong(idScope, obs.id()), decoded));
+                            unresolvedHotStreams.remove(streamId);
                         }
-                        if (anyNewer)
-                            coldDataStreams.add(streamId);
                     }
                 }
             }
-            if (inspectedResultTimes) {
-                for (ArchiveGeneration generation : hotCandidates) {
-                    if (generation.maxResultTime() == null) {
-                        archiveReader.cachedMaxResultTime(generation).ifPresent(
-                                discovered -> archiveCatalog.backfillMaxResultTime(generation.id(), discovered));
+
+            if (!unresolvedHotStreams.isEmpty()) {
+                Instant minHotTime = unresolvedHotStreams.stream()
+                        .map(hotTimeByStream::get)
+                        .filter(java.util.Objects::nonNull)
+                        .min(Comparator.naturalOrder())
+                        .orElse(null);
+                List<ArchiveGeneration> hotCandidates;
+                Set<Long> archivedHotStreams = unresolvedHotStreams;
+                if (latestResult && minHotTime != null) {
+                    hotCandidates = archiveCatalog.candidatesPotentiallyNewerThanResultTime(
+                            bounds.start(), bounds.end(), unresolvedHotStreams, minHotTime);
+                    if (!hotCandidates.isEmpty() && unresolvedHotStreams.size() > 1) {
+                        archivedHotStreams = archiveCatalog.filterPresentDataStreams(
+                                bounds.start(), bounds.end(), unresolvedHotStreams);
+                    }
+                } else if (!latestResult && minHotTime != null) {
+                    archivedHotStreams = archiveCatalog.filterPresentDataStreams(
+                            bounds.start(), bounds.end(), unresolvedHotStreams);
+                    Instant effectiveStart = minHotTime.isAfter(bounds.start()) ? minHotTime : bounds.start();
+                    hotCandidates = !archivedHotStreams.isEmpty() && effectiveStart.isBefore(bounds.end())
+                            ? archiveCatalog.candidates(
+                                    effectiveStart, bounds.end(), null, null, null, archivedHotStreams, minResultTime)
+                            : List.of();
+                } else {
+                    archivedHotStreams = archiveCatalog.filterPresentDataStreams(
+                            bounds.start(), bounds.end(), unresolvedHotStreams);
+                    hotCandidates = !archivedHotStreams.isEmpty()
+                            ? archiveCatalog.candidates(
+                                    bounds.start(), bounds.end(), null, null, null, archivedHotStreams, minResultTime)
+                            : List.of();
+                }
+                for (ArchiveGeneration generation : hotCandidates)
+                    candidateById.put(generation.id(), generation);
+
+                boolean inspectedResultTimes = false;
+                if (!hotCandidates.isEmpty()) {
+                    for (Long streamId : archivedHotStreams) {
+                        Instant hotTime = hotTimeByStream.get(streamId);
+                        if (latestResult) {
+                            inspectedResultTimes = true;
+                            List<ArchiveGeneration> newer = archiveReader.generationsPotentiallyNewerThanResultTime(
+                                    hotCandidates, hotTime);
+                            if (!newer.isEmpty()) {
+                                coldDataStreams.add(streamId);
+                                for (ArchiveGeneration generation : newer)
+                                    neededGenerationIds.add(generation.id());
+                            }
+                        } else {
+                            boolean anyNewer = false;
+                            for (ArchiveGeneration generation : hotCandidates) {
+                                if (generation.end().isAfter(hotTime)) {
+                                    anyNewer = true;
+                                    neededGenerationIds.add(generation.id());
+                                }
+                            }
+                            if (anyNewer)
+                                coldDataStreams.add(streamId);
+                        }
+                    }
+                }
+                if (inspectedResultTimes) {
+                    for (ArchiveGeneration generation : hotCandidates) {
+                        if (generation.maxResultTime() == null) {
+                            archiveReader.cachedMaxResultTime(generation).ifPresent(
+                                    discovered -> archiveCatalog.backfillMaxResultTime(generation.id(), discovered));
+                        }
                     }
                 }
             }
         }
 
-        List<Entry<BigId, IObsData>> cachedColdEntries = new ArrayList<>();
         if (!missingHotStreams.isEmpty()) {
             Set<Long> unresolvedMissingStreams = new HashSet<>(missingHotStreams);
-            if (fois == null && minResultTime == null &&
-                    bounds.start().equals(MIN_ARCHIVE_TIME) &&
-                    bounds.end().equals(MAX_ARCHIVE_TIME)) {
+            if (canUseIndexedColdLatest) {
                 Map<Long, ArchiveCatalog.ArchivedOverlay> indexedLatest =
                         archiveCatalog.loadVerifiedColdLatestByDataStream(idScope, missingHotStreams);
                 for (Map.Entry<Long, ArchiveCatalog.ArchivedOverlay> entry : indexedLatest.entrySet()) {
@@ -1467,13 +1500,60 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 Set<Long> archivedUnresolvedStreams = archiveCatalog.filterPresentDataStreams(
                         bounds.start(), bounds.end(), unresolvedMissingStreams);
                 if (!archivedUnresolvedStreams.isEmpty()) {
+                    boolean canCacheLegacyLatest = canUseIndexedColdLatest &&
+                            filter.getCQLFilter() == null &&
+                            filter.getValuePredicate() == null &&
+                            filter.getPhenomenonLocation() == null &&
+                            (filter.getInternalIDs() == null || filter.getInternalIDs().isEmpty());
                     List<ArchiveGeneration> missingCandidates = archiveCatalog.candidates(
                             bounds.start(), bounds.end(), null, null, null, archivedUnresolvedStreams, minResultTime);
                     if (!missingCandidates.isEmpty()) {
-                        coldDataStreams.addAll(archivedUnresolvedStreams);
-                        for (ArchiveGeneration generation : missingCandidates) {
-                            candidateById.put(generation.id(), generation);
-                            neededGenerationIds.add(generation.id());
+                        if (canCacheLegacyLatest && missingCandidates.size() <= 16 && archivedUnresolvedStreams.size() <= 16) {
+                            List<String> genShas = missingCandidates.stream().map(ArchiveGeneration::sha256).toList();
+                            Set<Long> mutIds = hasMutations
+                                    ? archiveCatalog.mutatedObservationIdsByGeneration(
+                                                    missingCandidates.stream().map(ArchiveGeneration::id).toList())
+                                            .values().stream().flatMap(Set::stream).collect(Collectors.toUnmodifiableSet())
+                                    : Set.of();
+                            Set<Long> stillUnresolved = new HashSet<>();
+                            for (Long streamId : archivedUnresolvedStreams) {
+                                LegacyColdLatestKey cacheKey = new LegacyColdLatestKey(
+                                        streamId, genShas, mutIds, latestResult);
+                                java.util.Optional<Entry<BigId, IObsData>> hit =
+                                        legacyColdLatestCache.getIfPresent(cacheKey);
+                                if (hit != null) {
+                                    hit.ifPresent(cachedColdEntries::add);
+                                } else {
+                                    stillUnresolved.add(streamId);
+                                }
+                            }
+                            if (!stillUnresolved.isEmpty()) {
+                                List<ArchiveGeneration> orderedMissing = missingCandidates.stream()
+                                        .sorted(Comparator.comparing(ArchiveGeneration::start)
+                                                .thenComparing(ArchiveGeneration::end)
+                                                .thenComparing(ArchiveGeneration::id))
+                                        .toList();
+                                Map<Long, Entry<BigId, IObsData>> resolvedByStream = new HashMap<>();
+                                try (Stream<Entry<BigId, IObsData>> s = streamColdBasesFromCandidates(
+                                        orderedMissing, filter, Long.MAX_VALUE, stillUnresolved, fois, hasMutations,
+                                        MutationFilteringIterator.LOOKUP_BATCH_SIZE)) {
+                                    s.forEach(e -> resolvedByStream.put(
+                                            e.getValue().getDataStreamID().getIdAsLong(), e));
+                                }
+                                for (Long streamId : stillUnresolved) {
+                                    java.util.Optional<Entry<BigId, IObsData>> val =
+                                            java.util.Optional.ofNullable(resolvedByStream.get(streamId));
+                                    legacyColdLatestCache.put(
+                                            new LegacyColdLatestKey(streamId, genShas, mutIds, latestResult), val);
+                                    val.ifPresent(cachedColdEntries::add);
+                                }
+                            }
+                        } else {
+                            coldDataStreams.addAll(archivedUnresolvedStreams);
+                            for (ArchiveGeneration generation : missingCandidates) {
+                                candidateById.put(generation.id(), generation);
+                                neededGenerationIds.add(generation.id());
+                            }
                         }
                     }
                 }
@@ -4736,6 +4816,12 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             Set<Long> mutatedIds,
             Set<Long> dataStreams,
             Object filterKey) {}
+
+    private record LegacyColdLatestKey(
+            long streamId,
+            List<String> generationSha256s,
+            Set<Long> mutatedIds,
+            boolean latestResult) {}
 
     private long countMutatedSummaryBaseMatches(
             List<ArchiveGeneration> exactMutatedCandidates,

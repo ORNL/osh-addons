@@ -100,10 +100,22 @@ public final class JsonCqlEvaluator {
             return false;
         if ("FALSE".equals(clause.sql())) {
             sql.append(" AND FALSE");
-        } else {
-            sql.append(" AND ((").append(clause.sql())
-                    .append(") OR strpos(").append(column).append(", '\\u') > 0)");
+            return true;
         }
+        if (clause.sql().contains("json_")) {
+            ExactDuckDbPredicate fastGuard = buildFastStrposGuard(filter, column);
+            if (fastGuard != null && !"TRUE".equals(fastGuard.sql()) && !"FALSE".equals(fastGuard.sql())) {
+                sql.append(" AND (CASE WHEN ((").append(fastGuard.sql())
+                        .append(") OR ").append(nonStandardJsonFormattingEscape(column))
+                        .append(") THEN ((").append(clause.sql())
+                        .append(") OR strpos(").append(column).append(", '\\u') > 0) ELSE FALSE END)");
+                parameters.addAll(fastGuard.parameters());
+                parameters.addAll(clause.parameters());
+                return true;
+            }
+        }
+        sql.append(" AND ((").append(clause.sql())
+                .append(") OR strpos(").append(column).append(", '\\u') > 0)");
         parameters.addAll(clause.parameters());
         return true;
     }
@@ -1152,7 +1164,8 @@ public final class JsonCqlEvaluator {
             List<Object> combined = new ArrayList<>(fastGuard.parameters().size() + node.parameters().size());
             combined.addAll(fastGuard.parameters());
             combined.addAll(node.parameters());
-            String caseSql = "CASE WHEN ((" + fastGuard.sql() + ") OR strpos(" + column + ", '\\u') > 0) " +
+            String caseSql = "CASE WHEN ((" + fastGuard.sql() + ") OR " +
+                    nonStandardJsonFormattingEscape(column) + ") " +
                     "THEN (json_type(" + column + ") = 'OBJECT' AND (" + node.sql() + ")) " +
                     "ELSE FALSE END";
             return Optional.of(new ExactDuckDbPredicate(caseSql, combined));
@@ -1160,6 +1173,15 @@ public final class JsonCqlEvaluator {
         return Optional.of(new ExactDuckDbPredicate(
                 "json_type(" + column + ") = 'OBJECT' AND (" + node.sql() + ")",
                 node.parameters()));
+    }
+
+    private static String nonStandardJsonFormattingEscape(String column) {
+        return "strpos(" + column + ", '\\u') > 0 OR " +
+                "strpos(" + column + ", '\" ') > 0 OR " +
+                "strpos(" + column + ", ':  ') > 0 OR " +
+                "strpos(" + column + ", chr(9)) > 0 OR " +
+                "strpos(" + column + ", chr(10)) > 0 OR " +
+                "strpos(" + column + ", chr(13)) > 0";
     }
 
     /**
@@ -1219,6 +1241,11 @@ public final class JsonCqlEvaluator {
             }
             if (cmp instanceof PropertyIsEqualTo && expected instanceof Boolean boolVal) {
                 String tok = boolVal ? "true" : "false";
+                if (leafKey != null && leafKey.equals(path)) {
+                    return new ExactDuckDbPredicate(
+                            "strpos(" + column + ", ?) > 0 OR strpos(" + column + ", ?) > 0",
+                            List.of("\"" + leafKey + "\":" + tok, "\"" + leafKey + "\": " + tok));
+                }
                 if (leafKey != null) {
                     return new ExactDuckDbPredicate(
                             "strpos(" + column + ", ?) > 0 AND strpos(" + column + ", ?) > 0",
