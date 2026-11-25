@@ -650,8 +650,8 @@ public final class ParquetArchiveReader {
     private static final int MAX_INLINE_MUTATION_EXCLUSIONS = 4_096;
     private static final int MAX_INLINE_CQL_AGGREGATE_EXCLUSIONS = 64;
     private static final int MAX_RESULT_TIME_METADATA_BATCH = 64;
-    private static final int MAX_CQL_PAYLOAD_BATCH = 64;
-    private static final int MAX_CQL_AGGREGATE_BATCH = 64;
+    private static final int MAX_CQL_PAYLOAD_BATCH = 16;
+    private static final int MAX_CQL_AGGREGATE_BATCH = 16;
     private static final int LOCAL_STAGE_COPY_RETRIES = 3;
 
     /**
@@ -1663,6 +1663,36 @@ public final class ParquetArchiveReader {
                 }
             }
         } catch (Exception e) {
+            if (objects.byFilename().size() > 1 && isDuckDbOutOfMemoryError(e)) {
+                throwIfInterruptedOrCancelled();
+                List<Map.Entry<String, ArchiveGeneration>> entries = new ArrayList<>(objects.byFilename().entrySet());
+                int mid = entries.size() / 2;
+                Map<String, ArchiveGeneration> leftMap = new LinkedHashMap<>(mid * 2);
+                Map<String, ArchiveGeneration> rightMap = new LinkedHashMap<>((entries.size() - mid) * 2);
+                for (int i = 0; i < entries.size(); i++) {
+                    Map.Entry<String, ArchiveGeneration> entry = entries.get(i);
+                    if (i < mid)
+                        leftMap.put(entry.getKey(), entry.getValue());
+                    else
+                        rightMap.put(entry.getKey(), entry.getValue());
+                }
+                Map<UUID, Long> leftCounts = perGenCounts != null ? new HashMap<>(mid * 2) : null;
+                Map<UUID, Long> rightCounts = perGenCounts != null ? new HashMap<>((entries.size() - mid) * 2) : null;
+                long leftTotal = countCqlAuthorizedBatch(
+                        duckSession, new AuthorizedObjects(leftMap, objects.stampsByGenId()), leftMap.size(),
+                        filter, allowedDataStreams, allowedFois, excludedIds, batchSortedExclusions,
+                        exactPredicate, leftCounts);
+                long rightTotal = countCqlAuthorizedBatch(
+                        duckSession, new AuthorizedObjects(rightMap, objects.stampsByGenId()), rightMap.size(),
+                        filter, allowedDataStreams, allowedFois, excludedIds, batchSortedExclusions,
+                        exactPredicate, rightCounts);
+                if (perGenCounts != null) {
+                    perGenCounts.clear();
+                    perGenCounts.putAll(leftCounts);
+                    perGenCounts.putAll(rightCounts);
+                }
+                return Math.addExact(leftTotal, rightTotal);
+            }
             throw new IllegalStateException("Cannot count CQL matches from " + generationCount +
                     " archive generation(s)", e);
         }
@@ -1940,6 +1970,20 @@ public final class ParquetArchiveReader {
         DirectReadFaultInjector injector = directReadFaultInjector;
         if (injector != null)
             injector.beforeDirectRead(objects.byFilename().keySet());
+    }
+
+    static boolean isDuckDbOutOfMemoryError(Throwable error) {
+        int depth = 0;
+        for (Throwable current = error; current != null && depth < 16; current = current.getCause(), depth++) {
+            String message = current.getMessage();
+            if (message == null)
+                continue;
+            String normalized = message.toLowerCase(Locale.ROOT);
+            if (normalized.contains("out of memory error") || normalized.contains("failed to allocate data")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static boolean isTransientReadMemoryError(Throwable error) {
