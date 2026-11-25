@@ -492,6 +492,55 @@ public class TestCqlMutatedGenerationCountCache {
         assertEquals(1L, reader.countCql(List.of(gen), adjFallbackPositive, Set.of(10L), null, Set.of()));
     }
 
+    @Test
+    public void largeExclusionSetStaysInExactAggregatePushdownUnder64MbMemoryLimit() throws Exception {
+        Path root = temporary.newFolder("large-exclusions-cql-agg-archive").toPath();
+        Path duckTmp = temporary.getRoot().toPath().resolve("large-exclusions-cql-agg-tmp");
+        TieredArchiveConfig config = singleSessionConfig(root, duckTmp);
+        ParquetArchiveReader reader = new ParquetArchiveReader(root, config);
+
+        Instant t0 = Instant.parse("2026-03-02T00:00:00Z");
+        List<ArchiveGeneration> gens = new ArrayList<>();
+        Set<Long> excludedIds = new HashSet<>();
+        long expectedRemaining = 0L;
+
+        // 70 generations (> MAX_CQL_AGGREGATE_BATCH=64) with 80 rows each = 5,600 rows;
+        // exclude 5,000 IDs (> MAX_INLINE_MUTATION_EXCLUSIONS=4,096) under a 64 MiB DuckDB cap.
+        long nextId = 10_000L;
+        for (int g = 0; g < 70; g++) {
+            Instant winStart = t0.plusSeconds(g * 1_800L);
+            Instant winEnd = winStart.plusSeconds(1_800L);
+            List<FixtureRow> rows = new ArrayList<>(80);
+            for (int r = 0; r < 80; r++) {
+                long id = nextId++;
+                rows.add(new FixtureRow(id, 10L, winStart.plusSeconds(r + 1L), winStart.plusSeconds(r + 2L),
+                        occupancyJson(winStart.plusSeconds(r), winStart.plusSeconds(r + 1L), true, false, 95.0, 0)));
+                if (excludedIds.size() < 5_000) {
+                    excludedIds.add(id);
+                } else {
+                    expectedRemaining++;
+                }
+            }
+            gens.add(writeParquetGeneration(
+                    root, "datasets/observations/date=2026-03-02/profile=RAW_GATED/gen-" + g + ".parquet",
+                    winStart, winEnd, rows));
+        }
+
+        ObsFilter filter = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(4, 10L))
+                .withCQLFilter("(((gammaAlarm=true AND neutronAlarm=false) OR (gammaAlarm=false AND neutronAlarm=true)) AND maxGamma>=50)")
+                .build();
+
+        long firstCount = reader.countCql(gens, filter, Set.of(10L), null, excludedIds);
+        assertEquals(expectedRemaining, firstCount);
+
+        // Second pass hits the per-generation CQL count cache across all 70 generations with 0 additional scans.
+        long scannedAfterFirst = reader.cqlCountScannedGenerationsForTesting();
+        long secondCount = reader.countCql(gens, filter, Set.of(10L), null, excludedIds);
+        assertEquals(expectedRemaining, secondCount);
+        assertEquals(scannedAfterFirst, reader.cqlCountScannedGenerationsForTesting());
+    }
+
     private static TieredArchiveConfig singleSessionConfig(Path root, Path duckTmp) {
         TieredArchiveConfig config = new TieredArchiveConfig();
         config.rootDirectory = root.toAbsolutePath().normalize().toString();

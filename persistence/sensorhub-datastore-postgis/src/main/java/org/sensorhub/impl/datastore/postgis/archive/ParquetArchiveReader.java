@@ -649,8 +649,8 @@ public final class ParquetArchiveReader {
 
     private static final int MAX_INLINE_MUTATION_EXCLUSIONS = 4_096;
     private static final int MAX_RESULT_TIME_METADATA_BATCH = 64;
-    private static final int MAX_CQL_PAYLOAD_BATCH = 128;
-    private static final int MAX_CQL_AGGREGATE_BATCH = 512;
+    private static final int MAX_CQL_PAYLOAD_BATCH = 64;
+    private static final int MAX_CQL_AGGREGATE_BATCH = 64;
     private static final int LOCAL_STAGE_COPY_RETRIES = 3;
 
     /**
@@ -1584,8 +1584,7 @@ public final class ParquetArchiveReader {
             List<Long> batchSortedExclusions,
             JsonCqlEvaluator.ExactDuckDbPredicate exactPredicate,
             Map<UUID, Long> perGenCounts) {
-        boolean useExactAggregate = exactPredicate != null &&
-                batchSortedExclusions.size() <= MAX_INLINE_MUTATION_EXCLUSIONS;
+        boolean useExactAggregate = exactPredicate != null;
         try {
             if (shouldProactivelyStage(objects, duckSession.operationDirectory())) {
                 AuthorizedObjects staged = stageAuthorizedObjectsLocally(objects, duckSession.operationDirectory());
@@ -1596,7 +1595,7 @@ public final class ParquetArchiveReader {
                                     cqlExactAggregateCountPlan(
                                             staged, filter, allowedDataStreams, allowedFois,
                                             batchSortedExclusions, exactPredicate),
-                                    staged, filter, false, perGenCounts)
+                                    staged, filter, batchSortedExclusions, false, perGenCounts)
                             : executeCountCqlPlan(
                                     duckSession, cqlCountPlan(staged, filter, allowedDataStreams, allowedFois),
                                     staged, filter, excludedIds, false, perGenCounts);
@@ -1611,7 +1610,7 @@ public final class ParquetArchiveReader {
                                 cqlExactAggregateCountPlan(
                                         objects, filter, allowedDataStreams, allowedFois,
                                         batchSortedExclusions, exactPredicate),
-                                objects, filter, true, perGenCounts)
+                                objects, filter, batchSortedExclusions, true, perGenCounts)
                         : executeCountCqlPlan(
                                 duckSession, cqlCountPlan(objects, filter, allowedDataStreams, allowedFois),
                                 objects, filter, excludedIds, true, perGenCounts);
@@ -1628,7 +1627,7 @@ public final class ParquetArchiveReader {
                                     cqlExactAggregateCountPlan(
                                             staged, filter, allowedDataStreams, allowedFois,
                                             batchSortedExclusions, exactPredicate),
-                                    staged, filter, false, perGenCounts)
+                                    staged, filter, batchSortedExclusions, false, perGenCounts)
                             : executeCountCqlPlan(
                                     duckSession, cqlCountPlan(staged, filter, allowedDataStreams, allowedFois),
                                     staged, filter, excludedIds, false, perGenCounts);
@@ -1675,8 +1674,13 @@ public final class ParquetArchiveReader {
         List<Object> parameters = new ArrayList<>();
         if (filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty())
             appendIn(sql, "id_value", filter.getInternalIDs().stream().map(BigId::getIdAsLong).toList(), parameters);
-        if (!batchSortedExclusions.isEmpty())
-            appendNotIn(sql, "id_value", batchSortedExclusions, parameters);
+        if (!batchSortedExclusions.isEmpty()) {
+            if (batchSortedExclusions.size() <= MAX_INLINE_MUTATION_EXCLUSIONS) {
+                appendNotIn(sql, "id_value", batchSortedExclusions, parameters);
+            } else {
+                sql.append(" AND id_value NOT IN (SELECT id_value FROM oscar_cql_excluded_ids)");
+            }
+        }
         if (allowedDataStreams != null)
             appendIn(sql, "datastream_id", allowedDataStreams, parameters);
         if (allowedFois != null) {
@@ -1706,35 +1710,77 @@ public final class ParquetArchiveReader {
         return new QueryPlan(sql.toString(), parameters);
     }
 
+    private static void populateTempExcludedIds(java.sql.Connection duckConn, List<Long> sortedExcludedIds) throws SQLException {
+        try (java.sql.Statement ddl = duckConn.createStatement()) {
+            ddl.execute("CREATE TEMP TABLE IF NOT EXISTS oscar_cql_excluded_ids (id_value BIGINT NOT NULL)");
+            ddl.execute("DELETE FROM oscar_cql_excluded_ids");
+        }
+        final int chunkSize = 1_024;
+        for (int offset = 0; offset < sortedExcludedIds.size(); offset += chunkSize) {
+            int end = Math.min(sortedExcludedIds.size(), offset + chunkSize);
+            int count = end - offset;
+            StringBuilder insertSql = new StringBuilder("INSERT INTO oscar_cql_excluded_ids VALUES ");
+            for (int idx = 0; idx < count; idx++) {
+                if (idx > 0)
+                    insertSql.append(',');
+                insertSql.append("(?)");
+            }
+            try (PreparedStatement insert = duckConn.prepareStatement(insertSql.toString())) {
+                for (int idx = 0; idx < count; idx++) {
+                    insert.setLong(idx + 1, sortedExcludedIds.get(offset + idx));
+                }
+                insert.executeUpdate();
+            }
+        }
+    }
+
+    private static void clearTempExcludedIds(java.sql.Connection duckConn) {
+        try (java.sql.Statement cleanup = duckConn.createStatement()) {
+            cleanup.execute("DELETE FROM oscar_cql_excluded_ids");
+        } catch (Exception ignored) {
+        }
+    }
+
     private long executeExactAggregateCountCqlPlan(
             DuckDbResourcePolicy.Session duckSession,
             QueryPlan plan,
             AuthorizedObjects objects,
             ObsFilter filter,
+            List<Long> batchSortedExclusions,
             boolean directRead,
             Map<UUID, Long> perGenCounts) throws Exception {
         if (directRead)
             maybeInjectDirectReadFault(objects);
-        long matched = 0;
-        try (PreparedStatement statement = ConnectionManager.trackCancellableStatement(
-                     duckSession.connection().prepareStatement(plan.sql()), "DuckDB cold CQL aggregate count")) {
-            bind(statement, plan.parameters());
-            try (ResultSet result = statement.executeQuery()) {
-                while (nextCancellable(result)) {
-                    String filename = result.getString(1);
-                    long fileCount = result.getLong(2);
-                    if (fileCount <= 0L)
-                        continue;
-                    if (perGenCounts != null) {
-                        ArchiveGeneration generation = generationForFilename(objects, filename);
-                        perGenCounts.merge(generation.id(), fileCount, Math::addExact);
+        boolean usedTempExclusions = batchSortedExclusions.size() > MAX_INLINE_MUTATION_EXCLUSIONS;
+        if (usedTempExclusions) {
+            populateTempExcludedIds(duckSession.connection(), batchSortedExclusions);
+        }
+        try {
+            long matched = 0;
+            try (PreparedStatement statement = ConnectionManager.trackCancellableStatement(
+                         duckSession.connection().prepareStatement(plan.sql()), "DuckDB cold CQL aggregate count")) {
+                bind(statement, plan.parameters());
+                try (ResultSet result = statement.executeQuery()) {
+                    while (nextCancellable(result)) {
+                        String filename = result.getString(1);
+                        long fileCount = result.getLong(2);
+                        if (fileCount <= 0L)
+                            continue;
+                        if (perGenCounts != null) {
+                            ArchiveGeneration generation = generationForFilename(objects, filename);
+                            perGenCounts.merge(generation.id(), fileCount, Math::addExact);
+                        }
+                        matched = Math.addExact(matched, fileCount);
+                        if (filter.getLimit() != Long.MAX_VALUE && matched >= filter.getLimit())
+                            return filter.getLimit();
                     }
-                    matched = Math.addExact(matched, fileCount);
-                    if (filter.getLimit() != Long.MAX_VALUE && matched >= filter.getLimit())
-                        return filter.getLimit();
                 }
+                return matched;
             }
-            return matched;
+        } finally {
+            if (usedTempExclusions) {
+                clearTempExcludedIds(duckSession.connection());
+            }
         }
     }
 
