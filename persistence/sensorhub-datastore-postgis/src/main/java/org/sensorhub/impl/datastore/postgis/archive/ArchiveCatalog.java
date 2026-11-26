@@ -1298,9 +1298,10 @@ public final class ArchiveCatalog {
                     Long foiId = rows.getObject(6, Long.class);
                     int archiveVersion = rows.getInt(10);
                     String profile = rows.getString(11);
+                    int expectedArchiveVersion = TieredArchiveConfig.isV2ArchiveProfile(generation.profile()) ? 2 : 1;
                     if (exportedIdScope != idScope || exportedDataStreamScope != idScope ||
                             (foiId == null ? foiScope != null : foiScope == null || foiScope != idScope) ||
-                            archiveVersion != 1 || !generation.profile().equals(profile))
+                            archiveVersion != expectedArchiveVersion || !generation.profile().equals(profile))
                         throw new IllegalStateException("Archive activation ledger metadata does not match its generation");
 
                     stage.setLong(1, observationId);
@@ -1327,8 +1328,10 @@ public final class ArchiveCatalog {
                             minResultTime = candidateResultTime;
                     }
                     String resultJson = rows.getString(9);
-                    ocrAccumulators.computeIfAbsent(dataStreamId, ignored -> new OcrBloomFilter.Accumulator())
-                            .addFromResultJson(resultJson);
+                    if (!TieredArchiveConfig.PROFILE_RAW_TELEMETRY.equals(generation.profile())) {
+                        ocrAccumulators.computeIfAbsent(dataStreamId, ignored -> new OcrBloomFilter.Accumulator())
+                                .addFromResultJson(resultJson);
+                    }
                     if (resultJson == null)
                         stage.setNull(6, Types.VARCHAR);
                     else
@@ -5502,7 +5505,7 @@ public final class ArchiveCatalog {
                         "  SELECT DISTINCT (date_trunc('day', g.window_start AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS day_start, " +
                         "         ((date_trunc('day', g.window_start AT TIME ZONE 'UTC') + interval '1 day') AT TIME ZONE 'UTC') AS day_end " +
                         "  FROM oscar_archive_generation g " +
-                        "  WHERE g.store_key = ? AND g.id_scope = ? AND g.profile = 'RAW_GATED' " +
+                        "  WHERE g.store_key = ? AND g.id_scope = ? AND g.profile = 'RAW_EVENTS' " +
                         "    AND g.state IN ('ACTIVE', 'SEALED')" +
                         ") " +
                         "SELECT d.day_start, d.day_end FROM raw_days d " +
@@ -5510,7 +5513,7 @@ public final class ArchiveCatalog {
                         stageOverlapCheck +
                         "AND NOT EXISTS (" +
                         "  SELECT 1 FROM oscar_archive_generation g2 " +
-                        "  WHERE g2.store_key = ? AND g2.id_scope = ? AND g2.profile = 'RAW_GATED' " +
+                        "  WHERE g2.store_key = ? AND g2.id_scope = ? AND g2.profile = 'RAW_EVENTS' " +
                         "    AND g2.state IN ('ACTIVE', 'SEALED') " +
                         "    AND g2.window_start < d.day_end AND g2.window_end > d.day_start " +
                         "    AND (g2.window_start < d.day_start OR g2.window_end > d.day_end OR " + blockedExpr + ")" +
@@ -5543,7 +5546,7 @@ public final class ArchiveCatalog {
                 List<CompactionWindowCandidate> out = new ArrayList<>(dayWindows.size());
                 for (Instant[] bounds : dayWindows) {
                     List<ArchiveGeneration> gens = loadGenerationsForProfileInWindow(
-                            connection, TieredArchiveConfig.PROFILE_RAW_GATED, bounds[0], bounds[1]);
+                            connection, TieredArchiveConfig.PROFILE_RAW_EVENTS, bounds[0], bounds[1]);
                     if (!gens.isEmpty()) {
                         out.add(new CompactionWindowCandidate(bounds[0], bounds[1], gens));
                     }
@@ -5583,7 +5586,7 @@ public final class ArchiveCatalog {
                         "WHERE m.month_end <= ? " +
                         "AND NOT EXISTS (" +
                         "  SELECT 1 FROM oscar_archive_generation rawg " +
-                        "  WHERE rawg.store_key = ? AND rawg.id_scope = ? AND rawg.profile = 'RAW_GATED' " +
+                        "  WHERE rawg.store_key = ? AND rawg.id_scope = ? AND rawg.profile = 'RAW_EVENTS' " +
                         "    AND rawg.state IN ('ACTIVE', 'SEALED') " +
                         "    AND rawg.window_start < m.month_end AND rawg.window_end > m.month_start" +
                         ") " +
@@ -6623,6 +6626,20 @@ public final class ArchiveCatalog {
             }
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot finalize deletion of superseded archive generation " + generationId, e);
+        }
+    }
+
+    public boolean hasActiveExportingJobs() {
+        try (Connection connection = connections.open();
+             PreparedStatement stmt = connection.prepareStatement(
+                     "SELECT 1 FROM oscar_archive_job WHERE store_key = ? AND id_scope = ? AND state = 'EXPORTING' LIMIT 1")) {
+            stmt.setString(1, storeKey);
+            stmt.setInt(2, idScope);
+            try (ResultSet rs = stmt.executeQuery()) {
+                return rs.next();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect active archive export jobs", e);
         }
     }
 }

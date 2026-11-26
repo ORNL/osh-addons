@@ -1301,7 +1301,7 @@ public final class JsonCqlEvaluator {
                 return Optional.of(node);
             }
             return Optional.of(new ExactDuckDbPredicate(
-                    "((COALESCE(archive_version, 1) >= 2 AND profile IN ('DAILY_EVENTS', 'MONTHLY_EVENTS')) OR json_type(" +
+                    "((COALESCE(archive_version, 1) >= 2 AND profile IN ('RAW_EVENTS', 'DAILY_EVENTS', 'MONTHLY_EVENTS')) OR json_type(" +
                             column + ") = 'OBJECT') AND (" + node.sql() + ")",
                     node.parameters()));
         }
@@ -1522,7 +1522,7 @@ public final class JsonCqlEvaluator {
         List<Object> params = new ArrayList<>(v2Pred.parameters().size() + v1Pred.parameters().size());
         params.addAll(v2Pred.parameters());
         params.addAll(v1Pred.parameters());
-        String sql = "(CASE WHEN COALESCE(archive_version, 1) = 2 AND profile IN ('DAILY_EVENTS', 'MONTHLY_EVENTS') " +
+        String sql = "(CASE WHEN COALESCE(archive_version, 1) = 2 AND profile IN ('RAW_EVENTS', 'DAILY_EVENTS', 'MONTHLY_EVENTS') " +
                 "THEN COALESCE((" + v2Pred.sql() + "), FALSE) " +
                 "ELSE (json_type(" + jsonColumn + ") = 'OBJECT' AND COALESCE((" + v1Pred.sql() + "), FALSE)) END)";
         return new ExactDuckDbPredicate(sql, params);

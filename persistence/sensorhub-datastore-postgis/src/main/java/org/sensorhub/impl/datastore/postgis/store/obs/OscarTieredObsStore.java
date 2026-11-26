@@ -791,16 +791,38 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     : List.of();
             if (archiveConfig.isParquetPrimary() && attachedChildren.isEmpty())
                 return java.util.Optional.empty();
-            String sql = archiveConfig.isParquetPrimary()
-                    ? "SELECT min(o.phenomenontime) FROM " +
-                    ArchiveCatalog.stageChildrenFromClause(attachedChildren, "id, phenomenontime") +
-                    " WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
-                    "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
-                    "AND o.phenomenontime < ?"
-                    : "SELECT min(o.phenomenontime) FROM " + getDatastoreName() +
-                    " o JOIN " + getDataStreams().getDatastoreName() + " d ON d.id=o.datastreamid " +
-                    "WHERE o.archivegenerationid IS NULL AND o.phenomenontime < ? " +
-                    "AND d.data->>'outputName' = ANY (?)";
+            boolean rawEvents = TieredArchiveConfig.PROFILE_RAW_EVENTS.equals(profile);
+            boolean rawTelemetry = TieredArchiveConfig.PROFILE_RAW_TELEMETRY.equals(profile);
+            String sql;
+            if (archiveConfig.isParquetPrimary()) {
+                String fromClause = ArchiveCatalog.stageChildrenFromClause(
+                        attachedChildren, "id, datastreamid, phenomenontime");
+                if (rawEvents) {
+                    sql = "SELECT min(o.phenomenontime) FROM " + fromClause +
+                            " JOIN " + getDataStreams().getDatastoreName() + " d ON d.id=o.datastreamid " +
+                            "WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                            "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
+                            "AND o.phenomenontime < ? " +
+                            "AND COALESCE(d.data->>'outputName', '') = ANY (?)";
+                } else if (rawTelemetry) {
+                    sql = "SELECT min(o.phenomenontime) FROM " + fromClause +
+                            " LEFT JOIN " + getDataStreams().getDatastoreName() + " d ON d.id=o.datastreamid " +
+                            "WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                            "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
+                            "AND o.phenomenontime < ? " +
+                            "AND NOT (COALESCE(d.data->>'outputName', '') = ANY (?))";
+                } else {
+                    sql = "SELECT min(o.phenomenontime) FROM " + fromClause +
+                            " WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                            "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
+                            "AND o.phenomenontime < ?";
+                }
+            } else {
+                sql = "SELECT min(o.phenomenontime) FROM " + getDatastoreName() +
+                        " o JOIN " + getDataStreams().getDatastoreName() + " d ON d.id=o.datastreamid " +
+                        "WHERE o.archivegenerationid IS NULL AND o.phenomenontime < ? " +
+                        "AND d.data->>'outputName' = ANY (?)";
+            }
             try (java.sql.PreparedStatement statement = connection.prepareStatement(sql)) {
                 int parameter = 1;
                 if (archiveConfig.isParquetPrimary()) {
@@ -808,8 +830,12 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     statement.setInt(parameter++, idScope);
                 }
                 UtcJdbcTime.setInstant(statement, parameter++, cutoff);
-                if (!archiveConfig.isParquetPrimary())
+                if (archiveConfig.isParquetPrimary() && (rawEvents || rawTelemetry)) {
+                    statement.setArray(parameter, connection.createArrayOf("text",
+                            TieredArchiveConfig.EVENT_OUTPUT_NAMES.toArray(String[]::new)));
+                } else if (!archiveConfig.isParquetPrimary()) {
                     statement.setArray(parameter, connection.createArrayOf("text", archiveConfig.outputNames.toArray()));
+                }
                 try (java.sql.ResultSet result = statement.executeQuery()) {
                     if (!result.next()) return java.util.Optional.empty();
                     Instant value = UtcJdbcTime.getInstant(result, 1);

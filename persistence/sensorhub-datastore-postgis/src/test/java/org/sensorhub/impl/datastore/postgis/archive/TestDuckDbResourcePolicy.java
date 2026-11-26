@@ -81,6 +81,39 @@ public class TestDuckDbResourcePolicy {
     }
 
     @Test
+    public void fileBackedSessionAndScratchDirectoryAreConfinedAndCleanedOnClose() throws Exception {
+        Path temporaryRoot = temporary.getRoot().toPath().resolve("duckdb-file-backed");
+        TieredArchiveConfig config = config(temporaryRoot);
+        Path fileBackedOpDir;
+        Path scratchDirPath;
+
+        try (DuckDbResourcePolicy.Session session = DuckDbResourcePolicy.openFileBacked(config, "export")) {
+            fileBackedOpDir = session.operationDirectory();
+            assertEquals(temporaryRoot.toRealPath(), fileBackedOpDir.getParent());
+            assertTrue(Files.isRegularFile(fileBackedOpDir.resolve("work.duckdb")));
+            try (Statement statement = session.connection().createStatement()) {
+                statement.execute("CREATE TABLE probe (id BIGINT, payload VARCHAR)");
+                statement.execute("INSERT INTO probe SELECT i, repeat('a', 64) FROM range(0, 10000) t(i)");
+                try (ResultSet rows = statement.executeQuery("SELECT count(*) FROM probe")) {
+                    assertTrue(rows.next());
+                    assertEquals(10000L, rows.getLong(1));
+                }
+            }
+        }
+        assertFalse(Files.exists(fileBackedOpDir));
+
+        try (DuckDbResourcePolicy.ScratchDirectory scratch =
+                     DuckDbResourcePolicy.openScratchDirectory(config, "compaction-stage")) {
+            scratchDirPath = scratch.path();
+            assertEquals(temporaryRoot.toRealPath(), scratchDirPath.getParent());
+            assertTrue(Files.isDirectory(scratchDirPath));
+            Files.writeString(scratchDirPath.resolve("chunk-000000.parquet"), "chunk");
+        }
+        assertFalse(Files.exists(scratchDirPath));
+        assertOnlyRootLock(temporaryRoot);
+    }
+
+    @Test
     public void concurrentOperationsReceiveDifferentConfinedDirectories() throws Exception {
         Path temporaryRoot = temporary.newFolder("separate-spill").toPath();
         TieredArchiveConfig config = config(temporaryRoot);

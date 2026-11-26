@@ -21,6 +21,7 @@ import org.vast.swe.SWEHelper;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -46,9 +47,12 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * End-to-end PostgreSQL + DuckDB + Parquet V2 integration verification for
- * multi-tier LSM compaction, settled-overlay folding, monthly consolidation,
- * periodic defragmentation, OCR Bloom catalog pruning, interleaved ID point
- * lookups, retention-hold and FK safety, and online-backup grace windows.
+ * split-at-export ({@code RAW_EVENTS} + {@code RAW_TELEMETRY}), event-only
+ * multi-tier compaction ({@code RAW_EVENTS} -&gt; {@code DAILY_EVENTS} -&gt;
+ * {@code MONTHLY_EVENTS}), disjoint rollover partitioning, overlapping source
+ * clustering, settled-overlay folding, periodic defragmentation, OCR Bloom
+ * catalog pruning, stale {@code .partial} self-healing, retention-hold and FK
+ * safety, and online-backup grace windows.
  */
 public class TestMultiTierParquetCompactionIntegration {
     private static final String PG_HOST_PORT = "localhost:5432";
@@ -92,34 +96,50 @@ public class TestMultiTierParquetCompactionIntegration {
     }
 
     @Test
-    public void dayOneCompactionSplitsEventAndTelemetryProfilesWithInterleavedIdsAndHonorsActivatedAtGuard()
+    public void splitAtExportAndDayOneEventCompactionLeaveTelemetryUntouchedAndRollOverDisjointParts()
             throws Exception {
         Path archiveRoot = temporary.newFolder("day1-archive").toPath();
         Path spillRoot = archiveRoot.resolveSibling("day1-spill");
         String table = uniqueTableName("compact_day1");
 
-        TieredArchiveConfig config = baseConfig(archiveRoot, spillRoot);
+        TieredArchiveConfig config = parquetPrimaryConfig(archiveRoot, spillRoot,
+                List.of("occupancy", "vehicleOcr", "gammaCounts", "dailyFile", "connectionStatus", "occupancyStatus"));
         config.compactionUnlinkGraceMinutes = 15;
 
         OscarTieredObsStore store = openStore(table, config);
         BigId occStream = addEventOccupancyStream(store, 101L, "occupancy");
         BigId ocrStream = addVehicleOcrStream(store, 102L, "vehicleOcr");
         BigId telStream = addTelemetryStream(store, 103L, "gammaCounts");
+        BigId dailyFileStream = addTelemetryStream(store, 104L, "dailyFile");
+        BigId connStatusStream = addTelemetryStream(store, 105L, "connectionStatus");
+        BigId occStatusStream = addTelemetryStream(store, 106L, "occupancyStatus");
 
+        Instant legacyDay = Instant.parse("2026-08-09T00:00:00Z");
         Instant dayD = Instant.parse("2026-08-10T00:00:00Z");
         Instant now = Instant.parse("2026-08-13T12:00:00Z");
+
+        // Plant a legacy pre-upgrade RAW_GATED generation on Day D-1 to prove it is never rewritten
+        // and stays 100% readable alongside V2 RAW_EVENTS / RAW_TELEMETRY / DAILY_EVENTS.
+        BigId legacyObsId = store.add(eventOccupancyObs(
+                occStream, legacyDay.plusSeconds(30L), legacyDay.plusSeconds(30L),
+                "evt-legacy-raw-gated", true, false, 222.0, 2.0, -1, 0));
+        commitStore(store);
+        ArchiveGeneration legacyGen = store.archiveWindow(
+                legacyDay, legacyDay.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_GATED)
+                .orElseThrow();
 
         Map<BigId, String> expectedEventIds = new HashMap<>();
         Map<BigId, String> expectedOcrNorms = new HashMap<>();
         Map<BigId, Double> expectedTelemetryGamma = new HashMap<>();
+        List<UUID> rawTelemetryIds = new ArrayList<>();
 
-        // Insert INTERLEAVED event + telemetry observations across 3 hourly windows in Day D
-        // so [min_id, max_id] of DAILY_EVENTS and multi-part DAILY_TELEMETRY overlap!
-        for (int hour = 0; hour < 3; hour++) {
-            Instant winStart = dayD.plus(hour, ChronoUnit.HOURS);
+        // Insert INTERLEAVED event + telemetry + high-rate status observations across three 30-min windows in Day D
+        // so [min_id, max_id] of RAW_EVENTS/DAILY_EVENTS and RAW_TELEMETRY overlap.
+        for (int slot = 0; slot < 3; slot++) {
+            Instant winStart = dayD.plus(slot * 30L, ChronoUnit.MINUTES);
             for (int i = 0; i < 10; i++) {
-                Instant tEvent = winStart.plusSeconds(60L + i * 180L);
-                String evtCode = "evt-d1-" + hour + "-" + i;
+                Instant tEvent = winStart.plusSeconds(30L + i * 120L);
+                String evtCode = "evt-d1-" + slot + "-" + i;
                 boolean gammaAlarm = (i % 3 == 0);
                 BigId occId = store.add(eventOccupancyObs(
                         occStream, tEvent, tEvent, evtCode, gammaAlarm, false,
@@ -127,56 +147,100 @@ public class TestMultiTierParquetCompactionIntegration {
                         gammaAlarm ? 0 : -1, 0));
                 expectedEventIds.put(occId, evtCode);
 
-                for (int t = 0; t < 4; t++) {
-                    Instant tTel = tEvent.plusSeconds(5L + t * 3L);
-                    double gross = 1_000.0 + hour * 100.0 + i * 10.0 + t;
-                    BigId telId = store.add(telemetryObs(telStream, tTel, tTel, gross, 3.0));
-                    expectedTelemetryGamma.put(telId, gross);
-                }
+                BigId gammaId = store.add(telemetryObs(telStream, tEvent.plusSeconds(5L), tEvent.plusSeconds(5L),
+                        1_000.0 + slot * 100.0 + i * 10.0, 3.0));
+                expectedTelemetryGamma.put(gammaId, 1_000.0 + slot * 100.0 + i * 10.0);
+
+                BigId dailyId = store.add(telemetryObs(dailyFileStream, tEvent.plusSeconds(8L), tEvent.plusSeconds(8L),
+                        2_000.0 + slot * 100.0 + i, 1.0));
+                expectedTelemetryGamma.put(dailyId, 2_000.0 + slot * 100.0 + i);
+
+                BigId connId = store.add(telemetryObs(connStatusStream, tEvent.plusSeconds(11L), tEvent.plusSeconds(11L),
+                        3_000.0 + slot * 100.0 + i, 1.0));
+                expectedTelemetryGamma.put(connId, 3_000.0 + slot * 100.0 + i);
+
+                BigId occStatId = store.add(telemetryObs(occStatusStream, tEvent.plusSeconds(14L), tEvent.plusSeconds(14L),
+                        4_000.0 + slot * 100.0 + i, 1.0));
+                expectedTelemetryGamma.put(occStatId, 4_000.0 + slot * 100.0 + i);
 
                 if (i % 2 == 0) {
                     Instant tOcr = tEvent.plusSeconds(20L);
-                    String norm = "MSCU1234" + hour + i + "5";
-                    BigId ocrId = store.add(vehicleOcrObs(ocrStream, tOcr, tOcr, "occ-ref-" + hour + "-" + i, norm));
+                    String norm = "MSCU1234" + slot + i + "5";
+                    BigId ocrId = store.add(vehicleOcrObs(ocrStream, tOcr, tOcr, "occ-ref-" + slot + "-" + i, norm));
                     expectedOcrNorms.put(ocrId, norm);
                 }
             }
             commitStore(store);
-            store.archiveWindow(winStart, winStart.plus(1, ChronoUnit.HOURS), TieredArchiveConfig.PROFILE_RAW_GATED)
+            ArchiveGeneration evGen = store.archiveWindow(
+                    winStart, winStart.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS)
                     .orElseThrow();
+            ArchiveGeneration telGen = store.archiveWindow(
+                    winStart, winStart.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_TELEMETRY)
+                    .orElseThrow();
+            assertEquals("Each 30m RAW_EVENTS window must contain 10 occupancy + 5 OCR rows", 15L, evGen.rowCount());
+            assertEquals("Each 30m RAW_TELEMETRY window must contain 40 telemetry/status rows", 40L, telGen.rowCount());
+            rawTelemetryIds.add(telGen.id());
         }
 
-        // Also create a synthetic historical RAW_GATED generation on 2026-08-11 whose activated_at is < 2h old!
+        // Plant a synthetic historical RAW_EVENTS generation on 2026-08-11 whose activated_at is < 2h old!
         Instant syntheticDay = Instant.parse("2026-08-11T00:00:00Z");
-        BigId freshHistoricalId = store.add(telemetryObs(
-                telStream, syntheticDay.plusSeconds(120L), syntheticDay.plusSeconds(120L), 777.0, 1.0));
+        BigId freshHistoricalId = store.add(eventOccupancyObs(
+                occStream, syntheticDay.plusSeconds(120L), syntheticDay.plusSeconds(120L),
+                "evt-fresh-historical", false, false, 19.0, 1.0, -1, 0));
         commitStore(store);
         ArchiveGeneration freshHistoricalGen = store.archiveWindow(
-                syntheticDay, syntheticDay.plus(1, ChronoUnit.HOURS), TieredArchiveConfig.PROFILE_RAW_GATED)
+                syntheticDay, syntheticDay.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS)
                 .orElseThrow();
 
-        long expectedTotalColdRows = expectedEventIds.size() + expectedOcrNorms.size() + expectedTelemetryGamma.size() + 1L;
+        long expectedTotalColdRows = 1L + expectedEventIds.size() + expectedOcrNorms.size()
+                + expectedTelemetryGamma.size() + 1L;
 
-        // Backdate all 4 RAW_GATED generations so maintainArchiveLifecycle verifies parity, retires hot rows, and seals them;
-        // then stamp freshHistoricalGen activated_at = now - 20m (< 2h) to prove Red-Team #3 activated_at guard!
-        try (Connection conn = openPg();
-             PreparedStatement backdateAll = conn.prepareStatement(
-                     "UPDATE oscar_archive_generation SET activated_at = ? WHERE store_key = ?")) {
-            UtcJdbcTime.setInstant(backdateAll, 1, now.minus(3, ChronoUnit.HOURS));
-            backdateAll.setString(2, table);
-            assertEquals(4, backdateAll.executeUpdate());
-        }
+        // Verify parity, retire all 30m stage partitions, and seal every generation.
         store.maintainArchiveLifecycle();
-        try (Connection conn = openPg();
-             PreparedStatement recentSynth = conn.prepareStatement(
-                     "UPDATE oscar_archive_generation SET activated_at = ? WHERE id = ?")) {
-            UtcJdbcTime.setInstant(recentSynth, 1, now.minus(20, ChronoUnit.MINUTES));
-            recentSynth.setObject(2, freshHistoricalGen.id());
-            assertEquals(1, recentSynth.executeUpdate());
+        assertTrue("All PARQUET_PRIMARY 30m staging partitions must retire once both RAW_EVENTS and RAW_TELEMETRY verify",
+                store.getImmutableStagePartitions().isEmpty());
+
+        // Verify split-at-export V2 formats, column counts, and selective ocr_bloom BEFORE Day-1 compaction!
+        try (Connection conn = openPg()) {
+            List<Path> rawEventPaths = listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_RAW_EVENTS);
+            List<Path> rawTelPaths = listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_RAW_TELEMETRY);
+            assertEquals(4, rawEventPaths.size());
+            assertEquals(3, rawTelPaths.size());
+            for (Path p : rawEventPaths) {
+                assertParquetV2AndColumnCount(archiveRoot.resolve(p), 20);
+            }
+            for (Path p : rawTelPaths) {
+                assertParquetV2AndColumnCount(archiveRoot.resolve(p), 11);
+            }
+            // RAW_TELEMETRY must leave ocr_bloom NULL on every stream row!
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT count(*) FROM oscar_archive_schema s " +
+                            "JOIN oscar_archive_generation g ON g.id = s.generation_id " +
+                            "WHERE g.store_key = ? AND g.profile = 'RAW_TELEMETRY' AND s.ocr_bloom IS NOT NULL")) {
+                ps.setString(1, table);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("RAW_TELEMETRY must not allocate ocr_bloom bytes", 0L, rs.getLong(1));
+                }
+            }
+            // Backdate all generations > 2h, except freshHistoricalGen (< 2h) to prove activated_at guard!
+            try (PreparedStatement backdateAll = conn.prepareStatement(
+                    "UPDATE oscar_archive_generation SET activated_at = ? WHERE store_key = ?")) {
+                UtcJdbcTime.setInstant(backdateAll, 1, now.minus(3, ChronoUnit.HOURS));
+                backdateAll.setString(2, table);
+                assertEquals(8, backdateAll.executeUpdate());
+            }
+            try (PreparedStatement recentSynth = conn.prepareStatement(
+                    "UPDATE oscar_archive_generation SET activated_at = ? WHERE id = ?")) {
+                UtcJdbcTime.setInstant(recentSynth, 1, now.minus(20, ChronoUnit.MINUTES));
+                recentSynth.setObject(2, freshHistoricalGen.id());
+                assertEquals(1, recentSynth.executeUpdate());
+            }
         }
 
-        // Run Day-1 compaction with maxRows=45 so 45 event rows stay 1 DAILY_EVENTS file and 120 telemetry rows split into 3 parts!
-        config.maximumRowsPerGeneration = 45;
+        // Run Day-1 compaction with maxRows=20 so 45 event rows roll over cleanly into 3 strictly disjoint DAILY_EVENTS parts,
+        // while ALL 3 RAW_TELEMETRY generations and legacy RAW_GATED remain 100% untouched (zero telemetry rewrites)!
+        config.maximumRowsPerGeneration = 20;
         ArchiveCompactionManager.CompactionCycleSummary summary = store.runCompactionCycle(now);
         assertEquals(1, summary.daysCompacted());
         assertEquals(0, summary.monthsConsolidated());
@@ -184,12 +248,20 @@ public class TestMultiTierParquetCompactionIntegration {
                 0, summary.deletingGenerationsDrained());
 
         try (Connection conn = openPg()) {
-            // 1. Freshly activated (< 2h) synthetic historical RAW_GATED generation must remain untouched!
+            // 1. Freshly activated (< 2h) RAW_EVENTS and legacy RAW_GATED must remain completely untouched!
             assertEquals("SEALED", queryGenerationState(conn, freshHistoricalGen.id()));
-            assertEquals(TieredArchiveConfig.PROFILE_RAW_GATED, queryGenerationProfile(conn, freshHistoricalGen.id()));
+            assertEquals(TieredArchiveConfig.PROFILE_RAW_EVENTS, queryGenerationProfile(conn, freshHistoricalGen.id()));
+            assertEquals("SEALED", queryGenerationState(conn, legacyGen.id()));
+            assertEquals(TieredArchiveConfig.PROFILE_RAW_GATED, queryGenerationProfile(conn, legacyGen.id()));
 
-            // 2. Day D's 3 RAW_GATED generations are DELETING with row_count = 0 (zero double-counting!)
-            //    and physical files still present on disk for online pg_basebackup consistency.
+            // 2. ALL 3 RAW_TELEMETRY generations must remain SEALED with identical UUIDs and ZERO DAILY_TELEMETRY created!
+            for (UUID telId : rawTelemetryIds) {
+                assertEquals("RAW_TELEMETRY must never be rewritten by compaction", "SEALED", queryGenerationState(conn, telId));
+                assertEquals(TieredArchiveConfig.PROFILE_RAW_TELEMETRY, queryGenerationProfile(conn, telId));
+            }
+            assertEquals(0, listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_DAILY_TELEMETRY).size());
+
+            // 3. Day D's 3 RAW_EVENTS generations are DELETING with row_count = 0 and files preserved during grace window.
             int deletingCount = 0;
             try (PreparedStatement ps = conn.prepareStatement(
                     "SELECT id, row_count, object_path FROM oscar_archive_generation " +
@@ -206,39 +278,41 @@ public class TestMultiTierParquetCompactionIntegration {
             }
             assertEquals(3, deletingCount);
 
-            // 3. Total catalog row_count across store_key is immediately exact!
+            // 4. Total catalog row_count across store_key is immediately exact!
             assertEquals(expectedTotalColdRows, querySumRowCount(conn, table));
             assertEquals(expectedTotalColdRows, store.getNumRecords());
 
-            // 4. Verify DAILY_EVENTS (1 generation, 45 rows) and multi-part DAILY_TELEMETRY (3 parts: 45 + 45 + 30 = 120 rows)
+            // 5. Verify multi-part DAILY_EVENTS rollover produced 3 strictly disjoint V2 parts covering [dayD, dayD+1d)!
             List<Path> dailyEventFiles = listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_DAILY_EVENTS);
-            List<Path> dailyTelFiles = listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_DAILY_TELEMETRY);
-            assertEquals(1, dailyEventFiles.size());
-            assertEquals("120 telemetry rows at maxRows=45 must split into 3 bounded parts", 3, dailyTelFiles.size());
-
-            // Verify Parquet V2 format & column counts (20 cols for DAILY_EVENTS, 11 cols for DAILY_TELEMETRY)
-            assertParquetV2AndColumnCount(archiveRoot.resolve(dailyEventFiles.get(0)), 20);
-            for (Path telRel : dailyTelFiles) {
-                assertParquetV2AndColumnCount(archiveRoot.resolve(telRel), 11);
+            assertEquals("45 event rows at maxRows=20 must roll over into 3 bounded DAILY_EVENTS parts",
+                    3, dailyEventFiles.size());
+            for (Path evRel : dailyEventFiles) {
+                assertParquetV2AndColumnCount(archiveRoot.resolve(evRel), 20);
             }
+            assertStrictlyDisjointProfileWindows(conn, table, TieredArchiveConfig.PROFILE_DAILY_EVENTS,
+                    dayD, dayD.plus(1, ChronoUnit.DAYS), 3);
 
-            // Verify overlapping [min_id, max_id] in oscar_archive_id_block between DAILY_EVENTS and DAILY_TELEMETRY!
-            assertOverlappingIdBlocksExist(conn, table);
+            // 6. Verify overlapping [min_id, max_id] in oscar_archive_id_block between DAILY_EVENTS and RAW_TELEMETRY!
+            assertOverlappingIdBlocksExist(conn, table,
+                    TieredArchiveConfig.PROFILE_DAILY_EVENTS, TieredArchiveConfig.PROFILE_RAW_TELEMETRY);
 
-            // Verify oscar_archive_schema 256-byte ocr_bloom + min/max on vehicleOcr and 1-byte sentinel on occupancy
+            // 7. Verify oscar_archive_schema 256-byte ocr_bloom on vehicleOcr and 1-byte sentinel on occupancy across DAILY_EVENTS.
             try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT s.datastream_id, octet_length(s.ocr_bloom), s.ocr_min_norm, s.ocr_max_norm " +
+                    "SELECT s.datastream_id, min(octet_length(s.ocr_bloom)), max(octet_length(s.ocr_bloom)), " +
+                            "min(s.ocr_min_norm), max(s.ocr_max_norm) " +
                             "FROM oscar_archive_schema s JOIN oscar_archive_generation g ON g.id = s.generation_id " +
-                            "WHERE g.store_key = ? AND g.profile = 'DAILY_EVENTS' AND g.state = 'SEALED'")) {
+                            "WHERE g.store_key = ? AND g.profile = 'DAILY_EVENTS' AND g.state = 'SEALED' " +
+                            "GROUP BY s.datastream_id")) {
                 ps.setString(1, table);
                 Map<Long, Integer> bloomLengths = new HashMap<>();
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         long dsId = rs.getLong(1);
+                        assertEquals(rs.getInt(2), rs.getInt(3));
                         bloomLengths.put(dsId, rs.getInt(2));
                         if (dsId == ocrStream.getIdAsLong()) {
-                            assertEquals("MSCU1234005", rs.getString(3));
-                            assertEquals("MSCU1234285", rs.getString(4));
+                            assertEquals("MSCU1234005", rs.getString(4));
+                            assertEquals("MSCU1234285", rs.getString(5));
                         }
                     }
                 }
@@ -246,11 +320,11 @@ public class TestMultiTierParquetCompactionIntegration {
                 assertEquals(Integer.valueOf(1), bloomLengths.get(occStream.getIdAsLong()));
             }
 
-            // 5. Run oscar-storage.sh archive verify SQL + filesystem reconciliation DURING grace window!
+            // 8. Run oscar-storage.sh archive verify SQL + filesystem reconciliation DURING grace window!
             assertArchiveVerifyClean(conn, table, archiveRoot);
         }
 
-        // 6. Point reads (store.get) across overlapping DAILY_EVENTS + DAILY_TELEMETRY id_blocks!
+        // 9. Point reads (store.get) across overlapping DAILY_EVENTS + RAW_TELEMETRY + legacy RAW_GATED id_blocks!
         for (Map.Entry<BigId, String> e : expectedEventIds.entrySet()) {
             IObsData obs = store.get(e.getKey());
             assertNotNull("Missing event point read " + e.getKey(), obs);
@@ -266,17 +340,18 @@ public class TestMultiTierParquetCompactionIntegration {
             assertNotNull("Missing telemetry point read " + e.getKey(), obs);
             assertEquals(e.getValue(), obs.getResult().getDoubleValue(0), 1e-6);
         }
-        assertNotNull(store.get(freshHistoricalId));
+        assertNotNull("Legacy RAW_GATED observation must remain readable", store.get(legacyObsId));
+        assertNotNull("Fresh historical RAW_EVENTS observation must remain readable", store.get(freshHistoricalId));
 
-        // 7. OCR Bloom candidate pruning + store CQL count/select parity
+        // 10. OCR Bloom candidate pruning + store CQL count/select parity across multi-part DAILY_EVENTS!
         ObsFilter absentOcr = new ObsFilter.Builder()
                 .withDataStreams(ocrStream)
                 .withCQLFilter("normalizedValue = 'ZZZZ9999999'")
                 .build();
         List<ArchiveGeneration> ocrCandidates = store.getArchiveCatalog().candidates(
                 dayD, dayD.plus(1, ChronoUnit.DAYS), null, null, null, Set.of(ocrStream.getIdAsLong()));
-        assertEquals(1, ocrCandidates.size());
-        assertTrue("OCR Bloom + zone-map must prune non-matching DAILY_EVENTS generation before DuckDB",
+        assertEquals(3, ocrCandidates.size());
+        assertTrue("OCR Bloom + zone-map must prune non-matching DAILY_EVENTS parts before DuckDB",
                 store.getArchiveCatalog().pruneOcrCandidates(
                         ocrCandidates, Set.of(ocrStream.getIdAsLong()), absentOcr.getCQLFilter()).isEmpty());
         assertEquals(0L, store.countMatchingEntries(absentOcr));
@@ -290,7 +365,7 @@ public class TestMultiTierParquetCompactionIntegration {
             assertEquals(5L, s.count());
         }
 
-        // 8. Advance past 15-minute grace window -> DELETING generations unlink, prune empty RAW_GATED dir, and pass verify!
+        // 11. Advance past 15-minute grace window -> DELETING RAW_EVENTS unlink, prune empty RAW_EVENTS dir, pass verify!
         try (Connection conn = openPg();
              PreparedStatement backdateSealed = conn.prepareStatement(
                      "UPDATE oscar_archive_generation SET sealed_at = ? WHERE store_key = ? AND state = 'DELETING'")) {
@@ -299,8 +374,10 @@ public class TestMultiTierParquetCompactionIntegration {
             assertEquals(3, backdateSealed.executeUpdate());
         }
         assertEquals(3, store.drainDeletingGenerations(now));
-        assertFalse("Empty profile=RAW_GATED directory for Day D must be pruned after unlink",
-                Files.exists(archiveRoot.resolve("datasets/observations/date=2026-08-10/profile=RAW_GATED")));
+        assertFalse("Empty profile=RAW_EVENTS directory for Day D must be pruned after unlink",
+                Files.exists(archiveRoot.resolve("datasets/observations/date=2026-08-10/profile=RAW_EVENTS")));
+        assertTrue("RAW_TELEMETRY directory for Day D must remain intact",
+                Files.isDirectory(archiveRoot.resolve("datasets/observations/date=2026-08-10/profile=RAW_TELEMETRY")));
         try (Connection conn = openPg()) {
             assertArchiveVerifyClean(conn, table, archiveRoot);
             assertEquals(expectedTotalColdRows, querySumRowCount(conn, table));
@@ -314,7 +391,8 @@ public class TestMultiTierParquetCompactionIntegration {
         Path spillRoot = archiveRoot.resolveSibling("overlays-holds-spill");
         String table = uniqueTableName("compact_ovl");
 
-        TieredArchiveConfig config = baseConfig(archiveRoot, spillRoot);
+        TieredArchiveConfig config = parquetPrimaryConfig(archiveRoot, spillRoot,
+                List.of("occupancy", "vehicleOcr", "gammaCounts"));
         config.compactionUnlinkGraceMinutes = 0; // Immediate drain once unpinned!
 
         OscarTieredObsStore store = openStore(table, config);
@@ -326,7 +404,7 @@ public class TestMultiTierParquetCompactionIntegration {
         Instant day2Held = Instant.parse("2026-08-16T00:00:00Z");
         Instant now = Instant.parse("2026-08-20T12:00:00Z");
 
-        // Day 1 Window 0: [00:00, 01:00)
+        // Day 1 Window 0: [00:00, 00:30)
         BigId obsSettled = store.add(eventOccupancyObs(
                 occStreamA, day1.plusSeconds(60L), day1.plusSeconds(60L),
                 "evt-initial-unadj", true, false, 140.0, 1.0, -1, 0));
@@ -338,32 +416,33 @@ public class TestMultiTierParquetCompactionIntegration {
                 "evt-keep-a", false, false, 12.0, 1.0, -1, 0));
         commitStore(store);
         ArchiveGeneration d1Gen0 = store.archiveWindow(
-                day1, day1.plus(1, ChronoUnit.HOURS), TieredArchiveConfig.PROFILE_RAW_GATED).orElseThrow();
+                day1, day1.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
 
-        // Day 1 Window 1: [01:00, 02:00)
+        // Day 1 Window 1: [00:30, 01:00)
         BigId obsRecent = store.add(eventOccupancyObs(
-                occStreamB, day1.plusSeconds(3_660L), day1.plusSeconds(3_660L),
+                occStreamB, day1.plusSeconds(1_860L), day1.plusSeconds(1_860L),
                 "evt-recent-base", true, false, 110.0, 2.0, -1, 0));
         BigId obsKeepB = store.add(eventOccupancyObs(
-                occStreamB, day1.plusSeconds(3_720L), day1.plusSeconds(3_720L),
+                occStreamB, day1.plusSeconds(1_920L), day1.plusSeconds(1_920L),
                 "evt-keep-b", false, false, 15.0, 1.0, -1, 0));
         BigId obsLatestC = store.add(eventOccupancyObs(
-                occStreamC, day1.plusSeconds(3_750L), day1.plusSeconds(3_750L),
+                occStreamC, day1.plusSeconds(1_950L), day1.plusSeconds(1_950L),
                 "evt-latest-c-base", false, false, 20.0, 1.0, -1, 0));
         commitStore(store);
         ArchiveGeneration d1Gen1 = store.archiveWindow(
-                day1.plus(1, ChronoUnit.HOURS), day1.plus(2, ChronoUnit.HOURS), TieredArchiveConfig.PROFILE_RAW_GATED)
+                day1.plus(30, ChronoUnit.MINUTES), day1.plus(60, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS)
                 .orElseThrow();
 
-        // Day 2 (Held): [00:00, 01:00)
+        // Day 2 (Held): [00:00, 00:30)
         BigId obsHeld = store.add(eventOccupancyObs(
                 occStreamA, day2Held.plusSeconds(60L), day2Held.plusSeconds(60L),
                 "evt-held-day2", true, false, 300.0, 1.0, -1, 0));
         commitStore(store);
         ArchiveGeneration d2HeldGen = store.archiveWindow(
-                day2Held, day2Held.plus(1, ChronoUnit.HOURS), TieredArchiveConfig.PROFILE_RAW_GATED).orElseThrow();
+                day2Held, day2Held.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
 
-        // Backdate activated_at on all 3 generations and run production maintainArchiveLifecycle to verify parity & seal.
+        store.maintainArchiveLifecycle();
+        assertTrue(store.getImmutableStagePartitions().isEmpty());
         try (Connection conn = openPg();
              PreparedStatement ps = conn.prepareStatement(
                      "UPDATE oscar_archive_generation SET activated_at = ? WHERE store_key = ?")) {
@@ -371,29 +450,23 @@ public class TestMultiTierParquetCompactionIntegration {
             ps.setString(2, table);
             assertEquals(3, ps.executeUpdate());
         }
-        store.maintainArchiveLifecycle();
 
         // Apply cold mutations on Day 1:
-        // 1. Settled adjudication overlay on obsSettled (backdated to now - 4h >= 2h cutoff)
         store.put(obsSettled, eventOccupancyObs(
                 occStreamA, day1.plusSeconds(60L), day1.plusSeconds(60L),
                 "evt-adjudicated-settled", true, false, 140.0, 1.0, 4, 2));
-        // 2. Recent/concurrent overlay on obsRecent (updated_at = now - 5m < 2h cutoff, advancing time past obsKeepB!)
-        Instant advancedTime = day1.plusSeconds(3_900L);
+        Instant advancedTime = day1.plusSeconds(2_100L);
         store.put(obsRecent, eventOccupancyObs(
                 occStreamB, advancedTime, advancedTime,
                 "evt-recent-updated", true, true, 999.5, 42.0, 6, 1));
-        // 3. Recent/concurrent in-place overlay directly on occStreamC's oscar_obs_latest row!
         store.put(obsLatestC, eventOccupancyObs(
-                occStreamC, day1.plusSeconds(3_750L), day1.plusSeconds(3_750L),
+                occStreamC, day1.plusSeconds(1_950L), day1.plusSeconds(1_950L),
                 "evt-latest-c-overlaid", true, false, 777.25, 3.0, 4, 1));
-        // 4. Cold tombstone on obsDeleted
         assertNotNull(store.remove(obsDeleted));
 
         UUID expiredPlanId = UUID.randomUUID();
         UUID holdId = UUID.randomUUID();
         try (Connection conn = openPg()) {
-            // Backdate obsSettled overlay to now - 4h (settled) and obsRecent + obsLatestC overlays to now - 5m (unsettled)
             try (PreparedStatement ps = conn.prepareStatement(
                     "UPDATE oscar_obs_overlay SET updated_at = ? WHERE store_key = ? AND observation_id = ?")) {
                 UtcJdbcTime.setInstant(ps, 1, now.minus(4, ChronoUnit.HOURS));
@@ -412,7 +485,6 @@ public class TestMultiTierParquetCompactionIntegration {
                 assertEquals(1, ps.executeUpdate());
             }
 
-            // Insert an EXPIRED PLANNED oscar_deletion_plan referencing d1Gen0 (must not block compaction & must clean up on drain!)
             try (PreparedStatement planIns = conn.prepareStatement(
                     "INSERT INTO oscar_deletion_plan (id, store_key, id_scope, subject_type, subject_id, state, " +
                             "estimated_rows, estimated_bytes, hold_count, confirmation_hash, requested_by, created_at, expires_at) " +
@@ -432,7 +504,6 @@ public class TestMultiTierParquetCompactionIntegration {
                 itemIns.executeUpdate();
             }
 
-            // Place an active OBSERVATION retention hold on obsHeld (Day 2) -> Day 2 must NOT compact!
             try (PreparedStatement holdIns = conn.prepareStatement(
                     "INSERT INTO oscar_retention_hold (id, store_key, id_scope, subject_type, subject_id, reason, created_by, resolution_mode) " +
                             "VALUES (?, ?, ?, 'OBSERVATION', ?, 'legal-hold-probe', 'tester', 'COLD_RANGE_CONSERVATIVE')")) {
@@ -444,8 +515,6 @@ public class TestMultiTierParquetCompactionIntegration {
             }
         }
 
-        // Pin d1Gen0 via ParquetArchiveReader BEFORE running compaction with grace=0:
-        // Day 1 must compact, d1Gen1 can drain immediately, while d1Gen0 MUST stay on disk until unpinned!
         try (ParquetArchiveReader.PinnedGenerations pin = store.getArchiveReader().pinGenerations(List.of(d1Gen0.id()))) {
             ArchiveCompactionManager.CompactionCycleSummary summary = store.runCompactionCycle(now);
             assertEquals("Day 1 compacts while held Day 2 is skipped", 1, summary.daysCompacted());
@@ -455,18 +524,15 @@ public class TestMultiTierParquetCompactionIntegration {
                     Files.isRegularFile(archiveRoot.resolve(d1Gen0.objectPath()), LinkOption.NOFOLLOW_LINKS));
         }
 
-        // Now pin is closed -> drain remaining DELETING generation d1Gen0!
         assertEquals(1, store.drainDeletingGenerations(now));
         assertFalse("Unpinned d1Gen0 Parquet file must be unlinked after pin release",
                 Files.exists(archiveRoot.resolve(d1Gen0.objectPath()), LinkOption.NOFOLLOW_LINKS));
 
         UUID day1CompactedGenId;
         try (Connection conn = openPg()) {
-            // Day 2 held generation remained untouched in RAW_GATED!
             assertEquals("SEALED", queryGenerationState(conn, d2HeldGen.id()));
-            assertEquals(TieredArchiveConfig.PROFILE_RAW_GATED, queryGenerationProfile(conn, d2HeldGen.id()));
+            assertEquals(TieredArchiveConfig.PROFILE_RAW_EVENTS, queryGenerationProfile(conn, d2HeldGen.id()));
 
-            // Find Day 1's new DAILY_EVENTS generation
             try (PreparedStatement ps = conn.prepareStatement(
                     "SELECT id FROM oscar_archive_generation WHERE store_key = ? AND profile = 'DAILY_EVENTS' AND state = 'SEALED'")) {
                 ps.setString(1, table);
@@ -477,7 +543,6 @@ public class TestMultiTierParquetCompactionIntegration {
                 }
             }
 
-            // Settled overlay (obsSettled) was FOLDED into Parquet and deleted from oscar_obs_overlay!
             try (PreparedStatement ps = conn.prepareStatement(
                     "SELECT count(*) FROM oscar_obs_overlay WHERE store_key = ? AND observation_id = ?")) {
                 ps.setString(1, table);
@@ -488,7 +553,6 @@ public class TestMultiTierParquetCompactionIntegration {
                 }
             }
 
-            // Recent overlay (obsRecent) was PRESERVED in oscar_obs_overlay and remapped to day1CompactedGenId!
             try (PreparedStatement ps = conn.prepareStatement(
                     "SELECT generation_id FROM oscar_obs_overlay WHERE store_key = ? AND observation_id = ?")) {
                 ps.setString(1, table);
@@ -499,7 +563,6 @@ public class TestMultiTierParquetCompactionIntegration {
                 }
             }
 
-            // Tombstone (obsDeleted) was remapped to day1CompactedGenId!
             try (PreparedStatement ps = conn.prepareStatement(
                     "SELECT generation_id FROM oscar_tombstone WHERE store_key = ? AND subject_id = ?")) {
                 ps.setString(1, table);
@@ -510,7 +573,6 @@ public class TestMultiTierParquetCompactionIntegration {
                 }
             }
 
-            // oscar_obs_latest remapped occStreamB (obsKeepB -> DAILY_EVENTS) & preserved in-place OVERLAY on occStreamC!
             try (PreparedStatement ps = conn.prepareStatement(
                     "SELECT datastream_id, observation_id, profile, generation_id FROM oscar_obs_latest WHERE store_key = ?")) {
                 ps.setString(1, table);
@@ -535,7 +597,6 @@ public class TestMultiTierParquetCompactionIntegration {
                 assertEquals(Long.valueOf(obsHeld.getIdAsLong()), latestObsIds.get(occStreamA.getIdAsLong()));
             }
 
-            // oscar_event_locator remapped folded eventId 'evt-adjudicated-settled' to day1CompactedGenId!
             try (PreparedStatement ps = conn.prepareStatement(
                     "SELECT observation_id, generation_id FROM oscar_event_locator WHERE store_key = ? AND public_id = ?")) {
                 ps.setString(1, table);
@@ -550,7 +611,6 @@ public class TestMultiTierParquetCompactionIntegration {
             assertArchiveVerifyClean(conn, table, archiveRoot);
         }
 
-        // Verify read/get/count semantics across folded overlay, live overlay, tombstone, and held generation!
         assertNull("Tombstoned observation must remain deleted after compaction", store.get(obsDeleted));
 
         IObsData foldedRead = store.get(obsSettled);
@@ -564,7 +624,6 @@ public class TestMultiTierParquetCompactionIntegration {
         assertEquals("evt-recent-updated", recentOverlayRead.getResult().getStringValue(0));
         assertEquals(999.5, recentOverlayRead.getResult().getDoubleValue(3), 1e-6);
 
-        // Projected V2 CQL query for adjudicationCode = 4 AND adjudicatedIdsCount = 2 matches folded obsSettled!
         ObsFilter code4Filter = new ObsFilter.Builder()
                 .withCQLFilter("adjudicationCode = 4 AND adjudicatedIdsCount = 2")
                 .build();
@@ -575,8 +634,6 @@ public class TestMultiTierParquetCompactionIntegration {
             assertEquals(obsSettled, list.get(0).getKey());
         }
 
-        // Latest per stream returns obsHeld on occStreamA, overlaid obsRecent (999.5) on occStreamB,
-        // and overlaid obsLatestC (777.25) on occStreamC!
         try (var latest = store.selectEntries(new ObsFilter.Builder()
                 .withDataStreams(occStreamA, occStreamB, occStreamC)
                 .withPhenomenonTime(new TemporalFilter.Builder().withLatestTime().build())
@@ -592,13 +649,14 @@ public class TestMultiTierParquetCompactionIntegration {
     }
 
     @Test
-    public void monthlyConsolidationAndSixtyFourOverlayDefragmentationProduceSingleMonthlyEventsBundle()
+    public void monthlyConsolidationAndSixtyFourOverlayDefragmentationKeepTelemetryUntouched()
             throws Exception {
         Path archiveRoot = temporary.newFolder("monthly-defrag-archive").toPath();
         Path spillRoot = archiveRoot.resolveSibling("monthly-defrag-spill");
         String table = uniqueTableName("compact_month");
 
-        TieredArchiveConfig config = baseConfig(archiveRoot, spillRoot);
+        TieredArchiveConfig config = parquetPrimaryConfig(archiveRoot, spillRoot,
+                List.of("occupancy", "vehicleOcr", "gammaCounts"));
         config.compactionUnlinkGraceMinutes = 0;
 
         OscarTieredObsStore store = openStore(table, config);
@@ -607,52 +665,54 @@ public class TestMultiTierParquetCompactionIntegration {
         BigId telStream = addTelemetryStream(store, 303L, "gammaCounts");
 
         Instant julyStart = Instant.parse("2026-07-01T00:00:00Z");
-        Instant now = Instant.parse("2026-08-20T12:00:00Z"); // > 7 days after 2026-08-01T00:00:00Z!
+        Instant now = Instant.parse("2026-08-20T12:00:00Z"); // > 15 days after 2026-08-01T00:00:00Z
 
         List<BigId> julyEventObsIds = new ArrayList<>();
-        // Populate 3 days in July 2026 (25 event rows + 5 OCR rows + 6 telemetry rows per day = 75 event, 15 OCR, 18 tel)
+        List<UUID> rawTelemetryGenIds = new ArrayList<>();
         for (int day = 0; day < 3; day++) {
             Instant dayStart = julyStart.plus(day * 5L, ChronoUnit.DAYS);
             for (int i = 0; i < 25; i++) {
-                Instant t = dayStart.plusSeconds(60L + i * 60L);
+                Instant t = dayStart.plusSeconds(30L + i * 30L);
                 BigId occId = store.add(eventOccupancyObs(
                         occStream, t, t, "evt-july-" + day + "-" + i,
                         i % 5 == 0, false, 95.0 + i, 1.0, -1, 0));
                 julyEventObsIds.add(occId);
             }
             for (int i = 0; i < 5; i++) {
-                Instant t = dayStart.plusSeconds(2_000L + i * 30L);
+                Instant t = dayStart.plusSeconds(900L + i * 30L);
                 store.add(vehicleOcrObs(ocrStream, t, t, "occ-j-" + day + "-" + i, "TGHU777" + day + i + "01"));
             }
             for (int i = 0; i < 6; i++) {
-                Instant t = dayStart.plusSeconds(3_000L + i * 10L);
+                Instant t = dayStart.plusSeconds(1_200L + i * 10L);
                 store.add(telemetryObs(telStream, t, t, 50.0 + i, 1.0));
             }
             commitStore(store);
-            store.archiveWindow(dayStart, dayStart.plus(2, ChronoUnit.HOURS), TieredArchiveConfig.PROFILE_RAW_GATED)
+            store.archiveWindow(dayStart, dayStart.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS)
                     .orElseThrow();
+            ArchiveGeneration telGen = store.archiveWindow(
+                    dayStart, dayStart.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_TELEMETRY)
+                    .orElseThrow();
+            rawTelemetryGenIds.add(telGen.id());
         }
 
         long expectedTotal = 75L + 15L + 18L;
 
+        store.maintainArchiveLifecycle();
+        assertTrue(store.getImmutableStagePartitions().isEmpty());
         try (Connection conn = openPg();
              PreparedStatement ps = conn.prepareStatement(
                      "UPDATE oscar_archive_generation SET activated_at = ? WHERE store_key = ?")) {
             UtcJdbcTime.setInstant(ps, 1, Instant.parse("2026-07-20T00:00:00Z"));
             ps.setString(2, table);
-            assertEquals(3, ps.executeUpdate());
+            assertEquals(6, ps.executeUpdate());
         }
-        store.maintainArchiveLifecycle();
 
-        // Cycle 1: Compacts all 3 July days from RAW_GATED -> DAILY_EVENTS + DAILY_TELEMETRY
-        // AND in the same cycle consolidates July's newly sealed DAILY_EVENTS -> MONTHLY_EVENTS
-        // once DAILY_EVENTS activated_at is >= 7 days old. First verify Day-1 produces 3 DAILY_EVENTS + 3 DAILY_TELEMETRY!
+        // Cycle 1: Compacts all 3 July days from RAW_EVENTS -> DAILY_EVENTS, leaving RAW_TELEMETRY untouched.
         ArchiveCompactionManager.CompactionCycleSummary cycle1 = store.runCompactionCycle(now);
         assertEquals(3, cycle1.daysCompacted());
         assertEquals("Freshly compacted DAILY_EVENTS have activated_at = now (< 7d), waiting before monthly merge",
                 0, cycle1.monthsConsolidated());
 
-        // Backdate DAILY_EVENTS activated_at by 8 days to simulate 1 week passing after Day-1 compaction.
         try (Connection conn = openPg();
              PreparedStatement ps = conn.prepareStatement(
                      "UPDATE oscar_archive_generation SET activated_at = ? " +
@@ -662,7 +722,7 @@ public class TestMultiTierParquetCompactionIntegration {
             assertEquals(3, ps.executeUpdate());
         }
 
-        // Cycle 2: Consolidates all 3 July DAILY_EVENTS into 1 MONTHLY_EVENTS under date=2026-07-01/profile=MONTHLY_EVENTS!
+        // Cycle 2: Consolidates all 3 July DAILY_EVENTS into 1 MONTHLY_EVENTS under date=2026-07-01/profile=MONTHLY_EVENTS.
         ArchiveCompactionManager.CompactionCycleSummary cycle2 = store.runCompactionCycle(now);
         assertEquals(0, cycle2.daysCompacted());
         assertEquals(1, cycle2.monthsConsolidated());
@@ -670,7 +730,11 @@ public class TestMultiTierParquetCompactionIntegration {
         UUID initialMonthlyGenId;
         try (Connection conn = openPg()) {
             assertEquals(0, listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_DAILY_EVENTS).size());
-            assertEquals(3, listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_DAILY_TELEMETRY).size());
+            assertEquals(0, listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_DAILY_TELEMETRY).size());
+            assertEquals(3, listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_RAW_TELEMETRY).size());
+            for (UUID telId : rawTelemetryGenIds) {
+                assertEquals("SEALED", queryGenerationState(conn, telId));
+            }
             List<Path> monthlyPaths = listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_MONTHLY_EVENTS);
             assertEquals(1, monthlyPaths.size());
             assertTrue("MONTHLY_EVENTS must reside under date=2026-07-01/profile=MONTHLY_EVENTS: " + monthlyPaths.get(0),
@@ -689,7 +753,7 @@ public class TestMultiTierParquetCompactionIntegration {
             }
         }
 
-        // Apply 65 (>= 64 threshold) overlays onto July MONTHLY_EVENTS observations!
+        // Apply 65 (>= 64 threshold) overlays onto July MONTHLY_EVENTS observations.
         for (int i = 0; i < 65; i++) {
             BigId targetId = julyEventObsIds.get(i);
             IObsData existing = store.get(targetId);
@@ -699,7 +763,6 @@ public class TestMultiTierParquetCompactionIntegration {
                     "evt-defrag-" + i, true, false, 500.0 + i, 2.0, 4, 1));
         }
 
-        // Backdate MONTHLY_EVENTS activated_at AND all 65 overlays' updated_at by 8 days (>= 7d monthly settled cutoff).
         try (Connection conn = openPg()) {
             try (PreparedStatement ps = conn.prepareStatement(
                     "UPDATE oscar_archive_generation SET activated_at = ? WHERE id = ?")) {
@@ -715,7 +778,7 @@ public class TestMultiTierParquetCompactionIntegration {
             }
         }
 
-        // Cycle 3: Periodic MONTHLY_EVENTS defragmentation folds all 65 settled overlays into a new MONTHLY_EVENTS file!
+        // Cycle 3: Periodic MONTHLY_EVENTS defragmentation folds all 65 settled overlays into a new MONTHLY_EVENTS file.
         ArchiveCompactionManager.CompactionCycleSummary cycle3 = store.runCompactionCycle(now);
         assertEquals(1, cycle3.monthlyGenerationsDefragmented());
 
@@ -744,7 +807,6 @@ public class TestMultiTierParquetCompactionIntegration {
             assertArchiveVerifyClean(conn, table, archiveRoot);
         }
 
-        // Verify all 65 folded adjudications match via projected V2 column CQL count and point get!
         ObsFilter foldedAdjFilter = new ObsFilter.Builder()
                 .withDataStreams(occStream)
                 .withCQLFilter("adjudicationCode = 4 AND adjudicatedIdsCount = 1")
@@ -757,18 +819,20 @@ public class TestMultiTierParquetCompactionIntegration {
     }
 
     @Test
-    public void parquetPrimaryModeBlocksUnretiredStagePartitionAndCompactsAfterStageRetirement() throws Exception {
+    public void parquetPrimaryModeBlocksUnretiredStagePartitionAndCompactsEventsOnlyAfterStageRetirement()
+            throws Exception {
         Path archiveRoot = temporary.newFolder("parquet-primary-archive").toPath();
         Path spillRoot = archiveRoot.resolveSibling("parquet-primary-spill");
         String table = uniqueTableName("compact_pp");
 
-        TieredArchiveConfig config = baseConfig(archiveRoot, spillRoot);
-        config.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        TieredArchiveConfig config = parquetPrimaryConfig(archiveRoot, spillRoot,
+                List.of("occupancy", "gammaCounts", "dailyFile"));
         config.compactionUnlinkGraceMinutes = 0;
 
         OscarTieredObsStore store = openStore(table, config);
         BigId occStream = addEventOccupancyStream(store, 401L, "occupancy");
         BigId telStream = addTelemetryStream(store, 402L, "gammaCounts");
+        BigId dailyFileStream = addTelemetryStream(store, 403L, "dailyFile");
 
         Instant dayStart = Instant.parse("2026-08-05T00:00:00Z");
         Instant now = Instant.parse("2026-08-10T12:00:00Z");
@@ -778,43 +842,187 @@ public class TestMultiTierParquetCompactionIntegration {
                 "evt-pp-1", true, false, 180.0, 2.0, -1, 0));
         BigId telId = store.add(telemetryObs(
                 telStream, dayStart.plusSeconds(45L), dayStart.plusSeconds(45L), 65.0, 1.0));
+        BigId dailyFileId = store.add(telemetryObs(
+                dailyFileStream, dayStart.plusSeconds(50L), dayStart.plusSeconds(50L), 99.0, 0.0));
         commitStore(store);
 
-        // Export 30-minute PARQUET_PRIMARY window -> creates oscar_obs_stage_owner rows on ATTACHED stage partition!
-        ArchiveGeneration rawGen = store.archiveWindow(
-                dayStart, dayStart.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_GATED).orElseThrow();
-
+        // Export ONLY RAW_EVENTS first -> stage child still holds unowned telemetry, so lifecycle cannot retire it yet
+        // AND compaction MUST NOT touch rawEvGen!
+        ArchiveGeneration rawEvGen = store.archiveWindow(
+                dayStart, dayStart.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
         try (Connection conn = openPg();
              PreparedStatement ps = conn.prepareStatement(
                      "UPDATE oscar_archive_generation SET activated_at = ? WHERE id = ?")) {
             UtcJdbcTime.setInstant(ps, 1, now.minus(1, ChronoUnit.DAYS));
-            ps.setObject(2, rawGen.id());
+            ps.setObject(2, rawEvGen.id());
             assertEquals(1, ps.executeUpdate());
         }
-
-        // Before maintainArchiveLifecycle retires the staging partition, compaction MUST NOT touch rawGen!
         assertEquals(0, store.runCompactionCycle(now).daysCompacted());
 
-        // Retire verified PARQUET_PRIMARY stage partition via maintainArchiveLifecycle, then re-backdate activated_at
+        // Export complementary RAW_TELEMETRY (captures both gammaCounts and dailyFile) -> lifecycle retires stage child!
+        ArchiveGeneration rawTelGen = store.archiveWindow(
+                dayStart, dayStart.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_TELEMETRY).orElseThrow();
+        assertEquals(2L, rawTelGen.rowCount());
         store.maintainArchiveLifecycle();
-        assertTrue("Stage partitions must be retired after parity verification",
+        assertTrue("Stage partitions must retire once both RAW_EVENTS and RAW_TELEMETRY verify",
                 store.getImmutableStagePartitions().isEmpty());
 
-        // Compact retired PARQUET_PRIMARY day into DAILY_EVENTS + DAILY_TELEMETRY!
+        // Compact retired day: RAW_EVENTS -> DAILY_EVENTS, while RAW_TELEMETRY stays untouched!
         ArchiveCompactionManager.CompactionCycleSummary summary = store.runCompactionCycle(now);
         assertEquals(1, summary.daysCompacted());
         assertEquals(1, summary.deletingGenerationsDrained());
 
         try (Connection conn = openPg()) {
             assertEquals(1, listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_DAILY_EVENTS).size());
-            assertEquals(1, listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_DAILY_TELEMETRY).size());
-            assertEquals(2L, querySumRowCount(conn, table));
+            assertEquals(1, listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_RAW_TELEMETRY).size());
+            assertEquals(0, listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_DAILY_TELEMETRY).size());
+            assertEquals("SEALED", queryGenerationState(conn, rawTelGen.id()));
+            assertEquals(3L, querySumRowCount(conn, table));
             assertArchiveVerifyClean(conn, table, archiveRoot);
         }
 
         assertNotNull(store.get(occId));
         assertNotNull(store.get(telId));
-        assertEquals(2L, store.getNumRecords());
+        assertNotNull(store.get(dailyFileId));
+        assertEquals(3L, store.getNumRecords());
+    }
+
+    @Test
+    public void staleUnregisteredPartialsAreSelfHealedWhileFreshAndRegisteredPartialsSurvive()
+            throws Exception {
+        Path archiveRoot = temporary.newFolder("partial-sweep-archive").toPath();
+        Path spillRoot = archiveRoot.resolveSibling("partial-sweep-spill");
+        String table = uniqueTableName("compact_part");
+
+        TieredArchiveConfig config = parquetPrimaryConfig(archiveRoot, spillRoot, List.of("occupancy"));
+        config.compactionUnlinkGraceMinutes = 0;
+
+        OscarTieredObsStore store = openStore(table, config);
+        BigId occStream = addEventOccupancyStream(store, 501L, "occupancy");
+
+        Instant dayStart = Instant.parse("2026-08-02T00:00:00Z");
+        Instant now = Instant.parse("2026-08-03T12:00:00Z");
+        store.add(eventOccupancyObs(occStream, dayStart.plusSeconds(30L), dayStart.plusSeconds(30L),
+                "evt-reg", false, false, 10.0, 1.0, -1, 0));
+        commitStore(store);
+        ArchiveGeneration registeredGen = store.archiveWindow(
+                dayStart, dayStart.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
+        store.maintainArchiveLifecycle();
+
+        // 1. Stale (>= 2h) unregistered .partial files in an otherwise empty date/profile folder -> must be removed + dir pruned.
+        Path staleDir = archiveRoot.resolve("datasets/observations/date=2026-08-01/profile=RAW_EVENTS");
+        Files.createDirectories(staleDir);
+        UUID staleUuid = UUID.randomUUID();
+        Path staleParquet = staleDir.resolve("generation-" + staleUuid + ".parquet.partial");
+        Path staleManifest = staleDir.resolve("generation-" + staleUuid + ".manifest.json.partial");
+        Files.writeString(staleParquet, "interrupted-parquet");
+        Files.writeString(staleManifest, "interrupted-manifest");
+        FileTime threeHoursAgo = FileTime.from(now.minus(3, ChronoUnit.HOURS));
+        Files.setLastModifiedTime(staleParquet, threeHoursAgo);
+        Files.setLastModifiedTime(staleManifest, threeHoursAgo);
+
+        // 2. Fresh (< 2h) unregistered .partial file -> must be preserved!
+        Path freshDir = archiveRoot.resolve("datasets/observations/date=2026-08-03/profile=RAW_EVENTS");
+        Files.createDirectories(freshDir);
+        Path freshPartial = freshDir.resolve("generation-" + UUID.randomUUID() + ".parquet.partial");
+        Files.writeString(freshPartial, "in-flight-parquet");
+        Files.setLastModifiedTime(freshPartial, FileTime.from(now.minus(15, ChronoUnit.MINUTES)));
+
+        // 3. Stale (>= 2h) .partial whose UUID IS registered in oscar_archive_generation -> must fail closed & survive!
+        Path registeredDir = archiveRoot.resolve("datasets/observations/date=2026-08-02/profile=RAW_EVENTS");
+        Path registeredPartial = registeredDir.resolve("generation-" + registeredGen.id() + ".parquet.partial");
+        Files.writeString(registeredPartial, "registered-id-partial");
+        Files.setLastModifiedTime(registeredPartial, threeHoursAgo);
+
+        store.drainDeletingGenerations(now);
+
+        assertFalse("Stale unregistered .parquet.partial must be swept", Files.exists(staleParquet));
+        assertFalse("Stale unregistered .manifest.json.partial must be swept", Files.exists(staleManifest));
+        assertFalse("Empty stale date directory must be pruned", Files.exists(staleDir.getParent()));
+        assertTrue("Fresh (< 2h) .partial file must not be touched", Files.isRegularFile(freshPartial));
+        assertTrue("Registered-UUID .partial file must fail closed and survive", Files.isRegularFile(registeredPartial));
+    }
+
+    @Test
+    public void overlappingMultiPartSourcesClusterAndRollOverIntoStrictlyDisjointParts()
+            throws Exception {
+        Path archiveRoot = temporary.newFolder("cluster-rollover-archive").toPath();
+        Path spillRoot = archiveRoot.resolveSibling("cluster-rollover-spill");
+        String table = uniqueTableName("compact_clst");
+
+        TieredArchiveConfig config = parquetPrimaryConfig(archiveRoot, spillRoot, List.of("occupancy"));
+        config.compactionUnlinkGraceMinutes = 0;
+
+        OscarTieredObsStore store = openStore(table, config);
+        BigId occStream = addEventOccupancyStream(store, 601L, "occupancy");
+
+        Instant dayD = Instant.parse("2026-08-12T00:00:00Z");
+        Instant now = Instant.parse("2026-08-15T12:00:00Z");
+
+        // Insert 30 rows in [00:00, 00:30) and export as 2 OVERLAPPING same-window RAW_EVENTS generations (maxRows=15),
+        // plus 10 rows in [00:30, 01:00).
+        Map<BigId, String> expectedEvents = new HashMap<>();
+        for (int i = 0; i < 30; i++) {
+            Instant t = dayD.plusSeconds(30L + i * 45L);
+            String evt = "evt-clst-0-" + i;
+            expectedEvents.put(store.add(eventOccupancyObs(occStream, t, t, evt, i % 4 == 0, false, 80.0 + i, 1.0, -1, 0)), evt);
+        }
+        for (int i = 0; i < 10; i++) {
+            Instant t = dayD.plusSeconds(1_860L + i * 60L);
+            String evt = "evt-clst-1-" + i;
+            expectedEvents.put(store.add(eventOccupancyObs(occStream, t, t, evt, false, false, 20.0 + i, 1.0, -1, 0)), evt);
+        }
+        commitStore(store);
+
+        config.maximumRowsPerGeneration = 15;
+        ArchiveGeneration partA = store.archiveWindow(
+                dayD, dayD.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
+        ArchiveGeneration partB = store.archiveWindow(
+                dayD, dayD.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
+        ArchiveGeneration win1 = store.archiveWindow(
+                dayD.plus(30, ChronoUnit.MINUTES), dayD.plus(60, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS)
+                .orElseThrow();
+        assertEquals(15L, partA.rowCount());
+        assertEquals(15L, partB.rowCount());
+        assertEquals(10L, win1.rowCount());
+        assertEquals(2, ArchiveCompactionManager.clusterOverlappingSources(List.of(win1, partB, partA)).size());
+
+        store.maintainArchiveLifecycle();
+        assertTrue(store.getImmutableStagePartitions().isEmpty());
+        try (Connection conn = openPg();
+             PreparedStatement ps = conn.prepareStatement(
+                     "UPDATE oscar_archive_generation SET activated_at = ? WHERE store_key = ?")) {
+            UtcJdbcTime.setInstant(ps, 1, now.minus(4, ChronoUnit.HOURS));
+            ps.setString(2, table);
+            assertEquals(3, ps.executeUpdate());
+        }
+
+        // Compact with maxRows=12 -> overlapping inputs merge cleanly and roll into 4 strictly disjoint DAILY_EVENTS parts!
+        config.maximumRowsPerGeneration = 12;
+        ArchiveCompactionManager.CompactionCycleSummary summary = store.runCompactionCycle(now);
+        assertEquals(1, summary.daysCompacted());
+        assertEquals(3, summary.deletingGenerationsDrained());
+
+        try (Connection conn = openPg()) {
+            List<Path> dailyParts = listActiveProfilePaths(conn, table, TieredArchiveConfig.PROFILE_DAILY_EVENTS);
+            assertEquals(4, dailyParts.size());
+            assertStrictlyDisjointProfileWindows(conn, table, TieredArchiveConfig.PROFILE_DAILY_EVENTS,
+                    dayD, dayD.plus(1, ChronoUnit.DAYS), 4);
+            assertEquals(40L, querySumRowCount(conn, table));
+            assertArchiveVerifyClean(conn, table, archiveRoot);
+        }
+
+        for (Map.Entry<BigId, String> e : expectedEvents.entrySet()) {
+            IObsData obs = store.get(e.getKey());
+            assertNotNull(obs);
+            assertEquals(e.getValue(), obs.getResult().getStringValue(0));
+        }
+
+        // Confirm zero leaked scratch or DuckDB operation directories remain under spillRoot.
+        try (Stream<Path> remaining = Files.list(spillRoot)) {
+            List<String> names = remaining.map(p -> p.getFileName().toString()).toList();
+            assertEquals(List.of(DuckDbResourcePolicy.ROOT_LOCK_FILE_NAME), names);
+        }
     }
 
     // --- Helpers ---
@@ -827,9 +1035,11 @@ public class TestMultiTierParquetCompactionIntegration {
         return prefix + "_" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
     }
 
-    private static TieredArchiveConfig baseConfig(Path archiveRoot, Path spillRoot) {
+    private static TieredArchiveConfig parquetPrimaryConfig(
+            Path archiveRoot, Path spillRoot, List<String> outputNames) {
         TieredArchiveConfig config = new TieredArchiveConfig();
         config.enabled = true;
+        config.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
         config.rootDirectory = archiveRoot.toString();
         config.duckDbTemporaryDirectory = spillRoot.toString();
         config.duckDbMemoryLimitMegabytes = 128;
@@ -837,9 +1047,10 @@ public class TestMultiTierParquetCompactionIntegration {
         config.duckDbMaximumTemporaryMegabytes = 256;
         config.duckDbMaximumConcurrentSessions = 2;
         config.duckDbSessionAcquireTimeoutSeconds = 10;
-        config.outputNames = List.of("occupancy", "vehicleOcr", "gammaCounts");
+        config.outputNames = new ArrayList<>(outputNames);
         config.deleteHotAfterArchive = true;
         config.rollbackGraceDays = 1;
+        config.maximumGenerationsPerCycle = 24;
         config.maximumVerificationsPerCycle = 24;
         config.maximumDeletionsPerCycle = 24;
         return config;
@@ -866,6 +1077,11 @@ public class TestMultiTierParquetCompactionIntegration {
         } catch (Exception ignored) {
         }
         try (PreparedStatement ps = conn.prepareStatement("DELETE FROM oscar_obs_stage_partition WHERE store_key = ?")) {
+            ps.setString(1, safe);
+            ps.executeUpdate();
+        } catch (Exception ignored) {
+        }
+        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM oscar_obs_storage_route WHERE store_key = ?")) {
             ps.setString(1, safe);
             ps.executeUpdate();
         } catch (Exception ignored) {
@@ -1074,7 +1290,7 @@ public class TestMultiTierParquetCompactionIntegration {
         try (PreparedStatement ps = conn.prepareStatement(
                 "SELECT object_path FROM oscar_archive_generation " +
                         "WHERE store_key = ? AND profile = ? AND state IN ('ACTIVE', 'SEALED') " +
-                        "ORDER BY window_start, id")) {
+                        "ORDER BY window_start, window_end, id")) {
             ps.setString(1, storeKey);
             ps.setString(2, profile);
             try (ResultSet rs = ps.executeQuery()) {
@@ -1084,6 +1300,37 @@ public class TestMultiTierParquetCompactionIntegration {
             }
         }
         return out;
+    }
+
+    private static void assertStrictlyDisjointProfileWindows(
+            Connection conn, String storeKey, String profile,
+            Instant expectedStart, Instant expectedEnd, int expectedParts) throws Exception {
+        List<Instant[]> bounds = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT window_start, window_end FROM oscar_archive_generation " +
+                        "WHERE store_key = ? AND profile = ? AND state IN ('ACTIVE', 'SEALED') " +
+                        "ORDER BY window_start, window_end, id")) {
+            ps.setString(1, storeKey);
+            ps.setString(2, profile);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    bounds.add(new Instant[]{
+                            UtcJdbcTime.getInstant(rs, 1),
+                            UtcJdbcTime.getInstant(rs, 2)});
+                }
+            }
+        }
+        assertEquals(expectedParts, bounds.size());
+        assertEquals(expectedStart, bounds.get(0)[0]);
+        assertEquals(expectedEnd, bounds.get(bounds.size() - 1)[1]);
+        for (int i = 0; i < bounds.size(); i++) {
+            assertTrue("Each part window must have non-empty positive width",
+                    bounds.get(i)[0].isBefore(bounds.get(i)[1]));
+            if (i > 0) {
+                assertEquals("Adjacent rolled-over parts must be contiguous and strictly disjoint",
+                        bounds.get(i - 1)[1], bounds.get(i)[0]);
+            }
+        }
     }
 
     private static void assertParquetV2AndColumnCount(Path parquetFile, int expectedColumns) throws Exception {
@@ -1105,21 +1352,24 @@ public class TestMultiTierParquetCompactionIntegration {
         }
     }
 
-    private static void assertOverlappingIdBlocksExist(Connection conn, String storeKey) throws Exception {
+    private static void assertOverlappingIdBlocksExist(
+            Connection conn, String storeKey, String profileA, String profileB) throws Exception {
         String sql = "SELECT count(*) FROM oscar_archive_id_block a " +
                 "JOIN oscar_archive_generation ga ON ga.id = a.generation_id " +
                 "JOIN oscar_archive_id_block b ON b.generation_id <> a.generation_id " +
                 "JOIN oscar_archive_generation gb ON gb.id = b.generation_id " +
                 "WHERE ga.store_key = ? AND gb.store_key = ? " +
                 "  AND ga.state IN ('ACTIVE', 'SEALED') AND gb.state IN ('ACTIVE', 'SEALED') " +
-                "  AND ga.profile = 'DAILY_EVENTS' AND gb.profile = 'DAILY_TELEMETRY' " +
+                "  AND ga.profile = ? AND gb.profile = ? " +
                 "  AND a.min_id <= b.max_id AND b.min_id <= a.max_id";
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, storeKey);
             ps.setString(2, storeKey);
+            ps.setString(3, profileA);
+            ps.setString(4, profileB);
             try (ResultSet rs = ps.executeQuery()) {
                 assertTrue(rs.next());
-                assertTrue("Expected overlapping [min_id, max_id] blocks across DAILY_EVENTS and DAILY_TELEMETRY",
+                assertTrue("Expected overlapping [min_id, max_id] blocks across " + profileA + " and " + profileB,
                         rs.getLong(1) > 0L);
             }
         }
@@ -1203,7 +1453,6 @@ public class TestMultiTierParquetCompactionIntegration {
             }
         }
 
-        // Reconcile every physical file/dir in archiveRoot against ACTIVE/DELETING catalog rows (audit_archive_filesystem)
         Set<String> registeredObjects = new HashSet<>();
         try (PreparedStatement ps = conn.prepareStatement(
                 "SELECT o.relative_path FROM oscar_archive_object o " +

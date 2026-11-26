@@ -50,6 +50,20 @@ final class DuckDbResourcePolicy {
     }
 
     static Session open(TieredArchiveConfig config, String operation) throws Exception {
+        return open(config, operation, false);
+    }
+
+    /**
+     * Opens a bounded DuckDB session backed by a session-private database file
+     * inside {@code operationDirectory} so large staged tables and external
+     * sorts transparently spill within {@code memory_limit} and are removed
+     * atomically when the session closes.
+     */
+    static Session openFileBacked(TieredArchiveConfig config, String operation) throws Exception {
+        return open(config, operation, true);
+    }
+
+    private static Session open(TieredArchiveConfig config, String operation, boolean fileBacked) throws Exception {
         config.validate();
         if (operation == null || !SAFE_OPERATION.matcher(operation).matches())
             throw new IllegalArgumentException("Unsafe DuckDB operation name");
@@ -71,24 +85,12 @@ final class DuckDbResourcePolicy {
                     archiveRoot.toRealPath() : archiveRoot;
             requireDisjointRoots(realArchiveRoot, realTemporaryRoot);
             initializeTemporaryRoot(realTemporaryRoot);
-            operationDirectory = realTemporaryRoot.resolve(
-                    operation + '-' + UUID.randomUUID()).normalize();
-            if (!operationDirectory.getParent().equals(realTemporaryRoot))
-                throw new IllegalStateException(
-                        "DuckDB operation directory escaped its configured parent");
-            if (supportsPosix(realTemporaryRoot))
-                Files.createDirectory(operationDirectory,
-                        PosixFilePermissions.asFileAttribute(PRIVATE_DIRECTORY_PERMISSIONS));
-            else
-                Files.createDirectory(operationDirectory);
-            BasicFileAttributes attributes = Files.readAttributes(
-                    operationDirectory, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            if (!attributes.isDirectory() || attributes.isSymbolicLink())
-                throw new IllegalStateException(
-                        "DuckDB operation directory creation was redirected");
-            requirePrivatePosixDirectory(operationDirectory);
+            operationDirectory = createOperationDirectory(realTemporaryRoot, operation);
 
-            connection = DriverManager.getConnection("jdbc:duckdb:");
+            String jdbcUrl = fileBacked
+                    ? "jdbc:duckdb:" + operationDirectory.resolve("work.duckdb")
+                    : "jdbc:duckdb:";
+            connection = DriverManager.getConnection(jdbcUrl);
             try (Statement statement = connection.createStatement()) {
                 statement.execute("SET memory_limit='" + config.duckDbMemoryLimitMegabytes + "MB'");
                 statement.execute("SET threads=" + config.duckDbThreads);
@@ -109,6 +111,48 @@ final class DuckDbResourcePolicy {
             permit.close();
             throw error;
         }
+    }
+
+    /**
+     * Creates a private 0700 scratch directory inside {@code duckDbTemporaryDirectory}
+     * without occupying a DuckDB session permit. Recognized directories left
+     * behind after a hard crash are reclaimed automatically on next startup.
+     */
+    static ScratchDirectory openScratchDirectory(TieredArchiveConfig config, String operation) throws Exception {
+        config.validate();
+        if (operation == null || !SAFE_OPERATION.matcher(operation).matches())
+            throw new IllegalArgumentException("Unsafe DuckDB operation name");
+        Path archiveRoot = Path.of(config.rootDirectory).toAbsolutePath().normalize();
+        Path temporaryRoot = Path.of(config.duckDbTemporaryDirectory).toAbsolutePath().normalize();
+        requireDisjointRoots(archiveRoot, temporaryRoot);
+        preparePrivateDirectory(temporaryRoot);
+        Path realTemporaryRoot = temporaryRoot.toRealPath();
+        Path realArchiveRoot = Files.exists(archiveRoot, LinkOption.NOFOLLOW_LINKS) ?
+                archiveRoot.toRealPath() : archiveRoot;
+        requireDisjointRoots(realArchiveRoot, realTemporaryRoot);
+        initializeTemporaryRoot(realTemporaryRoot);
+        Path dir = createOperationDirectory(realTemporaryRoot, operation);
+        return new ScratchDirectory(realTemporaryRoot, dir);
+    }
+
+    private static Path createOperationDirectory(Path realTemporaryRoot, String operation) throws IOException {
+        Path operationDirectory = realTemporaryRoot.resolve(
+                operation + '-' + UUID.randomUUID()).normalize();
+        if (!operationDirectory.getParent().equals(realTemporaryRoot))
+            throw new IllegalStateException(
+                    "DuckDB operation directory escaped its configured parent");
+        if (supportsPosix(realTemporaryRoot))
+            Files.createDirectory(operationDirectory,
+                    PosixFilePermissions.asFileAttribute(PRIVATE_DIRECTORY_PERMISSIONS));
+        else
+            Files.createDirectory(operationDirectory);
+        BasicFileAttributes attributes = Files.readAttributes(
+                operationDirectory, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!attributes.isDirectory() || attributes.isSymbolicLink())
+            throw new IllegalStateException(
+                    "DuckDB operation directory creation was redirected");
+        requirePrivatePosixDirectory(operationDirectory);
+        return operationDirectory;
     }
 
     private static void preparePrivateDirectory(Path directory) throws IOException {
@@ -422,6 +466,33 @@ final class DuckDbResourcePolicy {
             } finally {
                 permit.close();
             }
+        }
+    }
+
+    static final class ScratchDirectory implements AutoCloseable {
+        private final Path temporaryRoot;
+        private final Path directory;
+        private boolean closed;
+
+        private ScratchDirectory(Path temporaryRoot, Path directory) {
+            this.temporaryRoot = temporaryRoot;
+            this.directory = directory;
+        }
+
+        Path path() {
+            return directory;
+        }
+
+        @Override
+        public synchronized void close() {
+            if (closed)
+                return;
+            closed = true;
+            Throwable failure = new IllegalStateException("DuckDB scratch cleanup failed");
+            int priorSuppressed = failure.getSuppressed().length;
+            deleteOperationDirectory(temporaryRoot, directory, failure);
+            if (failure.getSuppressed().length != priorSuppressed)
+                throw new IllegalStateException("Cannot close DuckDB scratch directory", failure);
         }
     }
 

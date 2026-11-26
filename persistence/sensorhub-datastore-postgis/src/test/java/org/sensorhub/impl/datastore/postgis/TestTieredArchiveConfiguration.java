@@ -446,10 +446,51 @@ public class TestTieredArchiveConfiguration {
         config.maximumUncompressedBytesPerGeneration = Long.MAX_VALUE;
         assertEquals(32L * 1024 * 1024,
                 config.effectiveMaximumUncompressedBytesPerGeneration());
+        assertEquals(128L * 1024 * 1024,
+                config.effectiveTelemetryExportUncompressedBytes());
+        assertEquals(192L * 1024 * 1024,
+                config.effectiveCompactionPartUncompressedBytes());
+        assertEquals(TieredArchiveConfig.DEFAULT_COMPACTION_PART_MAX_ROWS,
+                config.effectiveCompactionPartMaxRows());
 
         config.maximumUncompressedBytesPerGeneration = 8L * 1024 * 1024;
+        config.maximumRowsPerGeneration = 250_000;
         assertEquals(8L * 1024 * 1024,
                 config.effectiveMaximumUncompressedBytesPerGeneration());
+        assertEquals(8L * 1024 * 1024,
+                config.effectiveTelemetryExportUncompressedBytes());
+        assertEquals(8L * 1024 * 1024,
+                config.effectiveCompactionPartUncompressedBytes());
+        assertEquals(250_000L, config.effectiveCompactionPartMaxRows());
+    }
+
+    @Test
+    public void splitAtExportEventOutputSetAndV2ProfilePredicatesAreStrict() {
+        assertEquals(java.util.Set.of(
+                "occupancy", "alarm", "adjudication", "report", "vehicleOcr",
+                "emlAnalysis", "tamper", "siteStatistics", "nationalSummary"),
+                TieredArchiveConfig.EVENT_OUTPUT_NAMES);
+        assertFalse(TieredArchiveConfig.isEventOutputName("dailyFile"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("connectionStatus"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("occupancyStatus"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("gammaCounts"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("gammaThreshold"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("neutronCounts"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("emlScanContextual"));
+
+        assertTrue(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_RAW_EVENTS));
+        assertTrue(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_DAILY_EVENTS));
+        assertTrue(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_MONTHLY_EVENTS));
+        assertFalse(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_RAW_TELEMETRY));
+        assertFalse(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_DAILY_TELEMETRY));
+        assertFalse(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_RAW_GATED));
+
+        assertTrue(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_RAW_EVENTS));
+        assertTrue(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_RAW_TELEMETRY));
+        assertTrue(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_DAILY_EVENTS));
+        assertTrue(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_DAILY_TELEMETRY));
+        assertTrue(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_MONTHLY_EVENTS));
+        assertFalse(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_RAW_GATED));
     }
 
     @Test

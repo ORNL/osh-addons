@@ -13,9 +13,11 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryNotEmptyException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.sql.ResultSet;
@@ -44,12 +46,23 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Multi-tier LSM Parquet V2 compaction, settled-overlay folding, monthly
- * consolidation, periodic defragmentation, and reader-pin-safe superseded
- * generation cleanup.
+ * Event-only multi-tier Parquet V2 compaction, settled-overlay folding,
+ * monthly consolidation, periodic per-part defragmentation, reader-pin-safe
+ * superseded generation cleanup, and stale unregistered {@code .partial}
+ * hygiene.
+ *
+ * <p>High-rate {@code 1 Hz} telemetry streams are written once directly into
+ * {@code RAW_TELEMETRY} by {@link ArchiveExporter} and are never rewritten here.
+ * This manager compacts only the compact (~1.3% of total rows) operational
+ * event tier ({@code RAW_EVENTS} -&gt; {@code DAILY_EVENTS} -&gt;
+ * {@code MONTHLY_EVENTS}) with explicit rollover size/row limits, chunk-spilled
+ * streaming writes, and strictly disjoint sub-window bounds across multi-part
+ * rollovers.</p>
  */
 public final class ArchiveCompactionManager {
     private static final Logger LOG = LoggerFactory.getLogger(ArchiveCompactionManager.class);
@@ -60,10 +73,12 @@ public final class ArchiveCompactionManager {
 
     private static final int DAILY_EVENTS_ROW_GROUP_SIZE = 8_192;
     private static final int MONTHLY_EVENTS_ROW_GROUP_SIZE = 16_384;
-    private static final int DAILY_TELEMETRY_ROW_GROUP_SIZE = 65_536;
-    private static final long MAX_PROJECTED_EVENT_PART_UNCOMPRESSED_BYTES = 16L * 1024L * 1024L;
     private static final long MAX_COMPACTION_CYCLE_NANOS = TimeUnit.SECONDS.toNanos(40);
-    private static final int SOURCE_READ_CHUNK_ROWS = 60_000;
+    private static final int SOURCE_READ_CHUNK_ROWS = 50_000;
+    private static final Duration STALE_PARTIAL_MIN_AGE = Duration.ofHours(2);
+    private static final Pattern ARCHIVE_PARTIAL_FILE_PATTERN = Pattern.compile(
+            "^generation-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})" +
+                    "\\.(?:parquet|schemas\\.json\\.gz|manifest\\.json)\\.partial.*$");
 
     private final ArchiveCatalog catalog;
     private final ParquetArchiveReader archiveReader;
@@ -181,16 +196,6 @@ public final class ArchiveCompactionManager {
         List<UUID> sourceIds = sources.stream().map(ArchiveGeneration::id).toList();
         ArchiveCatalog.CompactionSchemaCatalog schemaCatalog =
                 catalog.loadCompactionSchemas(sourceIds, dataStreamTable);
-        Set<Long> eventStreams = new HashSet<>();
-        Set<Long> telemetryStreams = new HashSet<>();
-        for (Long dsId : schemaCatalog.schemasByStreamId().keySet()) {
-            String outName = schemaCatalog.outputNameByStreamId().get(dsId);
-            if (TieredArchiveConfig.isEventOutputName(outName))
-                eventStreams.add(dsId);
-            else
-                telemetryStreams.add(dsId);
-        }
-
         Instant settledOverlayCutoff = now.minus(2, ChronoUnit.HOURS);
         Map<Long, ArchiveCatalog.FoldedOverlayCandidate> settledOverlays =
                 catalog.loadSettledOverlaysForFolding(
@@ -198,23 +203,12 @@ public final class ArchiveCompactionManager {
         Set<Long> preReferencedIds = catalog.loadReferencedObservationIdsOnGenerations(sourceIds);
 
         LocalDate partitionDate = dayCandidate.windowStart().atZone(ZoneOffset.UTC).toLocalDate();
-        List<ProfileTargetSpec> specs = new ArrayList<>(2);
-        if (!eventStreams.isEmpty()) {
-            specs.add(new ProfileTargetSpec(
-                    TieredArchiveConfig.PROFILE_DAILY_EVENTS,
-                    eventStreams,
-                    partitionDate,
-                    true,
-                    DAILY_EVENTS_ROW_GROUP_SIZE));
-        }
-        if (!telemetryStreams.isEmpty()) {
-            specs.add(new ProfileTargetSpec(
-                    TieredArchiveConfig.PROFILE_DAILY_TELEMETRY,
-                    telemetryStreams,
-                    partitionDate,
-                    false,
-                    DAILY_TELEMETRY_ROW_GROUP_SIZE));
-        }
+        List<ProfileTargetSpec> specs = List.of(new ProfileTargetSpec(
+                TieredArchiveConfig.PROFILE_DAILY_EVENTS,
+                null,
+                partitionDate,
+                true,
+                DAILY_EVENTS_ROW_GROUP_SIZE));
         return executeCompactionJob(
                 dayCandidate.windowStart(),
                 dayCandidate.windowEnd(),
@@ -531,18 +525,19 @@ public final class ArchiveCompactionManager {
         if (spec.allowedStreamIds() != null && spec.allowedStreamIds().isEmpty()) {
             return new ProfileBuildResult(0L, List.of(), List.of(), Map.of());
         }
-        long maxBytesPerPart = spec.projectedEventColumns()
-                ? Math.min(config.effectiveMaximumUncompressedBytesPerGeneration(),
-                        MAX_PROJECTED_EVENT_PART_UNCOMPRESSED_BYTES)
-                : config.effectiveMaximumUncompressedBytesPerGeneration();
-        long maxRowsPerPart = Math.min(config.maximumRowsPerGeneration, 250_000L);
+        long maxBytesPerPart = config.effectiveCompactionPartUncompressedBytes();
+        long maxRowsPerPart = config.effectiveCompactionPartMaxRows();
+        long hardCapRowsPerPart = Math.multiplyExact(maxRowsPerPart, 2L);
+        long hardCapBytesPerPart = Math.multiplyExact(maxBytesPerPart, 2L);
 
         MultisetRowDigest sourceDigest = new MultisetRowDigest();
         LongIdTracker sourceIdsSeen = new LongIdTracker();
         long sourceProfileRows = 0L;
         List<PendingPart> pendingParts = new ArrayList<>();
         PartAccumulator currentPart = new PartAccumulator();
-        List<StagedRow> currentPartRows = new ArrayList<>();
+        List<StagedRow> currentChunkBuffer = new ArrayList<>();
+        List<Path> spilledChunkFiles = new ArrayList<>();
+        int spillChunkSequence = 0;
 
         String streamFilterClause = null;
         if (spec.allowedStreamIds() != null) {
@@ -552,9 +547,8 @@ public final class ArchiveCompactionManager {
                     .collect(Collectors.joining(","));
         }
 
-        Path realRoot = root.toRealPath();
-        for (int sIdx = 0; sIdx < sources.size(); sIdx++) {
-            ArchiveGeneration src = sources.get(sIdx);
+        List<ArchiveGeneration> filteredSources = new ArrayList<>(sources.size());
+        for (ArchiveGeneration src : sources) {
             if (spec.allowedStreamIds() != null && schemaCatalog.streamIdsByGeneration() != null) {
                 Set<Long> genStreams = schemaCatalog.streamIdsByGeneration().get(src.id());
                 if (genStreams != null && !genStreams.isEmpty() &&
@@ -562,127 +556,179 @@ public final class ArchiveCompactionManager {
                     continue;
                 }
             }
-            Path srcFile = realRoot.resolve(src.objectPath().normalize()).normalize();
-            long offsetInSource = 0L;
-            boolean sourceExhausted = false;
+            filteredSources.add(src);
+        }
+        List<List<ArchiveGeneration>> sourceClusters = clusterOverlappingSources(filteredSources);
 
-            while (!sourceExhausted) {
-                List<StagedRow> chunkRows = new ArrayList<>();
-                boolean stoppedOnChunkBytes = false;
+        Path realRoot = root.toRealPath();
+        try (DuckDbResourcePolicy.ScratchDirectory scratchDir =
+                     DuckDbResourcePolicy.openScratchDirectory(config, "compaction-stage")) {
+            for (int cIdx = 0; cIdx < sourceClusters.size(); cIdx++) {
+                List<ArchiveGeneration> cluster = sourceClusters.get(cIdx);
+                long offsetInCluster = 0L;
+                boolean clusterExhausted = false;
 
-                // Short-lived read session per source chunk so activeBackgroundCount never nests
-                // and foreground queries never wait behind multi-file compaction reads.
-                try (DuckDbResourcePolicy.Session readSession =
-                             DuckDbResourcePolicy.open(config, "archive-compaction")) {
-                    Path opDir = readSession.operationDirectory();
-                    Path stagedSrc = ArchiveExporter.stageToLocalDirectory(
-                            srcFile, opDir, "src-" + sIdx + "-" + offsetInSource + "-" + src.id() + ".parquet");
-                    try {
-                        StringBuilder readSql = new StringBuilder(
-                                "SELECT id_scope, id_value, datastream_scope, datastream_id, " +
-                                        "foi_scope, foi_id, phenomenon_time, result_time, result_json " +
-                                        "FROM read_parquet('")
-                                .append(ArchiveExporter.sqlLiteral(stagedSrc.toString()))
-                                .append("', union_by_name=true)");
-                        if (streamFilterClause != null) {
-                            readSql.append(" WHERE datastream_id IN (").append(streamFilterClause).append(')');
-                        }
-                        readSql.append(" ORDER BY phenomenon_time ASC NULLS FIRST, result_time ASC NULLS FIRST, id_value ASC")
-                                .append(" LIMIT ").append(SOURCE_READ_CHUNK_ROWS)
-                                .append(" OFFSET ").append(offsetInSource);
+                while (!clusterExhausted) {
+                    List<StagedRow> chunkRows = new ArrayList<>();
+                    boolean stoppedOnChunkBytes = false;
 
-                        long chunkBytes = 0L;
-                        long rowsReadThisPass = 0L;
-                        try (Statement readStmt = readSession.connection().createStatement();
-                             ResultSet rs = readStmt.executeQuery(readSql.toString())) {
-                            while (rs.next()) {
-                                int rowIdScope = rs.getInt(1);
-                                long obsId = rs.getLong(2);
-                                int dsScope = rs.getInt(3);
-                                long dsId = rs.getLong(4);
-                                Integer foiScope = rs.getObject(5, Integer.class);
-                                Long foiId = rs.getObject(6, Long.class);
-                                Instant phenTime = UtcJdbcTime.getDuckDbInstant(rs, 7);
-                                Instant resTime = UtcJdbcTime.getDuckDbInstant(rs, 8);
-                                String resultJson = rs.getString(9);
-                                chunkRows.add(new StagedRow(
-                                        rowIdScope, obsId, dsScope, dsId, foiScope, foiId, phenTime, resTime, resultJson));
-                                rowsReadThisPass++;
-                                chunkBytes = Math.addExact(
-                                        chunkBytes, ArchiveExporter.estimateUncompressedRowBytes(resultJson));
-                                if (chunkBytes >= maxBytesPerPart && rowsReadThisPass < SOURCE_READ_CHUNK_ROWS) {
-                                    stoppedOnChunkBytes = true;
-                                    break;
+                    // Short-lived read session per source chunk so activeBackgroundCount never
+                    // exceeds 1 and foreground interactive queries never wait behind compaction.
+                    try (DuckDbResourcePolicy.Session readSession =
+                                 DuckDbResourcePolicy.open(config, "archive-compaction")) {
+                        Path opDir = readSession.operationDirectory();
+                        List<Path> stagedFiles = new ArrayList<>(cluster.size());
+                        try {
+                            for (int fIdx = 0; fIdx < cluster.size(); fIdx++) {
+                                ArchiveGeneration src = cluster.get(fIdx);
+                                Path srcFile = realRoot.resolve(src.objectPath().normalize()).normalize();
+                                stagedFiles.add(ArchiveExporter.stageToLocalDirectory(
+                                        srcFile, opDir,
+                                        "src-" + cIdx + "-" + fIdx + "-" + offsetInCluster + "-" + src.id() + ".parquet"));
+                            }
+                            StringBuilder readSql = new StringBuilder(
+                                    "SELECT id_scope, id_value, datastream_scope, datastream_id, " +
+                                            "foi_scope, foi_id, phenomenon_time, result_time, result_json " +
+                                            "FROM read_parquet(");
+                            if (stagedFiles.size() == 1) {
+                                readSql.append('\'').append(ArchiveExporter.sqlLiteral(stagedFiles.get(0).toString())).append('\'');
+                            } else {
+                                readSql.append('[');
+                                for (int fIdx = 0; fIdx < stagedFiles.size(); fIdx++) {
+                                    if (fIdx > 0)
+                                        readSql.append(',');
+                                    readSql.append('\'').append(ArchiveExporter.sqlLiteral(stagedFiles.get(fIdx).toString())).append('\'');
+                                }
+                                readSql.append(']');
+                            }
+                            readSql.append(", union_by_name=true)");
+                            if (streamFilterClause != null) {
+                                readSql.append(" WHERE datastream_id IN (").append(streamFilterClause).append(')');
+                            }
+                            readSql.append(" ORDER BY phenomenon_time ASC NULLS FIRST, result_time ASC NULLS FIRST, id_value ASC")
+                                    .append(" LIMIT ").append(SOURCE_READ_CHUNK_ROWS)
+                                    .append(" OFFSET ").append(offsetInCluster);
+
+                            long chunkBytes = 0L;
+                            long rowsReadThisPass = 0L;
+                            try (Statement readStmt = readSession.connection().createStatement();
+                                 ResultSet rs = readStmt.executeQuery(readSql.toString())) {
+                                while (rs.next()) {
+                                    int rowIdScope = rs.getInt(1);
+                                    long obsId = rs.getLong(2);
+                                    int dsScope = rs.getInt(3);
+                                    long dsId = rs.getLong(4);
+                                    Integer foiScope = rs.getObject(5, Integer.class);
+                                    Long foiId = rs.getObject(6, Long.class);
+                                    Instant phenTime = UtcJdbcTime.getDuckDbInstant(rs, 7);
+                                    Instant resTime = UtcJdbcTime.getDuckDbInstant(rs, 8);
+                                    String resultJson = rs.getString(9);
+                                    chunkRows.add(new StagedRow(
+                                            rowIdScope, obsId, dsScope, dsId, foiScope, foiId, phenTime, resTime, resultJson));
+                                    rowsReadThisPass++;
+                                    chunkBytes = Math.addExact(
+                                            chunkBytes, ArchiveExporter.estimateUncompressedRowBytes(resultJson));
+                                    if (chunkBytes >= maxBytesPerPart && rowsReadThisPass < SOURCE_READ_CHUNK_ROWS) {
+                                        stoppedOnChunkBytes = true;
+                                        break;
+                                    }
                                 }
                             }
+                            offsetInCluster += rowsReadThisPass;
+                            if (!stoppedOnChunkBytes && rowsReadThisPass < SOURCE_READ_CHUNK_ROWS) {
+                                clusterExhausted = true;
+                            }
+                        } finally {
+                            for (Path staged : stagedFiles) {
+                                Files.deleteIfExists(staged);
+                            }
                         }
-                        offsetInSource += rowsReadThisPass;
-                        if (!stoppedOnChunkBytes && rowsReadThisPass < SOURCE_READ_CHUNK_ROWS) {
-                            sourceExhausted = true;
+                    }
+
+                    for (StagedRow raw : chunkRows) {
+                        int rowIdScope = raw.idScope();
+                        long obsId = raw.id();
+                        int dsScope = raw.dataStreamScope();
+                        long dsId = raw.dataStreamId();
+                        Integer foiScope = raw.foiScope();
+                        Long foiId = raw.foiId();
+                        Instant phenTime = raw.phenomenonTime();
+                        Instant resTime = raw.resultTime();
+                        String resultJson = raw.resultJson();
+
+                        ArchiveCatalog.FoldedOverlayCandidate folded = settledOverlays.get(obsId);
+                        if (folded != null) {
+                            dsId = folded.dataStreamId();
+                            foiId = folded.foiId();
+                            foiScope = foiId == null ? null : rowIdScope;
+                            phenTime = folded.phenomenonTime();
+                            resTime = folded.resultTime();
+                            resultJson = folded.resultJson();
                         }
-                    } finally {
-                        Files.deleteIfExists(stagedSrc);
+
+                        long estBytes = ArchiveExporter.estimateUncompressedRowBytes(resultJson);
+                        boolean wouldExceed = currentPart.rowCount > 0 &&
+                                (currentPart.rowCount + 1 > maxRowsPerPart ||
+                                 currentPart.estimatedBytes + estBytes > maxBytesPerPart);
+                        boolean timestampBoundary = currentPart.maxPhenomenonTime != null &&
+                                phenTime != null &&
+                                phenTime.isAfter(currentPart.maxPhenomenonTime);
+                        boolean hardCapReached = currentPart.rowCount >= hardCapRowsPerPart ||
+                                currentPart.estimatedBytes + estBytes > hardCapBytesPerPart;
+
+                        if (wouldExceed && (timestampBoundary || hardCapReached)) {
+                            PendingPart written = finalizeAndStagePart(
+                                    currentChunkBuffer,
+                                    spilledChunkFiles,
+                                    scratchDir.path(),
+                                    spillChunkSequence++,
+                                    spec,
+                                    currentPart,
+                                    publishedFilesToRollback);
+                            pendingParts.add(written);
+                            deletePathsQuietly(spilledChunkFiles);
+                            spilledChunkFiles.clear();
+                            currentChunkBuffer.clear();
+                            currentPart = new PartAccumulator();
+                        }
+
+                        StagedRow effective = new StagedRow(
+                                rowIdScope, obsId, dsScope, dsId, foiScope, foiId, phenTime, resTime, resultJson);
+                        currentChunkBuffer.add(effective);
+
+                        byte[] rowSha = computeSingleRowSha256(
+                                obsId, dsId, foiId, phenTime, resTime, resultJson);
+                        sourceDigest.observe(rowSha);
+                        sourceIdsSeen.add(obsId);
+
+                        currentPart.observe(effective, estBytes, trackOwnerIds.contains(obsId));
+                        sourceProfileRows++;
+
+                        if (currentChunkBuffer.size() >= SOURCE_READ_CHUNK_ROWS) {
+                            Path spilled = spillChunkToScratchParquet(
+                                    currentChunkBuffer, spec.projectedEventColumns(),
+                                    scratchDir.path(), spillChunkSequence++);
+                            spilledChunkFiles.add(spilled);
+                            currentChunkBuffer.clear();
+                        }
                     }
-                }
-
-                for (StagedRow raw : chunkRows) {
-                    int rowIdScope = raw.idScope();
-                    long obsId = raw.id();
-                    int dsScope = raw.dataStreamScope();
-                    long dsId = raw.dataStreamId();
-                    Integer foiScope = raw.foiScope();
-                    Long foiId = raw.foiId();
-                    Instant phenTime = raw.phenomenonTime();
-                    Instant resTime = raw.resultTime();
-                    String resultJson = raw.resultJson();
-
-                    ArchiveCatalog.FoldedOverlayCandidate folded = settledOverlays.get(obsId);
-                    if (folded != null) {
-                        dsId = folded.dataStreamId();
-                        foiId = folded.foiId();
-                        foiScope = foiId == null ? null : rowIdScope;
-                        phenTime = folded.phenomenonTime();
-                        resTime = folded.resultTime();
-                        resultJson = folded.resultJson();
-                    }
-
-                    long estBytes = ArchiveExporter.estimateUncompressedRowBytes(resultJson);
-                    boolean wouldExceed = currentPart.rowCount > 0 &&
-                            (currentPart.rowCount + 1 > maxRowsPerPart ||
-                             currentPart.estimatedBytes + estBytes > maxBytesPerPart);
-                    boolean timestampBoundary = currentPart.lastPhenomenonTime == null ||
-                            !Objects.equals(currentPart.lastPhenomenonTime, phenTime);
-                    boolean hardCapReached = currentPart.rowCount >= maxRowsPerPart ||
-                            currentPart.estimatedBytes + estBytes > Math.multiplyExact(maxBytesPerPart, 2L);
-
-                    if (wouldExceed && (timestampBoundary || hardCapReached)) {
-                        PendingPart written = writeAndStagePartialParquet(
-                                currentPartRows, spec, currentPart, publishedFilesToRollback);
-                        pendingParts.add(written);
-                        currentPartRows.clear();
-                        currentPart = new PartAccumulator();
-                    }
-
-                    StagedRow effective = new StagedRow(
-                            rowIdScope, obsId, dsScope, dsId, foiScope, foiId, phenTime, resTime, resultJson);
-                    currentPartRows.add(effective);
-
-                    byte[] rowSha = computeSingleRowSha256(
-                            obsId, dsId, foiId, phenTime, resTime, resultJson);
-                    sourceDigest.observe(rowSha);
-                    sourceIdsSeen.add(obsId);
-
-                    currentPart.observe(effective, estBytes, trackOwnerIds.contains(obsId));
-                    sourceProfileRows++;
                 }
             }
-        }
 
-        if (currentPart.rowCount > 0) {
-            PendingPart written = writeAndStagePartialParquet(
-                    currentPartRows, spec, currentPart, publishedFilesToRollback);
-            pendingParts.add(written);
-            currentPartRows.clear();
+            if (currentPart.rowCount > 0) {
+                PendingPart written = finalizeAndStagePart(
+                        currentChunkBuffer,
+                        spilledChunkFiles,
+                        scratchDir.path(),
+                        spillChunkSequence,
+                        spec,
+                        currentPart,
+                        publishedFilesToRollback);
+                pendingParts.add(written);
+                deletePathsQuietly(spilledChunkFiles);
+                spilledChunkFiles.clear();
+                currentChunkBuffer.clear();
+            }
         }
 
         if (sourceProfileRows == 0L) {
@@ -724,7 +770,86 @@ public final class ArchiveCompactionManager {
         return new ProfileBuildResult(sourceProfileRows, bundles, activations, owners);
     }
 
-    private static final int DUCKDB_INSERT_BATCH_SIZE = 250;
+    /**
+     * Groups overlapping source generations into sorted read clusters so
+     * multi-part same-window inputs emit rows in globally non-decreasing
+     * {@code phenomenon_time} order and rolled-over output parts receive
+     * strictly disjoint {@code [window_start, window_end)} intervals.
+     */
+    static List<List<ArchiveGeneration>> clusterOverlappingSources(List<ArchiveGeneration> sources) {
+        if (sources == null || sources.isEmpty())
+            return List.of();
+        List<ArchiveGeneration> sorted = new ArrayList<>(sources);
+        sorted.sort(Comparator.comparing(ArchiveGeneration::start)
+                .thenComparing(ArchiveGeneration::end)
+                .thenComparing(g -> g.id().toString()));
+        List<List<ArchiveGeneration>> clusters = new ArrayList<>();
+        List<ArchiveGeneration> current = new ArrayList<>();
+        Instant currentEnd = null;
+        for (ArchiveGeneration gen : sorted) {
+            if (current.isEmpty()) {
+                current.add(gen);
+                currentEnd = gen.end();
+            } else if (gen.start().isBefore(currentEnd)) {
+                current.add(gen);
+                if (gen.end().isAfter(currentEnd))
+                    currentEnd = gen.end();
+            } else {
+                clusters.add(current);
+                current = new ArrayList<>();
+                current.add(gen);
+                currentEnd = gen.end();
+            }
+        }
+        if (!current.isEmpty())
+            clusters.add(current);
+        return clusters;
+    }
+
+    private Path spillChunkToScratchParquet(
+            List<StagedRow> chunkRows,
+            boolean projected,
+            Path scratchDir,
+            int chunkSeq) throws Exception {
+        Path chunkFile = scratchDir.resolve(String.format("chunk-%06d.parquet", chunkSeq)).normalize();
+        if (!chunkFile.getParent().equals(scratchDir.normalize()))
+            throw new IllegalStateException("Spill chunk path escaped scratch directory");
+        try (DuckDbResourcePolicy.Session session =
+                     DuckDbResourcePolicy.open(config, "archive-compaction")) {
+            createCompactionPartTable(session.connection(), projected);
+            appendStagedRowsNative(session.connection(), chunkRows, projected);
+            try (Statement stmt = session.connection().createStatement()) {
+                stmt.execute("COPY compaction_part TO '" + ArchiveExporter.sqlLiteral(chunkFile.toString()) +
+                        "' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 1)");
+            }
+        }
+        return chunkFile;
+    }
+
+    private PendingPart finalizeAndStagePart(
+            List<StagedRow> trailingBuffer,
+            List<Path> spilledChunkFiles,
+            Path scratchDir,
+            int nextChunkSeq,
+            ProfileTargetSpec spec,
+            PartAccumulator acc,
+            List<Path> rollbackPaths) throws Exception {
+        if (spilledChunkFiles.isEmpty()) {
+            return writeAndStagePartialParquet(trailingBuffer, null, spec, acc, rollbackPaths);
+        }
+        List<Path> allChunks = new ArrayList<>(spilledChunkFiles);
+        if (!trailingBuffer.isEmpty()) {
+            allChunks.add(spillChunkToScratchParquet(
+                    trailingBuffer, spec.projectedEventColumns(), scratchDir, nextChunkSeq));
+        }
+        try {
+            return writeAndStagePartialParquet(null, allChunks, spec, acc, rollbackPaths);
+        } finally {
+            if (allChunks.size() > spilledChunkFiles.size()) {
+                Files.deleteIfExists(allChunks.get(allChunks.size() - 1));
+            }
+        }
+    }
 
     private static void assignPartWindows(
             List<PendingPart> parts, Instant jobWindowStart, Instant jobWindowEnd) {
@@ -736,13 +861,16 @@ public final class ArchiveCompactionManager {
             return;
         }
         boolean strictlyIncreasingCuts = true;
+        Instant prevCut = jobWindowStart;
         for (int i = 0; i < parts.size() - 1; i++) {
             Instant prevMax = parts.get(i).maxPhenomenonTime;
             Instant nextMin = parts.get(i + 1).minPhenomenonTime;
-            if (prevMax == null || nextMin == null || !prevMax.isBefore(nextMin)) {
+            if (prevMax == null || nextMin == null || !prevMax.isBefore(nextMin) ||
+                    !nextMin.isAfter(prevCut) || !nextMin.isBefore(jobWindowEnd)) {
                 strictlyIncreasingCuts = false;
                 break;
             }
+            prevCut = nextMin;
         }
         if (!strictlyIncreasingCuts) {
             for (PendingPart part : parts) {
@@ -766,7 +894,8 @@ public final class ArchiveCompactionManager {
     }
 
     private PendingPart writeAndStagePartialParquet(
-            List<StagedRow> partRows,
+            List<StagedRow> inMemoryRows,
+            List<Path> spilledChunks,
             ProfileTargetSpec spec,
             PartAccumulator acc,
             List<Path> rollbackPaths) throws Exception {
@@ -799,39 +928,35 @@ public final class ArchiveCompactionManager {
                 partialManifest, partialSchemas, partialParquet);
         rollbackPaths.addAll(created);
 
-        // Dedicated short-lived DuckDB session per bounded part so native BufferManager
-        // memory is 100% released when the part closes (never retaining deleted row-group blocks).
+        // Dedicated short-lived file-backed DuckDB session per bounded part so native
+        // BufferManager spills cleanly within memory_limit and releases 100% of memory on close.
         try (DuckDbResourcePolicy.Session writeSession =
-                     DuckDbResourcePolicy.open(config, "archive-compaction")) {
+                     DuckDbResourcePolicy.openFileBacked(config, "archive-compaction")) {
             Path opDir = writeSession.operationDirectory();
             Path tempOut = opDir.resolve("part-" + genId + ".parquet").normalize();
             if (!tempOut.getParent().equals(opDir.normalize()))
                 throw new IllegalStateException("Compaction temporary Parquet path escaped operation directory");
 
             boolean projected = spec.projectedEventColumns();
-            try (Statement ddl = writeSession.connection().createStatement()) {
-                if (projected) {
-                    ddl.execute("CREATE TABLE compaction_part (" +
-                            "id_scope INTEGER NOT NULL, id_value BIGINT NOT NULL, " +
-                            "datastream_scope INTEGER NOT NULL, datastream_id BIGINT NOT NULL, " +
-                            "foi_scope INTEGER, foi_id BIGINT, " +
-                            "phenomenon_time TIMESTAMP, result_time TIMESTAMP, result_json VARCHAR, " +
-                            "ocr_norm VARCHAR, occ_obs_id VARCHAR, event_id VARCHAR, " +
-                            "adj_code INTEGER, adj_count INTEGER, " +
-                            "gamma_alarm BOOLEAN, neutron_alarm BOOLEAN, " +
-                            "max_gamma DOUBLE, max_neutron DOUBLE)");
-                } else {
-                    ddl.execute("CREATE TABLE compaction_part (" +
-                            "id_scope INTEGER NOT NULL, id_value BIGINT NOT NULL, " +
-                            "datastream_scope INTEGER NOT NULL, datastream_id BIGINT NOT NULL, " +
-                            "foi_scope INTEGER, foi_id BIGINT, " +
-                            "phenomenon_time TIMESTAMP, result_time TIMESTAMP, result_json VARCHAR)");
+            String sourceRelation;
+            if (spilledChunks != null && !spilledChunks.isEmpty()) {
+                StringBuilder filesExpr = new StringBuilder("read_parquet([");
+                for (int i = 0; i < spilledChunks.size(); i++) {
+                    if (i > 0)
+                        filesExpr.append(',');
+                    filesExpr.append('\'')
+                            .append(ArchiveExporter.sqlLiteral(spilledChunks.get(i).toString()))
+                            .append('\'');
                 }
+                filesExpr.append("])");
+                sourceRelation = filesExpr.toString();
+            } else {
+                createCompactionPartTable(writeSession.connection(), projected);
+                appendStagedRowsNative(writeSession.connection(), inMemoryRows, projected);
+                sourceRelation = "compaction_part";
             }
 
-            appendStagedRowsNative(writeSession.connection(), partRows, projected);
-
-            String copySql = buildV2CopySql(spec, tempOut);
+            String copySql = buildV2CopySql(spec, tempOut, sourceRelation);
             try (Statement stmt = writeSession.connection().createStatement()) {
                 stmt.execute(copySql);
             }
@@ -862,6 +987,29 @@ public final class ArchiveCompactionManager {
                 parquetSha256,
                 parquetBytes,
                 acc);
+    }
+
+    private static void createCompactionPartTable(
+            java.sql.Connection duckConn, boolean projected) throws Exception {
+        try (Statement ddl = duckConn.createStatement()) {
+            if (projected) {
+                ddl.execute("CREATE TABLE compaction_part (" +
+                        "id_scope INTEGER NOT NULL, id_value BIGINT NOT NULL, " +
+                        "datastream_scope INTEGER NOT NULL, datastream_id BIGINT NOT NULL, " +
+                        "foi_scope INTEGER, foi_id BIGINT, " +
+                        "phenomenon_time TIMESTAMP, result_time TIMESTAMP, result_json VARCHAR, " +
+                        "ocr_norm VARCHAR, occ_obs_id VARCHAR, event_id VARCHAR, " +
+                        "adj_code INTEGER, adj_count INTEGER, " +
+                        "gamma_alarm BOOLEAN, neutron_alarm BOOLEAN, " +
+                        "max_gamma DOUBLE, max_neutron DOUBLE)");
+            } else {
+                ddl.execute("CREATE TABLE compaction_part (" +
+                        "id_scope INTEGER NOT NULL, id_value BIGINT NOT NULL, " +
+                        "datastream_scope INTEGER NOT NULL, datastream_id BIGINT NOT NULL, " +
+                        "foi_scope INTEGER, foi_id BIGINT, " +
+                        "phenomenon_time TIMESTAMP, result_time TIMESTAMP, result_json VARCHAR)");
+            }
+        }
     }
 
     private PublishedFileBundle publishPartMetadataFiles(
@@ -1052,7 +1200,7 @@ public final class ArchiveCompactionManager {
         }
     }
 
-    private String buildV2CopySql(ProfileTargetSpec spec, Path tempOut) {
+    private String buildV2CopySql(ProfileTargetSpec spec, Path tempOut, String sourceRelation) {
         String profileLit = ArchiveExporter.sqlLiteral(spec.targetProfile());
         if (spec.projectedEventColumns()) {
             // Projected scalar columns are pre-extracted once in Java before insertion
@@ -1063,7 +1211,7 @@ public final class ArchiveCompactionManager {
                     "2 AS archive_version, '" + profileLit + "' AS profile, " +
                     "ocr_norm, occ_obs_id, event_id, adj_code, adj_count, " +
                     "gamma_alarm, neutron_alarm, max_gamma, max_neutron " +
-                    "FROM compaction_part " +
+                    "FROM " + sourceRelation + " " +
                     "ORDER BY datastream_id, phenomenon_time, result_time, id_value" +
                     ") TO '" + ArchiveExporter.sqlLiteral(tempOut.toString()) + "' (" +
                     "FORMAT PARQUET, PARQUET_VERSION V2, COMPRESSION ZSTD, " +
@@ -1075,7 +1223,7 @@ public final class ArchiveCompactionManager {
                 "SELECT id_scope, id_value, datastream_scope, datastream_id, " +
                 "foi_scope, foi_id, phenomenon_time, result_time, result_json, " +
                 "2 AS archive_version, '" + profileLit + "' AS profile " +
-                "FROM compaction_part " +
+                "FROM " + sourceRelation + " " +
                 "ORDER BY datastream_id, phenomenon_time, result_time, id_value" +
                 ") TO '" + ArchiveExporter.sqlLiteral(tempOut.toString()) + "' (" +
                 "FORMAT PARQUET, PARQUET_VERSION V2, COMPRESSION ZSTD, " +
@@ -1083,101 +1231,9 @@ public final class ArchiveCompactionManager {
                 "ROW_GROUP_SIZE " + spec.rowGroupSize() + ")";
     }
 
-    private record ProjectedEventValues(
-            String ocrNorm,
-            String occObsId,
-            String eventId,
-            Integer adjCode,
-            Integer adjCount,
-            Boolean gammaAlarm,
-            Boolean neutronAlarm,
-            Double maxGamma,
-            Double maxNeutron) {
-        static final ProjectedEventValues EMPTY = new ProjectedEventValues(
-                null, null, null, null, null, null, null, null, null);
-
-        static ProjectedEventValues extract(String resultJson) {
-            if (resultJson == null || resultJson.isBlank())
-                return EMPTY;
-            try {
-                JsonElement parsed = JsonParser.parseString(resultJson);
-                if (!parsed.isJsonObject())
-                    return EMPTY;
-                JsonObject obj = parsed.getAsJsonObject();
-                String ocrNorm = extractJsonString(obj, "normalizedValue");
-                String occObsId = extractJsonString(obj, "occupancyObsId");
-                String eventId = extractJsonString(obj, "eventId");
-                Integer adjCode = extractJsonInteger(obj.get("adjudicationCode"));
-                Integer adjCount = extractAdjudicatedCount(obj);
-                Boolean gammaAlarm = extractJsonBoolean(obj, "gammaAlarm");
-                Boolean neutronAlarm = extractJsonBoolean(obj, "neutronAlarm");
-                Double maxGamma = extractJsonDouble(obj.get("maxGammaCount"));
-                Double maxNeutron = extractJsonDouble(obj.get("maxNeutronCount"));
-                return new ProjectedEventValues(
-                        ocrNorm, occObsId, eventId, adjCode, adjCount,
-                        gammaAlarm, neutronAlarm, maxGamma, maxNeutron);
-            } catch (RuntimeException ignored) {
-                return EMPTY;
-            }
-        }
-
-        private static String extractJsonString(JsonObject obj, String key) {
-            JsonElement el = obj.get(key);
-            if (el != null && el.isJsonPrimitive() && el.getAsJsonPrimitive().isString())
-                return el.getAsString();
-            return null;
-        }
-
-        private static Boolean extractJsonBoolean(JsonObject obj, String key) {
-            JsonElement el = obj.get(key);
-            if (el != null && el.isJsonPrimitive() && el.getAsJsonPrimitive().isBoolean())
-                return el.getAsBoolean();
-            return null;
-        }
-
-        private static Integer extractJsonInteger(JsonElement el) {
-            if (el == null || !el.isJsonPrimitive() || !el.getAsJsonPrimitive().isNumber())
-                return null;
-            try {
-                double d = el.getAsDouble();
-                if (!Double.isFinite(d))
-                    return null;
-                long rounded = Math.round(d);
-                if (rounded < Integer.MIN_VALUE || rounded > Integer.MAX_VALUE)
-                    return null;
-                return (int) rounded;
-            } catch (RuntimeException ignored) {
-                return null;
-            }
-        }
-
-        private static Integer extractAdjudicatedCount(JsonObject obj) {
-            JsonElement cnt = obj.get("adjudicatedIdsCount");
-            if (cnt != null && !cnt.isJsonNull()) {
-                return extractJsonInteger(cnt);
-            }
-            JsonElement arr = obj.get("adjudicatedIds");
-            if (arr != null && arr.isJsonArray()) {
-                return arr.getAsJsonArray().size();
-            }
-            return null;
-        }
-
-        private static Double extractJsonDouble(JsonElement el) {
-            if (el == null || !el.isJsonPrimitive() || !el.getAsJsonPrimitive().isNumber())
-                return null;
-            try {
-                double d = el.getAsDouble();
-                return Double.isFinite(d) ? d : null;
-            } catch (RuntimeException ignored) {
-                return null;
-            }
-        }
-    }
-
     private static void appendStagedRowsNative(
             java.sql.Connection duckConn, List<StagedRow> rows, boolean projected) throws Exception {
-        if (rows.isEmpty())
+        if (rows == null || rows.isEmpty())
             return;
         DuckDBConnection nativeConn = duckConn.unwrap(DuckDBConnection.class);
         try (DuckDBAppender appender = nativeConn.createAppender(
@@ -1205,7 +1261,7 @@ public final class ArchiveCompactionManager {
                     appender.append(LocalDateTime.ofInstant(row.resultTime(), ZoneOffset.UTC));
                 appender.append(row.resultJson());
                 if (projected) {
-                    ProjectedEventValues ev = ProjectedEventValues.extract(row.resultJson());
+                    ProjectedEventColumns ev = ProjectedEventColumns.extract(row.resultJson());
                     appender.append(ev.ocrNorm());
                     appender.append(ev.occObsId());
                     appender.append(ev.eventId());
@@ -1400,8 +1456,6 @@ public final class ArchiveCompactionManager {
         Instant unlinkCutoff = now.minus(Duration.ofMinutes(Math.max(0, config.compactionUnlinkGraceMinutes)));
         List<ArchiveCatalog.DeletingGenerationRecord> candidates =
                 catalog.listDrainableDeletingGenerations(unlinkCutoff);
-        if (candidates.isEmpty())
-            return 0;
 
         int finalized = 0;
         List<UUID> retiredIds = new ArrayList<>();
@@ -1436,6 +1490,7 @@ public final class ArchiveCompactionManager {
                 finalized++;
             }
         }
+        sweepStaleUnregisteredPartials(now, allParentDirs);
         if (!allParentDirs.isEmpty()) {
             pruneEmptyProfileAndDateDirectories(allParentDirs);
         }
@@ -1443,6 +1498,84 @@ public final class ArchiveCompactionManager {
             retiredGenerationHook.accept(retiredIds);
         }
         return finalized;
+    }
+
+    /**
+     * Sweeps stale (&gt;= 2 hours old) unregistered {@code .partial} files left
+     * behind by an interrupted export or compaction attempt so online
+     * {@code oscar.sh archive verify} reconciliation remains self-healing.
+     */
+    int sweepStaleUnregisteredPartials(Instant now, Set<Path> touchedProfileDirs) {
+        Path observationsDir = root.resolve("datasets/observations").normalize();
+        if (!Files.exists(observationsDir, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(observationsDir))
+            return 0;
+        if (catalog.hasActiveExportingJobs())
+            return 0;
+
+        Instant staleCutoff = now.minus(STALE_PARTIAL_MIN_AGE);
+        int removed = 0;
+        Map<UUID, Boolean> registrationCache = new HashMap<>();
+        try {
+            Path realRoot = root.toRealPath();
+            Path realObsDir = observationsDir.toRealPath();
+            if (!realObsDir.startsWith(realRoot))
+                return 0;
+            final int[] removedCount = {0};
+            Files.walkFileTree(realObsDir, Collections.emptySet(), 3, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    if (attrs.isSymbolicLink())
+                        return FileVisitResult.SKIP_SUBTREE;
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    if (attrs.isSymbolicLink() || !attrs.isRegularFile())
+                        return FileVisitResult.CONTINUE;
+                    Path fileNamePath = file.getFileName();
+                    if (fileNamePath == null)
+                        return FileVisitResult.CONTINUE;
+                    String fileName = fileNamePath.toString();
+                    Matcher m = ARCHIVE_PARTIAL_FILE_PATTERN.matcher(fileName);
+                    if (!m.matches())
+                        return FileVisitResult.CONTINUE;
+                    if (attrs.lastModifiedTime().toInstant().isAfter(staleCutoff))
+                        return FileVisitResult.CONTINUE;
+                    UUID genId = UUID.fromString(m.group(1));
+                    boolean registered = registrationCache.computeIfAbsent(genId, id -> {
+                        try {
+                            return catalog.isGenerationRegistered(id);
+                        } catch (RuntimeException ignored) {
+                            return true; // fail closed when catalog check fails
+                        }
+                    });
+                    if (registered)
+                        return FileVisitResult.CONTINUE;
+                    try {
+                        if (Files.deleteIfExists(file)) {
+                            removedCount[0]++;
+                            if (touchedProfileDirs != null && file.getParent() != null)
+                                touchedProfileDirs.add(file.getParent());
+                        }
+                    } catch (IOException | RuntimeException ignored) {
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+            removed = removedCount[0];
+        } catch (IOException | RuntimeException ignored) {
+        }
+        if (removed > 0) {
+            LOG.info("Removed {} stale unregistered archive .partial file(s) older than {}",
+                    removed, STALE_PARTIAL_MIN_AGE);
+        }
+        return removed;
     }
 
     private void notifyRetiredGenerations(List<ArchiveGeneration> sources) {

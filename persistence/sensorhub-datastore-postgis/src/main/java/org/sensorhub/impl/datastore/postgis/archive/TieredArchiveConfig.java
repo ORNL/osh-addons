@@ -179,21 +179,46 @@ public class TieredArchiveConfig {
     public int compactionUnlinkGraceMinutes = 15;
 
     public static final String PROFILE_RAW_GATED = "RAW_GATED";
+    public static final String PROFILE_RAW_EVENTS = "RAW_EVENTS";
+    public static final String PROFILE_RAW_TELEMETRY = "RAW_TELEMETRY";
     public static final String PROFILE_DAILY_EVENTS = "DAILY_EVENTS";
+    /** Read-only compatibility profile for pre-split archives; new telemetry is written once as {@link #PROFILE_RAW_TELEMETRY}. */
     public static final String PROFILE_DAILY_TELEMETRY = "DAILY_TELEMETRY";
     public static final String PROFILE_MONTHLY_EVENTS = "MONTHLY_EVENTS";
 
+    /**
+     * Searchable operational, evidentiary, and summary streams (~1.3% of total
+     * rows) exported directly to {@link #PROFILE_RAW_EVENTS} and compacted into
+     * {@link #PROFILE_DAILY_EVENTS} and {@link #PROFILE_MONTHLY_EVENTS}.
+     *
+     * <p>High-rate {@code 1 Hz} detector and serial status streams (including
+     * {@code dailyFile}, {@code connectionStatus}, {@code occupancyStatus},
+     * {@code gammaCounts}, {@code gammaThreshold}, and {@code neutronCounts})
+     * are deliberately excluded so they are written once into
+     * {@link #PROFILE_RAW_TELEMETRY} with zero write amplification.</p>
+     */
     public static final Set<String> EVENT_OUTPUT_NAMES = Set.of(
             "occupancy", "alarm", "adjudication", "report", "vehicleOcr",
-            "emlAnalysis", "tamper", "dailyFile", "siteStatistics",
-            "nationalSummary", "connectionStatus", "occupancyStatus");
+            "emlAnalysis", "tamper", "siteStatistics", "nationalSummary");
+
+    public static final int DEFAULT_COMPACTION_PART_MAX_ROWS = 1_000_000;
 
     public static boolean isEventOutputName(String outputName) {
         return outputName != null && EVENT_OUTPUT_NAMES.contains(outputName);
     }
 
     public static boolean isProjectedEventProfile(String profile) {
-        return PROFILE_DAILY_EVENTS.equals(profile) || PROFILE_MONTHLY_EVENTS.equals(profile);
+        return PROFILE_RAW_EVENTS.equals(profile)
+                || PROFILE_DAILY_EVENTS.equals(profile)
+                || PROFILE_MONTHLY_EVENTS.equals(profile);
+    }
+
+    public static boolean isV2ArchiveProfile(String profile) {
+        return PROFILE_RAW_EVENTS.equals(profile)
+                || PROFILE_RAW_TELEMETRY.equals(profile)
+                || PROFILE_DAILY_EVENTS.equals(profile)
+                || PROFILE_DAILY_TELEMETRY.equals(profile)
+                || PROFILE_MONTHLY_EVENTS.equals(profile);
     }
 
     private static final List<String> LEGACY_DEFAULT_OUTPUT_NAMES = List.of(
@@ -247,6 +272,49 @@ public class TieredArchiveConfig {
         long memorySafePayloadBytes = Math.max(1L,
                 duckDbMemoryBytes / EXPORT_MEMORY_SAFETY_DIVISOR);
         return Math.min(maximumUncompressedBytesPerGeneration, memorySafePayloadBytes);
+    }
+
+    /**
+     * Source-payload rollover limit for direct {@link #PROFILE_RAW_TELEMETRY}
+     * exports written via file-backed DuckDB + {@code DuckDBAppender}.
+     *
+     * <p>With a 256 MiB DuckDB memory cap this allows up to 128 MiB of
+     * uncompressed JSON (~8-10 MiB ZSTD Parquet) per generation, keeping a full
+     * 30-minute 50-lane telemetry window (~48 MiB uncompressed / ~3.6 MiB
+     * compressed) in one single Parquet V2 file while still honoring smaller
+     * operator or test caps.</p>
+     */
+    public long effectiveTelemetryExportUncompressedBytes() {
+        long duckDbMemoryBytes = Math.multiplyExact(
+                (long) duckDbMemoryLimitMegabytes, BYTES_PER_MEBIBYTE);
+        long spillSafePayloadBytes = Math.max(1L, duckDbMemoryBytes / 2L);
+        return Math.min(maximumUncompressedBytesPerGeneration, spillSafePayloadBytes);
+    }
+
+    /**
+     * Source-payload rollover limit for chunk-spilled {@link #PROFILE_DAILY_EVENTS}
+     * and {@link #PROFILE_MONTHLY_EVENTS} compaction parts.
+     *
+     * <p>With a 256 MiB DuckDB memory cap this caps each compacted event part
+     * at 192 MiB uncompressed (~16-32 MiB ZSTD Parquet) and
+     * {@link #effectiveCompactionPartMaxRows()} rows so high-volume days or
+     * months automatically roll into two or more right-sized, independently
+     * defragmentable Parquet V2 files with disjoint time windows.</p>
+     */
+    public long effectiveCompactionPartUncompressedBytes() {
+        long duckDbMemoryBytes = Math.multiplyExact(
+                (long) duckDbMemoryLimitMegabytes, BYTES_PER_MEBIBYTE);
+        long spillSafePayloadBytes = Math.max(1L, (duckDbMemoryBytes * 3L) / 4L);
+        return Math.min(maximumUncompressedBytesPerGeneration, spillSafePayloadBytes);
+    }
+
+    /**
+     * Maximum row count admitted into one compacted {@link #PROFILE_DAILY_EVENTS}
+     * or {@link #PROFILE_MONTHLY_EVENTS} part before rolling over at the next
+     * phenomenon-time boundary.
+     */
+    public long effectiveCompactionPartMaxRows() {
+        return Math.min((long) maximumRowsPerGeneration, (long) DEFAULT_COMPACTION_PART_MAX_ROWS);
     }
 
     public boolean isParquetPrimary() {
