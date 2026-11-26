@@ -217,12 +217,19 @@ following invariants:
      `exactReadyExpr`, serving separate `tamper` and detector-fault streams
      with zero DuckDB opens while safely falling back to DuckDB if any single
      stream ever emits both fields.
-   - **Row-count prefix slicing on plain bounded queries:** Plain unfiltered
-     `LIMIT`-bounded queries (`GET /datastreams/{id}/observations?limit=N` with
-     `CQLFilter == null` or `Filter.INCLUDE`) run
+   - **Row-count prefix slicing & Top-N homogeneous-cluster fast path:** Plain
+     unfiltered `LIMIT`-bounded queries (`GET /datastreams/{id}/observations?limit=N`
+     with `CQLFilter == null` or `Filter.INCLUDE`) run
      `selectSummaryMatchedCandidates` with `COALESCE(s.row_count, 0)` over the
      bounded `candidatesInitialClusters` prefix so DuckDB opens only the
-     minimum generation(s) needed (typically `1` file instead of `15`).
+     minimum generation(s) needed (typically `1` file instead of `15`). Inside
+     `ParquetArchiveReader.sliceWideCluster`, artificial day-by-day subdivision
+     of a homogeneous identical-window wide cluster (`> 16` files sharing the
+     exact same `[window_start, window_end)`) is skipped when DuckDB can push
+     a bounded SQL `LIMIT <= 1,024` Top-N heap, preventing 25+ redundant
+     empty-day DuckDB sessions on sparse legacy monthly partitions while still
+     slicing heterogeneous clusters (`MONTHLY_EVENTS` + `DAILY_*`) and
+     unbounded scans.
    - **Bloat-gated `oscar_archive_schema` nightly reindex:**
      `ArchiveCatalog.reindexMutableTables()` unconditionally reindexes the
      small mutable tables (`ONLY obs`, `oscar_obs_stage_owner`, datastreams),

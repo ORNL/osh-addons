@@ -742,16 +742,27 @@ public final class ParquetArchiveReader {
         }
 
         List<Instant> initialCuts = new ArrayList<>(cutSet);
-        for (int i = 0; i < initialCuts.size() - 1; i++) {
-            Instant a = initialCuts.get(i);
-            Instant b = initialCuts.get(i + 1);
-            if (java.time.Duration.between(a, b).toHours() >= 2 &&
-                    overlappingGenerations(cluster, a, b).size() > MAX_CLUSTER_STEP_FILES) {
-                Instant day = a.truncatedTo(java.time.temporal.ChronoUnit.DAYS)
-                        .plus(1, java.time.temporal.ChronoUnit.DAYS);
-                while (day.isBefore(b)) {
-                    cutSet.add(day);
-                    day = day.plus(1, java.time.temporal.ChronoUnit.DAYS);
+        boolean sqlBoundedTopN = callerHintLimit > 0L && callerHintLimit <= 1_024L &&
+                (filter.getCQLFilter() == null ||
+                 JsonCqlEvaluator.tryBuildExactDuckDbPredicate(
+                         filter.getCQLFilter(), "result_json", resolveProjectedColumnMode(cluster)).isPresent());
+        // Subdivide a wide homogeneous overlapping span into daily steps only
+        // when DuckDB cannot execute a bounded SQL Top-N heap (e.g. unbounded
+        // scans or Java-only CQL filters). For bounded SQL LIMIT queries over
+        // identical-window generations, artificial daily slicing cannot reduce
+        // file count and would multiply empty-day DuckDB opens by up to 31x.
+        if (!sqlBoundedTopN) {
+            for (int i = 0; i < initialCuts.size() - 1; i++) {
+                Instant a = initialCuts.get(i);
+                Instant b = initialCuts.get(i + 1);
+                if (java.time.Duration.between(a, b).toHours() >= 2 &&
+                        overlappingGenerations(cluster, a, b).size() > MAX_CLUSTER_STEP_FILES) {
+                    Instant day = a.truncatedTo(java.time.temporal.ChronoUnit.DAYS)
+                            .plus(1, java.time.temporal.ChronoUnit.DAYS);
+                    while (day.isBefore(b)) {
+                        cutSet.add(day);
+                        day = day.plus(1, java.time.temporal.ChronoUnit.DAYS);
+                    }
                 }
             }
         }

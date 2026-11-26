@@ -1402,6 +1402,44 @@ public class TestParquetArchiveReader {
     }
 
     @Test
+    public void homogeneousWideMonthlyClusterWithBoundedLimitExecutesSingleTopNStep() throws Exception {
+        Path root = temporary.newFolder("homogeneous-wide-monthly").toPath();
+        Instant monthStart = Instant.parse("2026-10-01T00:00:00Z");
+        Instant monthEnd = Instant.parse("2026-11-01T00:00:00Z");
+        List<ArchiveGeneration> gens = new java.util.ArrayList<>();
+        List<Long> expectedIds = new java.util.ArrayList<>();
+        long id = 1_000L;
+        for (int i = 0; i < 20; i++) {
+            // Data starts on Oct 26 inside [Oct 1, Nov 1); artificial daily slicing would issue
+            // 25 empty DuckDB queries over all 20 files before reaching Oct 26.
+            String ts = Instant.parse("2026-10-26T00:00:00Z").plusSeconds(i * 60L).toString();
+            expectedIds.add(id);
+            gens.add(writeV2Generation(
+                    root,
+                    "datasets/observations/date=2026-10-01/profile=MONTHLY_EVENTS/part-" + i + ".parquet",
+                    TieredArchiveConfig.PROFILE_MONTHLY_EVENTS,
+                    monthStart,
+                    monthEnd,
+                    true,
+                    16_384,
+                    new TestRow[]{new TestRow(id++, 9L, ts, "{\"gammaAlarm\":false,\"neutronAlarm\":false}")}));
+        }
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+        reader.resetAuthorizeColdStatCountForTesting();
+        ObsFilter asc10 = new ObsFilter.Builder()
+                .withLimit(10)
+                .build();
+        try (Stream<ParquetArchiveReader.ArchivedRow> s = reader.stream(gens, asc10, Set.of(9L), null, 10)) {
+            List<Long> actual = s.map(r -> r.observation().id()).toList();
+            assertEquals(expectedIds.subList(0, 10), actual);
+        }
+        assertEquals("Bounded LIMIT 10 over 20 identical-window monthly files must authorize 1 single pass (20 stats), not 26 daily passes",
+                20L, reader.authorizeColdStatCountForTesting());
+        assertEquals(0, reader.getOpenCursorCount());
+    }
+
+    @Test
     public void projectedV2EventColumnsAndMixedV1V2PushdownAvoidResultJsonScanAndMatchExactSemantics() throws Exception {
         Path root = temporary.newFolder("v2-projected-pushdown").toPath();
 
