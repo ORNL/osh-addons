@@ -3244,6 +3244,8 @@ public final class ArchiveCatalog {
         }
         if (summaryExpr == null)
             return working;
+        if ("0::bigint".equals(summaryExpr))
+            return List.of();
 
         boolean filterStreams = dataStreams != null;
         boolean omitGenFilter = filterStreams && working.size() > 64;
@@ -3421,6 +3423,10 @@ public final class ArchiveCatalog {
 
         if (summarySpec == null && timeContainedSpec == null)
             return new CandidateSelectionPlan(working, List.of());
+        if (summarySpec != null &&
+                "0::bigint".equals(summarySpec.upperBoundExpr()) &&
+                "true".equals(summarySpec.exactReadyExpr()))
+            return new CandidateSelectionPlan(List.of(), List.of());
 
         String upperExpr = summarySpec != null ? summarySpec.upperBoundExpr() : timeContainedSpec.upperBoundExpr();
         String exactReadyExpr = summarySpec != null ? summarySpec.exactReadyExpr() : "false";
@@ -3848,6 +3854,10 @@ public final class ArchiveCatalog {
             JsonCqlEvaluator.TimeContainedSummarySpec timeContainedSpec) {
         if (candidates == null || candidates.isEmpty() || (summarySpec == null && timeContainedSpec == null))
             return new ColdSummaryPlan(0L, candidates == null ? List.of() : candidates, List.of());
+        if (summarySpec != null &&
+                "0::bigint".equals(summarySpec.upperBoundExpr()) &&
+                "true".equals(summarySpec.exactReadyExpr()))
+            return new ColdSummaryPlan(0L, List.of(), List.of());
         String upperExpr = summarySpec != null ? summarySpec.upperBoundExpr() : timeContainedSpec.upperBoundExpr();
         String exactReadyExpr = summarySpec != null ? summarySpec.exactReadyExpr() : "false";
         String exactExpr = summarySpec != null ? summarySpec.exactExpr() : "0::bigint";

@@ -2705,6 +2705,31 @@ public final class ParquetArchiveReader {
         return candidate;
     }
 
+    private boolean allHaveFreshInMemoryStamps(List<ArchiveGeneration> generations) {
+        if (generations == null || generations.isEmpty())
+            return true;
+        Path realRoot;
+        try {
+            realRoot = resolveRealRoot();
+        } catch (Exception ignored) {
+            return false;
+        }
+        long now = System.nanoTime();
+        for (ArchiveGeneration generation : generations) {
+            Path rel = generation.objectPath();
+            if (rel == null)
+                return false;
+            Path candidate = realRoot.resolve(rel.normalize()).normalize();
+            VerificationStamp stamp = verifiedObjects.get(candidate);
+            if (stamp == null || !stamp.expectedSha256().equals(generation.sha256()))
+                return false;
+            long age = now - stamp.verifiedAtNanos();
+            if (age < 0 || age > VERIFICATION_TTL_NANOS)
+                return false;
+        }
+        return true;
+    }
+
     public void verifyGenerationObject(ArchiveGeneration generation) {
         Objects.requireNonNull(generation, "generation");
         Path realRoot = resolveRealRoot();
@@ -3374,12 +3399,32 @@ public final class ParquetArchiveReader {
                             recordBatchZeroMatches();
                         }
                         closeCurrentBatch();
+                        if (sharedSession != null && sharedSession.hasWaitingRequests()) {
+                            releaseSharedSession();
+                        }
                     }
                     if (!clusters.hasNext()) {
                         close();
                         return false;
                     }
                     List<ArchiveGeneration> cluster = clusters.next();
+                    if (zeroCacheAllowed) {
+                        List<ArchiveGeneration> uncachedPreAuth = new ArrayList<>(cluster.size());
+                        for (ArchiveGeneration gen : cluster) {
+                            if (gen.parityVerified() &&
+                                    Long.valueOf(0L).equals(cqlGenerationCounts.getIfPresent(cacheKeyFor(gen)))) {
+                                continue;
+                            }
+                            uncachedPreAuth.add(gen);
+                        }
+                        if (uncachedPreAuth.isEmpty())
+                            continue;
+                        cluster = uncachedPreAuth;
+                    }
+                    if (sharedSession != null &&
+                            (sharedSession.hasWaitingRequests() || !allHaveFreshInMemoryStamps(cluster))) {
+                        releaseSharedSession();
+                    }
                     AuthorizedObjects objects = authorize(cluster);
                     if (objects.byFilename().isEmpty())
                         continue;
@@ -3528,6 +3573,18 @@ public final class ParquetArchiveReader {
             }
             if (failure != null)
                 throw new IllegalStateException("Cannot close archive query resources", failure);
+        }
+
+        private void releaseSharedSession() {
+            if (sharedSession == null)
+                return;
+            DuckDbResourcePolicy.Session toClose = sharedSession;
+            sharedSession = null;
+            if (sessionCountedInOpenCursors) {
+                openCursors.decrementAndGet();
+                sessionCountedInOpenCursors = false;
+            }
+            toClose.close();
         }
 
         private void closeCurrentBatch() {

@@ -392,6 +392,10 @@ final class DuckDbResourcePolicy {
             return permit.shouldYield();
         }
 
+        boolean hasWaitingRequests() {
+            return permit.hasWaitingRequests();
+        }
+
         @Override
         public synchronized void close() {
             if (closed)
@@ -481,6 +485,15 @@ final class DuckDbResourcePolicy {
                     return queued;
             }
             return null;
+        }
+
+        boolean hasWaitingRequests() {
+            lock.lock();
+            try {
+                return !waiting.isEmpty();
+            } finally {
+                lock.unlock();
+            }
         }
 
         boolean shouldBackgroundYield(boolean backgroundPermit) {
@@ -608,6 +621,14 @@ final class DuckDbResourcePolicy {
                     return false;
             }
             return controller.shouldBackgroundYield(background);
+        }
+
+        boolean hasWaitingRequests() {
+            synchronized (this) {
+                if (closed)
+                    return false;
+            }
+            return controller.hasWaitingRequests();
         }
 
         @Override
