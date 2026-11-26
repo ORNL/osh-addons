@@ -1254,6 +1254,521 @@ public class TestParquetArchiveReader {
         assertEquals(70L, reader.countCql(generations, numericFilter, Set.of(10L), null, Set.of()));
     }
 
+    @Test
+    public void monthlyEventsOverlappingFortyDailyTelemetryPartsSlicesSubWindowsWithinBatchCap() throws Exception {
+        Path root = temporary.newFolder("monthly-vs-daily-telemetry-slicing").toPath();
+        List<ArchiveGeneration> allGenerations = new java.util.ArrayList<>();
+        List<TestRow> allRows = new java.util.ArrayList<>();
+
+        Instant monthStart = Instant.parse("2026-10-01T00:00:00Z");
+        Instant monthEnd = Instant.parse("2026-11-01T00:00:00Z");
+
+        // 1 MONTHLY_EVENTS V2 generation spanning the entire month [2026-10-01, 2026-11-01)
+        List<TestRow> monthlyEventRows = new java.util.ArrayList<>();
+        long nextId = 1_000L;
+        for (int day = 0; day < 31; day++) {
+            Instant dayBase = monthStart.plusSeconds(day * 86_400L);
+            TestRow r1 = new TestRow(nextId++, 10L, dayBase.plusSeconds(600L).toString(),
+                    "{\"eventId\":\"evt-" + day + "-a\",\"gammaAlarm\":true,\"neutronAlarm\":false,\"maxGammaCount\":85.0}");
+            TestRow r2 = new TestRow(nextId++, 10L, dayBase.plusSeconds(50_000L).toString(),
+                    "{\"normalizedValue\":\"MSCU1000" + String.format("%02d", day) + "5\",\"occupancyObsId\":\"occ-" + day + "\"}");
+            monthlyEventRows.add(r1);
+            monthlyEventRows.add(r2);
+            allRows.add(r1);
+            allRows.add(r2);
+        }
+        ArchiveGeneration monthlyGen = writeV2Generation(
+                root,
+                "datasets/observations/date=2026-10-01/profile=MONTHLY_EVENTS/monthly.parquet",
+                TieredArchiveConfig.PROFILE_MONTHLY_EVENTS,
+                monthStart,
+                monthEnd,
+                true,
+                16_384,
+                monthlyEventRows.toArray(TestRow[]::new));
+        allGenerations.add(monthlyGen);
+
+        // 40 DAILY_TELEMETRY V2 generations across October (days 0..8 have 2 parts/day = 18; days 9..30 have 1 part/day = 22 -> 40 total)
+        for (int day = 0; day < 31; day++) {
+            Instant dayStart = monthStart.plusSeconds(day * 86_400L);
+            Instant dayEnd = dayStart.plusSeconds(86_400L);
+            if (day < 9) {
+                Instant midDay = dayStart.plusSeconds(43_200L);
+                TestRow morning1 = new TestRow(nextId++, 20L, dayStart.plusSeconds(300L).toString(),
+                        "{\"gammaGrossCount\":101.0,\"neutronGrossCount\":2.0}");
+                TestRow morning2 = new TestRow(nextId++, 20L, dayStart.plusSeconds(1_200L).toString(),
+                        "{\"gammaGrossCount\":102.0,\"neutronGrossCount\":2.0}");
+                allRows.add(morning1);
+                allRows.add(morning2);
+                allGenerations.add(writeV2Generation(
+                        root,
+                        "datasets/observations/date=2026-10-" + String.format("%02d", day + 1) +
+                                "/profile=DAILY_TELEMETRY/part-a-" + day + ".parquet",
+                        TieredArchiveConfig.PROFILE_DAILY_TELEMETRY,
+                        dayStart,
+                        midDay,
+                        false,
+                        65_536,
+                        new TestRow[]{morning1, morning2}));
+
+                TestRow afternoon1 = new TestRow(nextId++, 20L, midDay.plusSeconds(300L).toString(),
+                        "{\"gammaGrossCount\":103.0,\"neutronGrossCount\":3.0}");
+                TestRow afternoon2 = new TestRow(nextId++, 20L, midDay.plusSeconds(9_000L).toString(),
+                        "{\"gammaGrossCount\":104.0,\"neutronGrossCount\":3.0}");
+                allRows.add(afternoon1);
+                allRows.add(afternoon2);
+                allGenerations.add(writeV2Generation(
+                        root,
+                        "datasets/observations/date=2026-10-" + String.format("%02d", day + 1) +
+                                "/profile=DAILY_TELEMETRY/part-b-" + day + ".parquet",
+                        TieredArchiveConfig.PROFILE_DAILY_TELEMETRY,
+                        midDay,
+                        dayEnd,
+                        false,
+                        65_536,
+                        new TestRow[]{afternoon1, afternoon2}));
+            } else {
+                TestRow t1 = new TestRow(nextId++, 20L, dayStart.plusSeconds(300L).toString(),
+                        "{\"gammaGrossCount\":105.0,\"neutronGrossCount\":1.0}");
+                TestRow t2 = new TestRow(nextId++, 20L, dayStart.plusSeconds(60_000L).toString(),
+                        "{\"gammaGrossCount\":106.0,\"neutronGrossCount\":1.0}");
+                allRows.add(t1);
+                allRows.add(t2);
+                allGenerations.add(writeV2Generation(
+                        root,
+                        "datasets/observations/date=2026-10-" + String.format("%02d", day + 1) +
+                                "/profile=DAILY_TELEMETRY/part-" + day + ".parquet",
+                        TieredArchiveConfig.PROFILE_DAILY_TELEMETRY,
+                        dayStart,
+                        dayEnd,
+                        false,
+                        65_536,
+                        new TestRow[]{t1, t2}));
+            }
+        }
+        assertEquals(41, allGenerations.size());
+
+        List<Long> expectedAsc15 = allRows.stream()
+                .sorted(java.util.Comparator
+                        .comparing((TestRow r) -> Instant.parse(r.time()))
+                        .thenComparingLong(TestRow::id))
+                .limit(15)
+                .map(TestRow::id)
+                .toList();
+        List<Long> expectedDesc15 = allRows.stream()
+                .sorted(java.util.Comparator
+                        .comparing((TestRow r) -> Instant.parse(r.time()), java.util.Comparator.reverseOrder())
+                        .thenComparingLong(TestRow::id))
+                .limit(15)
+                .map(TestRow::id)
+                .toList();
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+
+        reader.resetMaxBatchFileCountSeenForTesting();
+        ObsFilter ascFilter = new ObsFilter.Builder()
+                .withPhenomenonTime()
+                .withAllTimes()
+                .descendingOrder(false)
+                .done()
+                .withLimit(15)
+                .build();
+        try (Stream<ParquetArchiveReader.ArchivedRow> s = reader.stream(
+                allGenerations, ascFilter, null, null, 15)) {
+            List<Long> actualAsc = s.map(r -> r.observation().id()).toList();
+            assertEquals(expectedAsc15, actualAsc);
+        }
+        assertTrue("Expected <= 16 files per DuckDB statement on ASC sliced cluster, saw " +
+                        reader.maxBatchFileCountSeenForTesting(),
+                reader.maxBatchFileCountSeenForTesting() > 0 && reader.maxBatchFileCountSeenForTesting() <= 16);
+
+        reader.resetMaxBatchFileCountSeenForTesting();
+        ObsFilter descFilter = new ObsFilter.Builder()
+                .withPhenomenonTime()
+                .withAllTimes()
+                .descendingOrder(true)
+                .done()
+                .withLimit(15)
+                .build();
+        try (Stream<ParquetArchiveReader.ArchivedRow> s = reader.stream(
+                allGenerations, descFilter, null, null, 15)) {
+            List<Long> actualDesc = s.map(r -> r.observation().id()).toList();
+            assertEquals(expectedDesc15, actualDesc);
+        }
+        assertTrue("Expected <= 16 files per DuckDB statement on DESC sliced cluster, saw " +
+                        reader.maxBatchFileCountSeenForTesting(),
+                reader.maxBatchFileCountSeenForTesting() > 0 && reader.maxBatchFileCountSeenForTesting() <= 16);
+        assertEquals(0, reader.getOpenCursorCount());
+    }
+
+    @Test
+    public void homogeneousWideMonthlyClusterWithBoundedLimitExecutesSingleTopNStep() throws Exception {
+        Path root = temporary.newFolder("homogeneous-wide-monthly").toPath();
+        Instant monthStart = Instant.parse("2026-10-01T00:00:00Z");
+        Instant monthEnd = Instant.parse("2026-11-01T00:00:00Z");
+        List<ArchiveGeneration> gens = new java.util.ArrayList<>();
+        List<Long> expectedIds = new java.util.ArrayList<>();
+        long id = 1_000L;
+        for (int i = 0; i < 20; i++) {
+            // Data starts on Oct 26 inside [Oct 1, Nov 1); artificial daily slicing would issue
+            // 25 empty DuckDB queries over all 20 files before reaching Oct 26.
+            String ts = Instant.parse("2026-10-26T00:00:00Z").plusSeconds(i * 60L).toString();
+            expectedIds.add(id);
+            gens.add(writeV2Generation(
+                    root,
+                    "datasets/observations/date=2026-10-01/profile=MONTHLY_EVENTS/part-" + i + ".parquet",
+                    TieredArchiveConfig.PROFILE_MONTHLY_EVENTS,
+                    monthStart,
+                    monthEnd,
+                    true,
+                    16_384,
+                    new TestRow[]{new TestRow(id++, 9L, ts, "{\"gammaAlarm\":false,\"neutronAlarm\":false}")}));
+        }
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+        reader.resetAuthorizeColdStatCountForTesting();
+        ObsFilter asc10 = new ObsFilter.Builder()
+                .withLimit(10)
+                .build();
+        try (Stream<ParquetArchiveReader.ArchivedRow> s = reader.stream(gens, asc10, Set.of(9L), null, 10)) {
+            List<Long> actual = s.map(r -> r.observation().id()).toList();
+            assertEquals(expectedIds.subList(0, 10), actual);
+        }
+        assertEquals("Bounded LIMIT 10 over 20 identical-window monthly files must authorize 1 single pass (20 stats), not 26 daily passes",
+                20L, reader.authorizeColdStatCountForTesting());
+        assertEquals(0, reader.getOpenCursorCount());
+    }
+
+    @Test
+    public void projectedV2EventColumnsAndMixedV1V2PushdownAvoidResultJsonScanAndMatchExactSemantics() throws Exception {
+        Path root = temporary.newFolder("v2-projected-pushdown").toPath();
+
+        ArchiveGeneration v2Monthly = writeV2Generation(
+                root,
+                "datasets/observations/date=2026-09-01/profile=MONTHLY_EVENTS/sep.parquet",
+                TieredArchiveConfig.PROFILE_MONTHLY_EVENTS,
+                Instant.parse("2026-09-01T00:00:00Z"),
+                Instant.parse("2026-10-01T00:00:00Z"),
+                true,
+                16_384,
+                new TestRow[]{
+                        new TestRow(101L, 10L, "2026-09-15T10:00:00Z",
+                                "{\"eventId\":\"evt-101\",\"gammaAlarm\":true,\"neutronAlarm\":false," +
+                                        "\"adjudicatedIdsCount\":0,\"adjudicatedIds\":[],\"maxGammaCount\":145.5,\"maxNeutronCount\":1.0," +
+                                        "\"startTime\":\"2026-09-15T10:00:00Z\",\"endTime\":\"2026-09-15T10:00:05Z\"}"),
+                        new TestRow(102L, 11L, "2026-09-15T10:00:02Z",
+                                "{\"occupancyObsId\":\"occ-101\",\"normalizedValue\":\"MSCU1234565\",\"samplingTime\":\"2026-09-15T10:00:02Z\"}")
+                });
+
+        ArchiveGeneration v2Daily = writeV2Generation(
+                root,
+                "datasets/observations/date=2026-10-05/profile=DAILY_EVENTS/oct05.parquet",
+                TieredArchiveConfig.PROFILE_DAILY_EVENTS,
+                Instant.parse("2026-10-05T00:00:00Z"),
+                Instant.parse("2026-10-06T00:00:00Z"),
+                true,
+                8_192,
+                new TestRow[]{
+                        new TestRow(201L, 10L, "2026-10-05T12:00:00Z",
+                                "{\"eventId\":\"evt-201\",\"gammaAlarm\":false,\"neutronAlarm\":true," +
+                                        "\"adjudicationCode\":4,\"adjudicatedIdsCount\":2,\"adjudicatedIds\":[\"cmd-1\",\"code:4\"]," +
+                                        "\"maxGammaCount\":22.0,\"maxNeutronCount\":18.0," +
+                                        "\"startTime\":\"2026-10-05T08:00:00-04:00\",\"endTime\":\"2026-10-05T12:00:06Z\"}"),
+                        new TestRow(202L, 11L, "2026-10-05T12:01:00Z",
+                                "{\"occupancyObsId\":\"occ-201\",\"normalizedValue\":\"TGHU9998881\",\"samplingTime\":\"2026-10-05T12:01:00Z\"}"),
+                        new TestRow(203L, 10L, "2026-10-05T12:02:00Z",
+                                "{\"eventId\":\"evt-203\",\"gammaAlarm\":true,\"neutronAlarm\":true," +
+                                        "\"adjudicatedIdsCount\":0,\"adjudicatedIds\":[],\"maxGammaCount\":210.0,\"maxNeutronCount\":3.5," +
+                                        "\"startTime\":\"not-a-timestamp\",\"endTime\":\"2026-10-05T12:02:04Z\"}")
+                });
+
+        Files.createDirectories(root.resolve("datasets/observations/date=2026-10-06/profile=RAW_GATED"));
+        ArchiveGeneration v1Raw = new ArchiveGeneration(
+                UUID.randomUUID(),
+                TieredArchiveConfig.PROFILE_RAW_GATED,
+                Instant.parse("2026-10-06T00:00:00Z"),
+                Instant.parse("2026-10-06T01:00:00Z"),
+                writeGeneration(root, "datasets/observations/date=2026-10-06/profile=RAW_GATED/raw.parquet", new TestRow[]{
+                        new TestRow(301L, 11L, "2026-10-06T00:05:00Z",
+                                "{\"occupancyObsId\":\"occ-301\",\"normalizedValue\":\"\\u004dSCU1234565\",\"samplingTime\":\"2026-10-06T00:05:00Z\"}"),
+                        new TestRow(302L, 10L, "2026-10-06T00:10:00Z",
+                                "{\"eventId\":\"evt-302\",\"gammaAlarm\":true,\"neutronAlarm\":false," +
+                                        "\"adjudicationCode\":4,\"adjudicatedIds\":[\"cmd-9\",\"code:4\"]," +
+                                        "\"maxGammaCount\":155.0,\"maxNeutronCount\":2.0," +
+                                        "\"startTime\":\"2026-10-06T00:10:00Z\",\"endTime\":\"2026-10-06T00:10:05Z\"}")
+                }).objectPath(),
+                ArchiveExporter.sha256(root.resolve("datasets/observations/date=2026-10-06/profile=RAW_GATED/raw.parquet")),
+                2L, 301L, 302L, "SEALED", true);
+
+        // Verify Parquet V2 metadata and Split-Block Bloom filter offsets on projected string columns.
+        TestRow[] bloomProbeRows = new TestRow[24];
+        for (int i = 0; i < bloomProbeRows.length; i++) {
+            String json = (i < 6)
+                    ? "{\"occupancyObsId\":\"occ-shared-" + (i % 2) + "\",\"normalizedValue\":\"MSCU123456" + (i % 2) + "\"}"
+                    : "{\"eventId\":\"evt-shared-" + (i % 3) + "\",\"gammaAlarm\":false,\"neutronAlarm\":false}";
+            bloomProbeRows[i] = new TestRow(9_000L + i, 10L + (i % 2),
+                    Instant.parse("2026-10-07T00:00:00Z").plusSeconds(i).toString(), json);
+        }
+        ArchiveGeneration bloomProbeGen = writeV2Generation(
+                root,
+                "datasets/observations/date=2026-10-07/profile=DAILY_EVENTS/bloom-probe.parquet",
+                TieredArchiveConfig.PROFILE_DAILY_EVENTS,
+                Instant.parse("2026-10-07T00:00:00Z"),
+                Instant.parse("2026-10-08T00:00:00Z"),
+                true,
+                8_192,
+                bloomProbeRows);
+        Path v2File = root.resolve(bloomProbeGen.objectPath());
+        try (Connection duck = DriverManager.getConnection("jdbc:duckdb:");
+             Statement st = duck.createStatement()) {
+            try (var rs = st.executeQuery("SELECT format_version FROM parquet_file_metadata('" +
+                    v2File.toString().replace("'", "''") + "')")) {
+                assertTrue(rs.next());
+                assertTrue("Expected Parquet V2 format_version, got " + rs.getString(1),
+                        rs.getString(1).startsWith("2"));
+            }
+            Set<String> bloomCols = new java.util.HashSet<>();
+            try (var rs = st.executeQuery("SELECT path_in_schema FROM parquet_metadata('" +
+                    v2File.toString().replace("'", "''") + "') WHERE bloom_filter_offset IS NOT NULL")) {
+                while (rs.next())
+                    bloomCols.add(rs.getString(1));
+            }
+            assertTrue("Expected Split-Block Bloom filters on ocr_norm, event_id, occ_obs_id; got " + bloomCols,
+                    bloomCols.containsAll(Set.of("ocr_norm", "event_id", "occ_obs_id")));
+        }
+
+        // Verify PURE_V2_EVENTS exact DuckDB SQL omits result_json entirely for projected columns.
+        for (String pureProjectedCql : List.of(
+                "normalizedValue = 'MSCU1234565'",
+                "normalizedValue LIKE 'MSCU%'",
+                "eventId = 'evt-201'",
+                "occupancyObsId = 'occ-201'",
+                "adjudicationCode = 4 AND adjudicatedIdsCount > 0",
+                "(gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0",
+                "maxGammaCount >= 120.5 AND maxNeutronCount < 5.0")) {
+            ObsFilter f = new ObsFilter.Builder().withCQLFilter(pureProjectedCql).build();
+            var exact = JsonCqlEvaluator.tryBuildExactDuckDbPredicate(
+                    f.getCQLFilter(), "result_json", JsonCqlEvaluator.ProjectedColumnMode.PURE_V2_EVENTS);
+            assertTrue("Expected exact DuckDB predicate for: " + pureProjectedCql, exact.isPresent());
+            assertFalse("PURE_V2_EVENTS predicate must not touch result_json for " + pureProjectedCql + ": " + exact.get().sql(),
+                    exact.get().sql().contains("result_json"));
+        }
+
+        // Verify RFC-3339 startTime/endTime/samplingTime exact pushdown.
+        ObsFilter isoRangeFilter = new ObsFilter.Builder()
+                .withCQLFilter("startTime >= '2026-10-05T12:00:00Z' AND endTime <= '2026-10-05T12:01:00Z'")
+                .build();
+        assertTrue(JsonCqlEvaluator.tryBuildExactDuckDbPredicate(
+                isoRangeFilter.getCQLFilter(), "result_json", JsonCqlEvaluator.ProjectedColumnMode.PURE_V2_EVENTS).isPresent());
+
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+        List<ArchiveGeneration> pureV2 = List.of(v2Monthly, v2Daily);
+        List<ArchiveGeneration> mixedAll = List.of(v2Monthly, v2Daily, v1Raw);
+
+        assertCqlReadAndCount(reader, pureV2, "normalizedValue = 'MSCU1234565'", List.of(102L));
+        assertCqlReadAndCount(reader, mixedAll, "normalizedValue = 'MSCU1234565'", List.of(102L, 301L));
+        assertCqlReadAndCount(reader, mixedAll, "normalizedValue LIKE 'TGHU%'", List.of(202L));
+        assertCqlReadAndCount(reader, mixedAll, "normalizedValue LIKE '%123456%'", List.of(102L, 301L));
+        assertCqlReadAndCount(reader, mixedAll, "eventId = 'evt-201' OR occupancyObsId = 'occ-101'", List.of(102L, 201L));
+        assertCqlReadAndCount(reader, pureV2, "adjudicationCode = 4 AND adjudicatedIdsCount > 0", List.of(201L));
+        assertCqlReadAndCount(reader, mixedAll, "adjudicationCode = 4 AND adjudicatedIdsCount > 0", List.of(201L, 302L));
+        assertCqlReadAndCount(reader, mixedAll, "(gammaAlarm = true OR neutronAlarm = true) AND adjudicatedIdsCount = 0", List.of(101L, 203L));
+        assertCqlReadAndCount(reader, mixedAll, "maxGammaCount >= 140 AND maxNeutronCount < 5", List.of(101L, 203L, 302L));
+        assertCqlReadAndCount(reader, mixedAll,
+                "startTime >= '2026-10-05T12:00:00Z' AND endTime <= '2026-10-05T12:01:00Z'", List.of(201L));
+        assertCqlReadAndCount(reader, mixedAll,
+                "samplingTime = '2026-10-05T12:01:00Z'", List.of(202L));
+        assertCqlReadAndCount(reader, mixedAll,
+                "samplingTime = '2026-10-05T08:01:00-04:00'", List.of());
+        assertCqlReadAndCount(reader, mixedAll,
+                "samplingTime >= '2026-10-05T08:01:00-04:00' AND samplingTime <= '2026-10-05T08:01:00-04:00'",
+                List.of(202L));
+
+        // Verify OcrBloomFilter + extractOcrGenerationMatcher false-negative freedom and pruning.
+        org.sensorhub.impl.datastore.postgis.archive.OcrBloomFilter.Accumulator bloomAcc =
+                new org.sensorhub.impl.datastore.postgis.archive.OcrBloomFilter.Accumulator();
+        bloomAcc.addNormalizedValue("MSCU1234565");
+        bloomAcc.addNormalizedValue("TGHU9998881");
+        var snapshot = bloomAcc.finish();
+        assertEquals(org.sensorhub.impl.datastore.postgis.archive.OcrBloomFilter.BLOOM_BYTES, snapshot.bloomBytes().length);
+        assertEquals("MSCU1234565", snapshot.minNorm());
+        assertEquals("TGHU9998881", snapshot.maxNorm());
+
+        for (String matchingOql : List.of(
+                "normalizedValue = 'MSCU1234565'",
+                "normalizedValue LIKE 'MSCU%'",
+                "normalizedValue LIKE '%123456%'",
+                "normalizedValue LIKE '%99888%'")) {
+            var matcher = JsonCqlEvaluator.extractOcrGenerationMatcher(
+                    new ObsFilter.Builder().withCQLFilter(matchingOql).build().getCQLFilter()).orElseThrow();
+            assertTrue("Bloom matcher must retain matching generation for " + matchingOql,
+                    matcher.mightMatch(snapshot.bloomBytes(), snapshot.minNorm(), snapshot.maxNorm()));
+        }
+        var nonMatchingExact = JsonCqlEvaluator.extractOcrGenerationMatcher(
+                new ObsFilter.Builder().withCQLFilter("normalizedValue = 'ABCD0000000'").build().getCQLFilter()).orElseThrow();
+        assertFalse("Zone-map minNorm must prune ABCD0000000 < MSCU1234565",
+                nonMatchingExact.mightMatch(snapshot.bloomBytes(), snapshot.minNorm(), snapshot.maxNorm()));
+
+        var emptySnapshot = new org.sensorhub.impl.datastore.postgis.archive.OcrBloomFilter.Accumulator().finish();
+        assertFalse("1-byte EMPTY_INDEXED_SENTINEL must prune streams with zero OCR values",
+                nonMatchingExact.mightMatch(emptySnapshot.bloomBytes(), emptySnapshot.minNorm(), emptySnapshot.maxNorm()));
+        assertTrue("Legacy null ocr_bloom must conservatively retain un-backfilled generation",
+                nonMatchingExact.mightMatch(null, null, null));
+    }
+
+    @Test
+    public void local9pParquetCacheAdoptsPrewarmedFileWithoutColdStatAndTracksReaderPins() throws Exception {
+        Path root = temporary.newFolder("local-cache-zero-stat").toPath();
+        Path cacheDir = temporary.newFolder("local-cache-dir").toPath();
+        Files.createDirectories(root.resolve("datasets/observations/date=2026-01-01/profile=DAILY_EVENTS"));
+
+        ArchiveGeneration g1 = writeV2Generation(
+                root,
+                "datasets/observations/date=2026-01-01/profile=DAILY_EVENTS/g1.parquet",
+                TieredArchiveConfig.PROFILE_DAILY_EVENTS,
+                Instant.parse("2026-01-01T00:00:00Z"),
+                Instant.parse("2026-01-01T12:00:00Z"),
+                true,
+                8_192,
+                new TestRow[]{new TestRow(11L, 10L, "2026-01-01T01:00:00Z", "{\"eventId\":\"e1\"}")});
+        ArchiveGeneration g2 = writeV2Generation(
+                root,
+                "datasets/observations/date=2026-01-01/profile=DAILY_EVENTS/g2.parquet",
+                TieredArchiveConfig.PROFILE_DAILY_EVENTS,
+                Instant.parse("2026-01-01T12:00:00Z"),
+                Instant.parse("2026-01-02T00:00:00Z"),
+                true,
+                8_192,
+                new TestRow[]{new TestRow(12L, 10L, "2026-01-01T13:00:00Z", "{\"eventId\":\"e2\"}")});
+
+        // Reader 1 populates the persistent local 9p Parquet cache on disk.
+        ParquetArchiveReader warmer = new ParquetArchiveReader(root);
+        warmer.setForceProactiveLocalStagingForTesting(true);
+        warmer.setLocalStageCacheForTestingPublic(cacheDir, 64L * 1024 * 1024, true);
+        assertEquals(2, warmer.read(List.of(g1, g2), new ObsFilter.Builder().build(), null, null, Long.MAX_VALUE).size());
+
+        // Reader 2 simulates a fresh reader after restart with pre-existing local cache files:
+        // parityVerified generations must be adopted from local disk with ZERO cold-root stat calls!
+        ParquetArchiveReader warmReader = new ParquetArchiveReader(root);
+        warmReader.setForceProactiveLocalStagingForTesting(true);
+        warmReader.setLocalStageCacheForTestingPublic(cacheDir, 64L * 1024 * 1024, false);
+        warmReader.resetAuthorizeColdStatCountForTesting();
+
+        assertEquals(1, warmReader.read(g1, new ObsFilter.Builder().build(), null, null).size());
+        assertEquals(2L, warmReader.count(List.of(g1, g2), new ObsFilter.Builder().build(), null, null));
+        assertEquals("Pre-warmed parityVerified generations must incur zero cold-root stat calls",
+                0L, warmReader.authorizeColdStatCountForTesting());
+
+        // Reader pin lifecycle across lazy stream + explicit pinGenerations.
+        assertEquals(0, warmReader.activePinCount(g1.id()));
+        try (Stream<ParquetArchiveReader.ArchivedRow> lazy = warmReader.stream(
+                List.of(g1, g2), new ObsFilter.Builder().build(), null, null, Long.MAX_VALUE)) {
+            assertTrue(warmReader.hasActivePins(List.of(g1.id())));
+            assertEquals(1, warmReader.activePinCount(g1.id()));
+            try (var extraPin = warmReader.pinGenerations(List.of(g1.id()))) {
+                assertEquals(2, warmReader.activePinCount(g1.id()));
+            }
+            assertEquals(1, warmReader.activePinCount(g1.id()));
+            assertEquals(2L, lazy.count());
+        }
+        assertEquals(0, warmReader.activePinCount(g1.id()));
+        assertFalse(warmReader.hasActivePins(List.of(g1.id(), g2.id())));
+
+        // Invalidating retired generation evicts its local cache copy so re-read checks cold storage.
+        warmReader.invalidateGenerations(List.of(g1.objectPath()), List.of(g1.sha256()));
+        assertEquals(1, warmReader.read(g1, new ObsFilter.Builder().build(), null, null).size());
+        assertTrue(warmReader.authorizeColdStatCountForTesting() > 0L);
+    }
+
+    private void assertCqlReadAndCount(
+            ParquetArchiveReader reader,
+            List<ArchiveGeneration> generations,
+            String cql,
+            List<Long> expectedIds) {
+        ObsFilter filter = new ObsFilter.Builder().withCQLFilter(cql).build();
+        List<Long> readIds = reader.read(generations, filter, null, null, Long.MAX_VALUE).stream()
+                .map(r -> r.observation().id())
+                .toList();
+        assertEquals("Read mismatch for CQL: " + cql, expectedIds, readIds);
+        assertEquals("Count mismatch for CQL: " + cql,
+                expectedIds.size(), reader.countCql(generations, filter, null, null, Set.of()));
+    }
+
+    private ArchiveGeneration writeV2Generation(
+            Path root,
+            String relativeFilename,
+            String profile,
+            Instant windowStart,
+            Instant windowEnd,
+            boolean projectedEventColumns,
+            int rowGroupSize,
+            TestRow[] rows) throws Exception {
+        Path object = root.resolve(relativeFilename);
+        Files.createDirectories(object.getParent());
+        try (Connection duck = DriverManager.getConnection("jdbc:duckdb:");
+             Statement statement = duck.createStatement()) {
+            statement.execute("CREATE TABLE rows (id_scope INTEGER, id_value BIGINT, datastream_scope INTEGER, " +
+                    "datastream_id BIGINT, foi_scope INTEGER, foi_id BIGINT, phenomenon_time TIMESTAMP, " +
+                    "result_time TIMESTAMP, result_json VARCHAR)");
+            try (PreparedStatement insert = duck.prepareStatement(
+                    "INSERT INTO rows VALUES (4, ?, 4, ?, NULL, NULL, ?, ?, ?)")) {
+                for (TestRow row : rows) {
+                    Instant time = Instant.parse(row.time());
+                    insert.setLong(1, row.id());
+                    insert.setLong(2, row.dataStreamId());
+                    UtcJdbcTime.setDuckDbInstant(insert, 3, time);
+                    UtcJdbcTime.setDuckDbInstant(insert, 4, time);
+                    insert.setString(5, row.resultJson());
+                    insert.addBatch();
+                }
+                insert.executeBatch();
+            }
+            String escOut = object.toString().replace("'", "''");
+            String escProf = profile.replace("'", "''");
+            if (projectedEventColumns) {
+                statement.execute("COPY (" +
+                        "SELECT id_scope, id_value, datastream_scope, datastream_id, foi_scope, foi_id, " +
+                        "phenomenon_time, result_time, result_json, 2 AS archive_version, '" + escProf + "' AS profile, " +
+                        "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.normalizedValue') = 'VARCHAR' " +
+                        "     THEN json_extract_string(result_json, '$.normalizedValue') ELSE NULL END AS ocr_norm, " +
+                        "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.occupancyObsId') = 'VARCHAR' " +
+                        "     THEN json_extract_string(result_json, '$.occupancyObsId') ELSE NULL END AS occ_obs_id, " +
+                        "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.eventId') = 'VARCHAR' " +
+                        "     THEN json_extract_string(result_json, '$.eventId') ELSE NULL END AS event_id, " +
+                        "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.adjudicationCode') IN ('UBIGINT', 'BIGINT', 'DOUBLE') " +
+                        "     THEN TRY_CAST(json_extract(result_json, '$.adjudicationCode') AS INTEGER) ELSE NULL END AS adj_code, " +
+                        "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.adjudicatedIdsCount') IN ('UBIGINT', 'BIGINT', 'DOUBLE') " +
+                        "     THEN TRY_CAST(json_extract(result_json, '$.adjudicatedIdsCount') AS INTEGER) " +
+                        "     WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.adjudicatedIds') = 'ARRAY' " +
+                        "     THEN CAST(json_array_length(json_extract(result_json, '$.adjudicatedIds')) AS INTEGER) ELSE NULL END AS adj_count, " +
+                        "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.gammaAlarm') = 'BOOLEAN' " +
+                        "     THEN TRY_CAST(json_extract(result_json, '$.gammaAlarm') AS BOOLEAN) ELSE NULL END AS gamma_alarm, " +
+                        "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.neutronAlarm') = 'BOOLEAN' " +
+                        "     THEN TRY_CAST(json_extract(result_json, '$.neutronAlarm') AS BOOLEAN) ELSE NULL END AS neutron_alarm, " +
+                        "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.maxGammaCount') IN ('UBIGINT', 'BIGINT', 'DOUBLE') " +
+                        "     THEN TRY_CAST(json_extract(result_json, '$.maxGammaCount') AS DOUBLE) ELSE NULL END AS max_gamma, " +
+                        "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.maxNeutronCount') IN ('UBIGINT', 'BIGINT', 'DOUBLE') " +
+                        "     THEN TRY_CAST(json_extract(result_json, '$.maxNeutronCount') AS DOUBLE) ELSE NULL END AS max_neutron " +
+                        "FROM rows ORDER BY datastream_id, phenomenon_time, result_time, id_value" +
+                        ") TO '" + escOut + "' (FORMAT PARQUET, PARQUET_VERSION V2, COMPRESSION ZSTD, " +
+                        "ROW_GROUP_SIZE " + rowGroupSize + ", BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)");
+            } else {
+                statement.execute("COPY (" +
+                        "SELECT id_scope, id_value, datastream_scope, datastream_id, foi_scope, foi_id, " +
+                        "phenomenon_time, result_time, result_json, 2 AS archive_version, '" + escProf + "' AS profile " +
+                        "FROM rows ORDER BY datastream_id, phenomenon_time, result_time, id_value" +
+                        ") TO '" + escOut + "' (FORMAT PARQUET, PARQUET_VERSION V2, COMPRESSION ZSTD, " +
+                        "ROW_GROUP_SIZE " + rowGroupSize + ")");
+            }
+        }
+        long minimum = java.util.Arrays.stream(rows).mapToLong(TestRow::id).min().orElseThrow();
+        long maximum = java.util.Arrays.stream(rows).mapToLong(TestRow::id).max().orElseThrow();
+        return new ArchiveGeneration(
+                UUID.randomUUID(), profile, windowStart, windowEnd,
+                root.relativize(object), ArchiveExporter.sha256(object),
+                rows.length, minimum, maximum, "SEALED", true);
+    }
+
     private record TestRow(long id, long dataStreamId, String time, String resultJson) {
         private TestRow(long id, long dataStreamId, String time) {
             this(id, dataStreamId, time, "{\"value\":" + id + "}");

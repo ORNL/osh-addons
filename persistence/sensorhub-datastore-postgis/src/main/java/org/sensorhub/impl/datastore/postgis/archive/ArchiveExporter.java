@@ -2,6 +2,8 @@ package org.sensorhub.impl.datastore.postgis.archive;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import org.duckdb.DuckDBAppender;
+import org.duckdb.DuckDBConnection;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -19,13 +21,16 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.zip.GZIPOutputStream;
@@ -34,7 +39,9 @@ import java.util.zip.GZIPOutputStream;
 public final class ArchiveExporter {
     private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create();
     private static final int FETCH_SIZE = 5_000;
-    private static final int DUCKDB_INSERT_BATCH_SIZE = 250;
+    private static final int RAW_EVENTS_ROW_GROUP_SIZE = 8_192;
+    private static final int RAW_TELEMETRY_ROW_GROUP_SIZE = 65_536;
+    private static final int LEGACY_RAW_GATED_ROW_GROUP_SIZE = 122_880;
     public static final long ESTIMATED_FIXED_BYTES_PER_ROW = 128L;
 
     private final SqlConnectionProvider postgres;
@@ -106,7 +113,7 @@ public final class ArchiveExporter {
                         "No eligible unowned rows remain in the reclaimed archive window");
                 return Optional.empty();
             }
-            verifyParquet(partialParquet, stats);
+            verifyParquet(partialParquet, stats, profile);
             forceFile(partialParquet);
             atomicMove(partialParquet, finalParquet);
             forceDirectory(directory);
@@ -183,22 +190,37 @@ public final class ArchiveExporter {
         Files.deleteIfExists(target);
         long count = 0;
         long uncompressedBytes = 0;
-        long byteBudget = config.effectiveMaximumUncompressedBytesPerGeneration();
+        boolean v2Archive = TieredArchiveConfig.isV2ArchiveProfile(profile);
+        boolean projectedEvents = TieredArchiveConfig.isProjectedEventProfile(profile);
+        boolean rawEvents = TieredArchiveConfig.PROFILE_RAW_EVENTS.equals(profile);
+        boolean rawTelemetry = TieredArchiveConfig.PROFILE_RAW_TELEMETRY.equals(profile);
+        int archiveVersion = v2Archive ? 2 : 1;
+        long byteBudget = rawTelemetry
+                ? config.effectiveTelemetryExportUncompressedBytes()
+                : config.effectiveMaximumUncompressedBytesPerGeneration();
         long minId = Long.MAX_VALUE;
         long maxId = Long.MIN_VALUE;
         Map<Long, Boolean> schemaIds = new TreeMap<>();
         List<ArchiveCatalog.SchemaSnapshot> schemas = List.of();
 
         try (Connection source = postgres.open();
-             DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "export")) {
+             DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.openFileBacked(config, "export")) {
             Connection duck = duckSession.connection();
             source.setAutoCommit(false);
             source.setReadOnly(true);
             source.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
             try (java.sql.Statement create = duck.createStatement()) {
-                create.execute("CREATE TABLE archive_rows (id_scope INTEGER, id_value BIGINT, datastream_scope INTEGER, " +
-                        "datastream_id BIGINT, foi_scope INTEGER, foi_id BIGINT, phenomenon_time TIMESTAMP, " +
-                        "result_time TIMESTAMP, result_json VARCHAR, archive_version INTEGER, profile VARCHAR)");
+                if (projectedEvents) {
+                    create.execute("CREATE TABLE archive_rows (id_scope INTEGER, id_value BIGINT, datastream_scope INTEGER, " +
+                            "datastream_id BIGINT, foi_scope INTEGER, foi_id BIGINT, phenomenon_time TIMESTAMP, " +
+                            "result_time TIMESTAMP, result_json VARCHAR, archive_version INTEGER, profile VARCHAR, " +
+                            "ocr_norm VARCHAR, occ_obs_id VARCHAR, event_id VARCHAR, adj_code INTEGER, adj_count INTEGER, " +
+                            "gamma_alarm BOOLEAN, neutron_alarm BOOLEAN, max_gamma DOUBLE, max_neutron DOUBLE)");
+                } else {
+                    create.execute("CREATE TABLE archive_rows (id_scope INTEGER, id_value BIGINT, datastream_scope INTEGER, " +
+                            "datastream_id BIGINT, foi_scope INTEGER, foi_id BIGINT, phenomenon_time TIMESTAMP, " +
+                            "result_time TIMESTAMP, result_json VARCHAR, archive_version INTEGER, profile VARCHAR)");
+                }
             }
 
             List<String> attachedChildren = config.isParquetPrimary()
@@ -208,22 +230,46 @@ public final class ArchiveExporter {
                 source.rollback();
                 return new ExportStats(0, 0, 0, List.of());
             }
-            String query = config.isParquetPrimary()
-                    ? "SELECT o.id, o.datastreamid, o.foiid, o.phenomenontime, o.resulttime, o.result::text " +
-                    "FROM " + ArchiveCatalog.stageChildrenFromClause(
-                    attachedChildren, "id, datastreamid, foiid, phenomenontime, resulttime, result") +
-                    " WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
-                    "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
-                    "AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
-                    "ORDER BY o.phenomenontime, o.id LIMIT ?"
-                    : "SELECT o.id, o.datastreamid, o.foiid, o.phenomenontime, o.resulttime, o.result::text " +
-                    "FROM " + observationTable + " o JOIN " + dataStreamTable + " d ON d.id=o.datastreamid " +
-                    "WHERE o.archivegenerationid IS NULL AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
-                    "AND d.data->>'outputName' = ANY (?) " +
-                    "ORDER BY o.phenomenontime, o.id LIMIT ?";
-            try (PreparedStatement read = source.prepareStatement(query);
-                 PreparedStatement fullBatchInsert = duck.prepareStatement(
-                         multiRowInsertSql(DUCKDB_INSERT_BATCH_SIZE))) {
+            String query;
+            if (config.isParquetPrimary()) {
+                String fromClause = ArchiveCatalog.stageChildrenFromClause(
+                        attachedChildren, "id, datastreamid, foiid, phenomenontime, resulttime, result");
+                if (rawEvents) {
+                    query = "SELECT o.id, o.datastreamid, o.foiid, o.phenomenontime, o.resulttime, o.result::text " +
+                            "FROM " + fromClause +
+                            " JOIN " + dataStreamTable + " d ON d.id=o.datastreamid " +
+                            "WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                            "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
+                            "AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
+                            "AND COALESCE(d.data->>'outputName', '') = ANY (?) " +
+                            "ORDER BY o.phenomenontime, o.id LIMIT ?";
+                } else if (rawTelemetry) {
+                    query = "SELECT o.id, o.datastreamid, o.foiid, o.phenomenontime, o.resulttime, o.result::text " +
+                            "FROM " + fromClause +
+                            " LEFT JOIN " + dataStreamTable + " d ON d.id=o.datastreamid " +
+                            "WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                            "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
+                            "AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
+                            "AND NOT (COALESCE(d.data->>'outputName', '') = ANY (?)) " +
+                            "ORDER BY o.phenomenontime, o.id LIMIT ?";
+                } else {
+                    query = "SELECT o.id, o.datastreamid, o.foiid, o.phenomenontime, o.resulttime, o.result::text " +
+                            "FROM " + fromClause +
+                            " WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                            "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
+                            "AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
+                            "ORDER BY o.phenomenontime, o.id LIMIT ?";
+                }
+            } else {
+                query = "SELECT o.id, o.datastreamid, o.foiid, o.phenomenontime, o.resulttime, o.result::text " +
+                        "FROM " + observationTable + " o JOIN " + dataStreamTable + " d ON d.id=o.datastreamid " +
+                        "WHERE o.archivegenerationid IS NULL AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
+                        "AND d.data->>'outputName' = ANY (?) " +
+                        "ORDER BY o.phenomenontime, o.id LIMIT ?";
+            }
+
+            DuckDBConnection nativeDuck = duck.unwrap(DuckDBConnection.class);
+            try (PreparedStatement read = source.prepareStatement(query)) {
                 read.setFetchSize(FETCH_SIZE);
                 int parameter = 1;
                 if (config.isParquetPrimary()) {
@@ -232,17 +278,22 @@ public final class ArchiveExporter {
                 }
                 UtcJdbcTime.setInstant(read, parameter++, start);
                 UtcJdbcTime.setInstant(read, parameter++, end);
-                if (!config.isParquetPrimary()) {
+                if (config.isParquetPrimary() && (rawEvents || rawTelemetry)) {
+                    Array eventNames = source.createArrayOf("text",
+                            TieredArchiveConfig.EVENT_OUTPUT_NAMES.toArray(String[]::new));
+                    read.setArray(parameter++, eventNames);
+                } else if (!config.isParquetPrimary()) {
                     Array names = source.createArrayOf("text", config.outputNames.toArray());
                     read.setArray(parameter++, names);
                 }
                 // One UTC archive window can contain more data than a bounded DuckDB
-                // session can safely stage.  Export a deterministic prefix;
-                // the next cycle creates a normal same-window revision for
-                // the remaining unowned rows.
+                // session can safely stage. Export a deterministic prefix; the next
+                // cycle creates a normal same-window revision for remaining unowned rows.
                 read.setInt(parameter, config.maximumRowsPerGeneration);
-                List<StagedArchiveRow> batch = new ArrayList<>(DUCKDB_INSERT_BATCH_SIZE);
-                try (ResultSet rows = read.executeQuery()) {
+
+                try (ResultSet rows = read.executeQuery();
+                     DuckDBAppender appender = nativeDuck.createAppender(
+                             DuckDBConnection.DEFAULT_SCHEMA, "archive_rows")) {
                     while (rows.next()) {
                         long id = rows.getLong(1);
                         long dataStreamId = rows.getLong(2);
@@ -259,23 +310,47 @@ public final class ArchiveExporter {
                         count++;
                         Instant phenomenonTime = UtcJdbcTime.getInstant(rows, 4);
                         Instant resultTime = UtcJdbcTime.getInstant(rows, 5);
-                        batch.add(new StagedArchiveRow(
-                                id, dataStreamId, foiId, phenomenonTime, resultTime, resultJson));
                         minId = Math.min(minId, id);
                         maxId = Math.max(maxId, id);
                         schemaIds.put(dataStreamId, Boolean.TRUE);
-                        if (batch.size() == DUCKDB_INSERT_BATCH_SIZE) {
-                            executeMultiRowInsert(fullBatchInsert, batch, profile, count);
-                            batch.clear();
+
+                        appender.beginRow();
+                        appender.append(idScope);
+                        appender.append(id);
+                        appender.append(idScope);
+                        appender.append(dataStreamId);
+                        if (foiId == null) {
+                            appender.appendNull();
+                            appender.appendNull();
+                        } else {
+                            appender.append(idScope);
+                            appender.append(foiId.longValue());
                         }
+                        if (phenomenonTime == null)
+                            appender.appendNull();
+                        else
+                            appender.append(LocalDateTime.ofInstant(phenomenonTime, ZoneOffset.UTC));
+                        if (resultTime == null)
+                            appender.appendNull();
+                        else
+                            appender.append(LocalDateTime.ofInstant(resultTime, ZoneOffset.UTC));
+                        appender.append(resultJson);
+                        appender.append(archiveVersion);
+                        appender.append(profile);
+                        if (projectedEvents) {
+                            ProjectedEventColumns ev = ProjectedEventColumns.extract(resultJson);
+                            appender.append(ev.ocrNorm());
+                            appender.append(ev.occObsId());
+                            appender.append(ev.eventId());
+                            appender.append(ev.adjCode());
+                            appender.append(ev.adjCount());
+                            appender.append(ev.gammaAlarm());
+                            appender.append(ev.neutronAlarm());
+                            appender.append(ev.maxGamma());
+                            appender.append(ev.maxNeutron());
+                        }
+                        appender.endRow();
                     }
-                }
-                if (!batch.isEmpty()) {
-                    try (PreparedStatement remainderInsert = duck.prepareStatement(
-                            multiRowInsertSql(batch.size()))) {
-                        executeMultiRowInsert(remainderInsert, batch, profile, count);
-                    }
-                    batch.clear();
                 }
                 schemas = loadSchemas(source, new ArrayList<>(schemaIds.keySet()));
             } finally {
@@ -285,67 +360,26 @@ public final class ArchiveExporter {
             if (count > 0) {
                 Path stagedParquet = duckSession.operationDirectory().resolve("export.parquet");
                 String path = sqlLiteral(stagedParquet.toString());
+                String copyOptions;
+                if (projectedEvents) {
+                    copyOptions = "FORMAT PARQUET, PARQUET_VERSION V2, COMPRESSION ZSTD, COMPRESSION_LEVEL " +
+                            config.zstdCompressionLevel + ", ROW_GROUP_SIZE " + RAW_EVENTS_ROW_GROUP_SIZE +
+                            ", BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01";
+                } else if (v2Archive) {
+                    copyOptions = "FORMAT PARQUET, PARQUET_VERSION V2, COMPRESSION ZSTD, COMPRESSION_LEVEL " +
+                            config.zstdCompressionLevel + ", ROW_GROUP_SIZE " + RAW_TELEMETRY_ROW_GROUP_SIZE;
+                } else {
+                    copyOptions = "FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL " +
+                            config.zstdCompressionLevel + ", ROW_GROUP_SIZE " + LEGACY_RAW_GATED_ROW_GROUP_SIZE;
+                }
                 try (java.sql.Statement copy = duck.createStatement()) {
                     copy.execute("COPY (SELECT * FROM archive_rows ORDER BY datastream_id, phenomenon_time, result_time, id_value) " +
-                            "TO '" + path + "' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL " +
-                            config.zstdCompressionLevel + ", ROW_GROUP_SIZE 122880)");
+                            "TO '" + path + "' (" + copyOptions + ")");
                 }
                 copyBounded(stagedParquet, target);
             }
         }
         return new ExportStats(count, minId, maxId, schemas);
-    }
-
-    private record StagedArchiveRow(long id, long dataStreamId, Long foiId,
-                                    Instant phenomenonTime, Instant resultTime,
-                                    String resultJson) {}
-
-    private static String multiRowInsertSql(int rowCount) {
-        StringBuilder sb = new StringBuilder(32 + rowCount * 36);
-        sb.append("INSERT INTO archive_rows VALUES ");
-        for (int i = 0; i < rowCount; i++) {
-            if (i > 0)
-                sb.append(',');
-            sb.append("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-        }
-        return sb.toString();
-    }
-
-    private void executeMultiRowInsert(PreparedStatement insert, List<StagedArchiveRow> batch,
-                                       String profile, long totalRowCount)
-            throws java.sql.SQLException {
-        try {
-            int p = 1;
-            for (StagedArchiveRow row : batch) {
-                insert.setInt(p++, idScope);
-                insert.setLong(p++, row.id());
-                insert.setInt(p++, idScope);
-                insert.setLong(p++, row.dataStreamId());
-                if (row.foiId() == null) {
-                    insert.setNull(p++, java.sql.Types.INTEGER);
-                    insert.setNull(p++, java.sql.Types.BIGINT);
-                } else {
-                    insert.setInt(p++, idScope);
-                    insert.setLong(p++, row.foiId());
-                }
-                if (row.phenomenonTime() == null)
-                    insert.setNull(p++, java.sql.Types.TIMESTAMP);
-                else
-                    UtcJdbcTime.setDuckDbInstant(insert, p++, row.phenomenonTime());
-                if (row.resultTime() == null)
-                    insert.setNull(p++, java.sql.Types.TIMESTAMP);
-                else
-                    UtcJdbcTime.setDuckDbInstant(insert, p++, row.resultTime());
-                insert.setString(p++, row.resultJson());
-                insert.setInt(p++, 1);
-                insert.setString(p++, profile);
-            }
-            insert.executeUpdate();
-        } catch (java.sql.SQLException error) {
-            throw new java.sql.SQLException(
-                    "DuckDB archive staging failed after " + totalRowCount + " source rows: " +
-                            error.getMessage(), error.getSQLState(), error.getErrorCode(), error);
-        }
     }
 
     /**
@@ -358,9 +392,23 @@ public final class ArchiveExporter {
                 resultJson.getBytes(StandardCharsets.UTF_8).length);
     }
 
-    private void verifyParquet(Path parquet, ExportStats expected) throws Exception {
+    private void verifyParquet(Path parquet, ExportStats expected, String profile) throws Exception {
         try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "export-verify")) {
             Path localParquet = stageToLocalDirectory(parquet, duckSession.operationDirectory(), "verify.parquet");
+            if (TieredArchiveConfig.isProjectedEventProfile(profile)) {
+                Set<String> cols = new HashSet<>();
+                try (java.sql.Statement stmt = duckSession.connection().createStatement();
+                     ResultSet rs = stmt.executeQuery("SELECT name FROM parquet_schema('" +
+                             sqlLiteral(localParquet.toString()) + "')")) {
+                    while (rs.next())
+                        cols.add(rs.getString(1));
+                }
+                List<String> required = List.of(
+                        "ocr_norm", "occ_obs_id", "event_id", "adj_code", "adj_count",
+                        "gamma_alarm", "neutron_alarm", "max_gamma", "max_neutron");
+                if (!cols.containsAll(required))
+                    throw new IOException("Exported V2 event Parquet is missing projected columns: " + cols);
+            }
             try (java.sql.Statement statement = duckSession.connection().createStatement();
                  ResultSet result = statement.executeQuery("SELECT count(*), min(id_value), max(id_value) FROM read_parquet('" +
                          sqlLiteral(localParquet.toString()) + "')")) {
@@ -388,7 +436,21 @@ public final class ArchiveExporter {
         return schemas;
     }
 
-    private void writeSchemaSnapshot(Path target, List<ArchiveCatalog.SchemaSnapshot> schemas) throws IOException {
+    static final List<String> V1_MANIFEST_COLUMNS = List.of(
+            "id_scope:INTEGER", "id_value:BIGINT", "datastream_scope:INTEGER", "datastream_id:BIGINT",
+            "foi_scope:INTEGER?", "foi_id:BIGINT?", "phenomenon_time:TIMESTAMP",
+            "result_time:TIMESTAMP", "result_json:VARCHAR", "archive_version:INTEGER", "profile:VARCHAR");
+
+    static final List<String> V2_EVENT_MANIFEST_COLUMNS = List.of(
+            "id_scope:INTEGER", "id_value:BIGINT", "datastream_scope:INTEGER", "datastream_id:BIGINT",
+            "foi_scope:INTEGER?", "foi_id:BIGINT?", "phenomenon_time:TIMESTAMP",
+            "result_time:TIMESTAMP", "result_json:VARCHAR", "archive_version:INTEGER", "profile:VARCHAR",
+            "ocr_norm:VARCHAR?", "occ_obs_id:VARCHAR?", "event_id:VARCHAR?",
+            "adj_code:INTEGER?", "adj_count:INTEGER?",
+            "gamma_alarm:BOOLEAN?", "neutron_alarm:BOOLEAN?",
+            "max_gamma:DOUBLE?", "max_neutron:DOUBLE?");
+
+    static void writeSchemaSnapshot(Path target, List<ArchiveCatalog.SchemaSnapshot> schemas) throws IOException {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("format", "oscar-datastream-schema-snapshot");
         snapshot.put("version", 1);
@@ -403,9 +465,21 @@ public final class ArchiveExporter {
     private void writeManifest(Path target, ArchiveGeneration generation, long bytes,
                                List<ArchiveCatalog.SchemaSnapshot> schemas, Path schemaPath,
                                String schemaSha256, long schemaBytes) throws IOException {
+        int version = TieredArchiveConfig.isV2ArchiveProfile(generation.profile()) ? 2 : 1;
+        List<String> columns = TieredArchiveConfig.isProjectedEventProfile(generation.profile())
+                ? V2_EVENT_MANIFEST_COLUMNS
+                : V1_MANIFEST_COLUMNS;
+        writeManifest(target, idScope, version, columns, generation, bytes,
+                schemas, schemaPath, schemaSha256, schemaBytes);
+    }
+
+    static void writeManifest(Path target, int idScope, int archiveVersion, List<String> columns,
+                              ArchiveGeneration generation, long bytes,
+                              List<ArchiveCatalog.SchemaSnapshot> schemas, Path schemaPath,
+                              String schemaSha256, long schemaBytes) throws IOException {
         Map<String, Object> manifest = new LinkedHashMap<>();
         manifest.put("format", "oscar-observation-archive");
-        manifest.put("version", 1);
+        manifest.put("version", archiveVersion);
         manifest.put("generationId", generation.id().toString());
         manifest.put("profile", generation.profile());
         manifest.put("windowStart", generation.start().toString());
@@ -423,10 +497,7 @@ public final class ArchiveExporter {
                 "sha256", schemaSha256,
                 "bytes", schemaBytes,
                 "compression", "gzip"));
-        manifest.put("columns", List.of(
-                "id_scope:INTEGER", "id_value:BIGINT", "datastream_scope:INTEGER", "datastream_id:BIGINT",
-                "foi_scope:INTEGER?", "foi_id:BIGINT?", "phenomenon_time:TIMESTAMP",
-                "result_time:TIMESTAMP", "result_json:VARCHAR", "archive_version:INTEGER", "profile:VARCHAR"));
+        manifest.put("columns", columns);
         manifest.put("sort", List.of("datastream_id", "phenomenon_time", "result_time", "id_value"));
         manifest.put("compression", "zstd");
         manifest.put("createdAt", Instant.now().toString());
@@ -512,13 +583,13 @@ public final class ArchiveExporter {
         return message != null && message.contains("Cannot allocate memory");
     }
 
-    private static void forceFile(Path path) throws IOException {
+    static void forceFile(Path path) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
             channel.force(true);
         }
     }
 
-    private static void forceDirectory(Path directory) {
+    static void forceDirectory(Path directory) {
         try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
             channel.force(true);
         } catch (IOException ignored) {
@@ -527,7 +598,7 @@ public final class ArchiveExporter {
         }
     }
 
-    private static void atomicMove(Path source, Path target) throws IOException {
+    static void atomicMove(Path source, Path target) throws IOException {
         try {
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
         } catch (AtomicMoveNotSupportedException e) {
@@ -535,19 +606,19 @@ public final class ArchiveExporter {
         }
     }
 
-    private static String safeIdentifier(String identifier) {
+    static String safeIdentifier(String identifier) {
         if (identifier == null || !identifier.matches("[A-Za-z_][A-Za-z0-9_]*"))
             throw new IllegalArgumentException("Unsafe SQL identifier: " + identifier);
         return identifier;
     }
 
-    private static String safePathComponent(String value) {
+    static String safePathComponent(String value) {
         if (value == null || !value.matches("[A-Za-z0-9_-]+"))
             throw new IllegalArgumentException("Unsafe archive profile: " + value);
         return value;
     }
 
-    private static String sqlLiteral(String value) {
+    static String sqlLiteral(String value) {
         return value.replace("'", "''");
     }
 

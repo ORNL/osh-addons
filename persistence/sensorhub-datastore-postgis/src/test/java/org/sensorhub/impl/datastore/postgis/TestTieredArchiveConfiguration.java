@@ -1,6 +1,8 @@
 package org.sensorhub.impl.datastore.postgis;
 
 import org.junit.Test;
+import org.sensorhub.impl.datastore.postgis.archive.ArchiveCatalog;
+import org.sensorhub.impl.datastore.postgis.archive.ImmutableObservationStageManager;
 import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig;
 import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig.StorageMode;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveExporter;
@@ -12,8 +14,19 @@ import org.sensorhub.impl.datastore.postgis.store.obs.OscarTieredObsStore;
 import org.sensorhub.api.datastore.obs.IObsStore;
 
 import java.lang.reflect.Proxy;
+import java.sql.Array;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertEquals;
@@ -52,22 +65,218 @@ public class TestTieredArchiveConfiguration {
         assertTrue(config.outputNames.contains("connectionStatus"));
         assertTrue(config.outputNames.contains("occupancyStatus"));
         assertTrue(config.outputNames.contains("vehicleOcr"));
-        assertEquals(22, config.outputNames.size());
+        assertTrue(config.outputNames.contains("location"));
+        assertTrue(config.outputNames.contains("alarm"));
+        assertTrue(config.outputNames.contains("KromekDetectorRadiometricsV1Report"));
+        assertTrue(config.outputNames.contains("KromekSerialRadiometricStatusReport"));
+        assertEquals(List.of(
+                "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
+                "speed", "backgroundReport", "foregroundReport", "status",
+                "emlContextual", "emlScanContextual", "emlAnalysis",
+                "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
+                "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary",
+                "vehicleOcr",
+                "location", "alarm",
+                "KromekDetectorRadiometricsV1Report", "KromekSerialRadiometricStatusReport"),
+                config.outputNames);
+        assertEquals(26, config.outputNames.size());
         assertFalse(config.outputNames.contains("sensorLocation"));
+        assertFalse(config.outputNames.contains("adjudicationCodes"));
+        assertFalse(config.outputNames.contains("siteInfo"));
     }
 
     @Test
-    public void persistedTwentyOneOutputListUpgradesToIncludeVehicleOcrOnValidate() {
+    public void persistedTwentyOneOutputListUpgradesToTwentySixDefaultOnValidate() {
         TieredArchiveConfig config = new TieredArchiveConfig();
-        config.outputNames = new java.util.ArrayList<>(java.util.List.of(
+        config.outputNames = new ArrayList<>(List.of(
                 "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
                 "speed", "backgroundReport", "foregroundReport", "status",
                 "emlContextual", "emlScanContextual", "emlAnalysis",
                 "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
                 "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary"));
         config.validate();
-        assertEquals(22, config.outputNames.size());
+        assertEquals(26, config.outputNames.size());
         assertTrue(config.outputNames.contains("vehicleOcr"));
+        assertTrue(config.outputNames.contains("location"));
+        assertTrue(config.outputNames.contains("alarm"));
+        assertTrue(config.outputNames.contains("KromekDetectorRadiometricsV1Report"));
+        assertTrue(config.outputNames.contains("KromekSerialRadiometricStatusReport"));
+    }
+
+    @Test
+    public void persistedTwentyTwoOutputListUpgradesToTwentySixDefaultOnValidate() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.outputNames = new ArrayList<>(List.of(
+                "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
+                "speed", "backgroundReport", "foregroundReport", "status",
+                "emlContextual", "emlScanContextual", "emlAnalysis",
+                "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
+                "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary",
+                "vehicleOcr"));
+        config.validate();
+        assertEquals(26, config.outputNames.size());
+        assertEquals(List.of(
+                "location", "alarm",
+                "KromekDetectorRadiometricsV1Report", "KromekSerialRadiometricStatusReport"),
+                config.outputNames.subList(22, 26));
+
+        // Custom operator-curated allowlists must never be overwritten on validate().
+        TieredArchiveConfig custom = new TieredArchiveConfig();
+        custom.outputNames = new ArrayList<>(List.of("gammaCounts", "occupancy"));
+        custom.validate();
+        assertEquals(List.of("gammaCounts", "occupancy"), custom.outputNames);
+    }
+
+    @Test
+    public void stageManagerUpgradesPromotedStreamsAndRoutesToThirtyMinuteStagePartitions() throws Exception {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.storageMode = StorageMode.PARQUET_PRIMARY;
+        config.deleteHotAfterArchive = true;
+        config.maximumGenerationsPerCycle = 2;
+        config.maximumVerificationsPerCycle = 2;
+        config.outputNames = new ArrayList<>(List.of(
+                "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
+                "speed", "backgroundReport", "foregroundReport", "status",
+                "emlContextual", "emlScanContextual", "emlAnalysis",
+                "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
+                "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary",
+                "vehicleOcr"));
+        config.validate();
+        assertEquals(26, config.outputNames.size());
+
+        List<String> executedSql = new ArrayList<>();
+        AtomicReference<List<String>> upgradedAllowlist = new AtomicReference<>();
+        List<Long> registeredImmutableStreamIds = new ArrayList<>();
+        AtomicBoolean autoCommit = new AtomicBoolean(true);
+        Instant now = Instant.parse("2026-11-25T12:10:00Z");
+
+        Connection mockConnection = (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class<?>[]{Connection.class},
+                (proxy, method, args) -> switch (method.getName()) {
+                    case "getAutoCommit" -> autoCommit.get();
+                    case "setAutoCommit" -> {
+                        autoCommit.set((Boolean) args[0]);
+                        yield null;
+                    }
+                    case "commit", "rollback", "close" -> null;
+                    case "createArrayOf" -> {
+                        Object[] elements = (Object[]) args[1];
+                        yield (Array) Proxy.newProxyInstance(
+                                Array.class.getClassLoader(),
+                                new Class<?>[]{Array.class},
+                                (arrProxy, arrMethod, arrArgs) -> switch (arrMethod.getName()) {
+                                    case "getArray" -> elements;
+                                    case "free" -> null;
+                                    default -> null;
+                                });
+                    }
+                    case "createStatement" -> (Statement) Proxy.newProxyInstance(
+                            Statement.class.getClassLoader(),
+                            new Class<?>[]{Statement.class},
+                            (stmtProxy, stmtMethod, stmtArgs) -> {
+                                if ("execute".equals(stmtMethod.getName())) {
+                                    executedSql.add((String) stmtArgs[0]);
+                                    return false;
+                                }
+                                if ("executeQuery".equals(stmtMethod.getName()) &&
+                                        "SELECT transaction_timestamp()".equals(stmtArgs[0])) {
+                                    AtomicBoolean rowAvailable = new AtomicBoolean(true);
+                                    return (ResultSet) Proxy.newProxyInstance(
+                                            ResultSet.class.getClassLoader(),
+                                            new Class<?>[]{ResultSet.class},
+                                            (rsProxy, rsMethod, rsArgs) -> switch (rsMethod.getName()) {
+                                                case "next" -> rowAvailable.getAndSet(false);
+                                                case "getTimestamp" -> Timestamp.from(now);
+                                                case "close" -> null;
+                                                default -> null;
+                                            });
+                                }
+                                return null;
+                            });
+                    case "prepareStatement" -> {
+                        String sql = (String) args[0];
+                        executedSql.add(sql);
+                        Object[] bound = new Object[8];
+                        yield (PreparedStatement) Proxy.newProxyInstance(
+                                PreparedStatement.class.getClassLoader(),
+                                new Class<?>[]{PreparedStatement.class},
+                                (psProxy, psMethod, psArgs) -> {
+                                    String name = psMethod.getName();
+                                    if (name.startsWith("set") && psArgs != null && psArgs.length >= 2 &&
+                                            psArgs[0] instanceof Integer idx && idx < bound.length) {
+                                        bound[idx] = psArgs[1];
+                                        return null;
+                                    }
+                                    if ("executeUpdate".equals(name)) {
+                                        if (sql.startsWith("UPDATE oscar_obs_storage_route route SET immutable=true")) {
+                                            Array arr = (Array) bound[3];
+                                            Object[] raw = (Object[]) arr.getArray();
+                                            upgradedAllowlist.set(Arrays.stream(raw).map(String::valueOf).toList());
+                                            return 4;
+                                        }
+                                        if (sql.startsWith("INSERT INTO oscar_obs_storage_route")) {
+                                            if (Boolean.TRUE.equals(bound[4]))
+                                                registeredImmutableStreamIds.add((Long) bound[3]);
+                                            return 1;
+                                        }
+                                        return 1;
+                                    }
+                                    if ("execute".equals(name))
+                                        return false;
+                                    if ("executeQuery".equals(name)) {
+                                        AtomicBoolean singleRow = new AtomicBoolean(true);
+                                        return (ResultSet) Proxy.newProxyInstance(
+                                                ResultSet.class.getClassLoader(),
+                                                new Class<?>[]{ResultSet.class},
+                                                (rsProxy, rsMethod, rsArgs) -> switch (rsMethod.getName()) {
+                                                    case "next" -> {
+                                                        if (sql.startsWith("SELECT EXISTS (SELECT 1 FROM oscar_obs_storage_route") ||
+                                                                sql.startsWith("SELECT to_regclass(?)::oid::bigint") ||
+                                                                sql.startsWith("SELECT table_oid::bigint FROM oscar_mutable_stream_counts_state") ||
+                                                                sql.startsWith("SELECT pg_try_advisory_xact_lock")) {
+                                                            yield singleRow.getAndSet(false);
+                                                        }
+                                                        yield false;
+                                                    }
+                                                    case "getBoolean" -> true;
+                                                    case "getLong" -> 42L;
+                                                    case "getInt" -> 0;
+                                                    case "getObject" -> 42L;
+                                                    case "close" -> null;
+                                                    default -> null;
+                                                });
+                                    }
+                                    return null;
+                                });
+                    }
+                    default -> null;
+                });
+
+        ArchiveCatalog catalog = new ArchiveCatalog(() -> mockConnection, "obs", 4, config);
+        ImmutableObservationStageManager stageManager = new ImmutableObservationStageManager(
+                () -> mockConnection, catalog, config, "obs", "obs_datastreams", 4);
+        stageManager.initialize();
+
+        assertEquals(26, upgradedAllowlist.get().size());
+        assertTrue(upgradedAllowlist.get().containsAll(List.of(
+                "location", "alarm",
+                "KromekDetectorRadiometricsV1Report", "KromekSerialRadiometricStatusReport")));
+        assertFalse("Existing PARQUET_PRIMARY upgrade must not run fresh-table rejection",
+                executedSql.stream().anyMatch(sql -> sql.startsWith("SELECT 1 FROM ONLY obs observation")));
+
+        autoCommit.set(false);
+        stageManager.prepare(mockConnection, List.of(
+                new ImmutableObservationStageManager.Route(101L, Instant.parse("2026-11-25T12:01:00Z"), true),
+                new ImmutableObservationStageManager.Route(102L, Instant.parse("2026-11-25T12:02:00Z"), true),
+                new ImmutableObservationStageManager.Route(103L, Instant.parse("2026-11-25T12:03:00Z"), true),
+                new ImmutableObservationStageManager.Route(104L, Instant.parse("2026-11-25T12:04:00Z"), true)));
+        assertEquals(List.of(101L, 102L, 103L, 104L), registeredImmutableStreamIds);
+        assertTrue("Newly promoted streams must create a 30-minute osg_* staging child",
+                executedSql.stream().anyMatch(sql ->
+                        sql.startsWith("CREATE TABLE osg_") &&
+                        sql.contains("TIMESTAMP '2026-11-25T12:00:00'") &&
+                        sql.contains("TIMESTAMP '2026-11-25T12:30:00'")));
     }
 
     @Test
@@ -237,10 +446,51 @@ public class TestTieredArchiveConfiguration {
         config.maximumUncompressedBytesPerGeneration = Long.MAX_VALUE;
         assertEquals(32L * 1024 * 1024,
                 config.effectiveMaximumUncompressedBytesPerGeneration());
+        assertEquals(128L * 1024 * 1024,
+                config.effectiveTelemetryExportUncompressedBytes());
+        assertEquals(192L * 1024 * 1024,
+                config.effectiveCompactionPartUncompressedBytes());
+        assertEquals(TieredArchiveConfig.DEFAULT_COMPACTION_PART_MAX_ROWS,
+                config.effectiveCompactionPartMaxRows());
 
         config.maximumUncompressedBytesPerGeneration = 8L * 1024 * 1024;
+        config.maximumRowsPerGeneration = 250_000;
         assertEquals(8L * 1024 * 1024,
                 config.effectiveMaximumUncompressedBytesPerGeneration());
+        assertEquals(8L * 1024 * 1024,
+                config.effectiveTelemetryExportUncompressedBytes());
+        assertEquals(8L * 1024 * 1024,
+                config.effectiveCompactionPartUncompressedBytes());
+        assertEquals(250_000L, config.effectiveCompactionPartMaxRows());
+    }
+
+    @Test
+    public void splitAtExportEventOutputSetAndV2ProfilePredicatesAreStrict() {
+        assertEquals(java.util.Set.of(
+                "occupancy", "alarm", "adjudication", "report", "vehicleOcr",
+                "emlAnalysis", "tamper", "siteStatistics", "nationalSummary"),
+                TieredArchiveConfig.EVENT_OUTPUT_NAMES);
+        assertFalse(TieredArchiveConfig.isEventOutputName("dailyFile"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("connectionStatus"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("occupancyStatus"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("gammaCounts"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("gammaThreshold"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("neutronCounts"));
+        assertFalse(TieredArchiveConfig.isEventOutputName("emlScanContextual"));
+
+        assertTrue(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_RAW_EVENTS));
+        assertTrue(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_DAILY_EVENTS));
+        assertTrue(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_MONTHLY_EVENTS));
+        assertFalse(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_RAW_TELEMETRY));
+        assertFalse(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_DAILY_TELEMETRY));
+        assertFalse(TieredArchiveConfig.isProjectedEventProfile(TieredArchiveConfig.PROFILE_RAW_GATED));
+
+        assertTrue(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_RAW_EVENTS));
+        assertTrue(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_RAW_TELEMETRY));
+        assertTrue(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_DAILY_EVENTS));
+        assertTrue(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_DAILY_TELEMETRY));
+        assertTrue(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_MONTHLY_EVENTS));
+        assertFalse(TieredArchiveConfig.isV2ArchiveProfile(TieredArchiveConfig.PROFILE_RAW_GATED));
     }
 
     @Test

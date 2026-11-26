@@ -30,6 +30,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
 
 /** Opens a bounded DuckDB connection with an operation-private spill directory. */
@@ -49,6 +50,20 @@ final class DuckDbResourcePolicy {
     }
 
     static Session open(TieredArchiveConfig config, String operation) throws Exception {
+        return open(config, operation, false);
+    }
+
+    /**
+     * Opens a bounded DuckDB session backed by a session-private database file
+     * inside {@code operationDirectory} so large staged tables and external
+     * sorts transparently spill within {@code memory_limit} and are removed
+     * atomically when the session closes.
+     */
+    static Session openFileBacked(TieredArchiveConfig config, String operation) throws Exception {
+        return open(config, operation, true);
+    }
+
+    private static Session open(TieredArchiveConfig config, String operation, boolean fileBacked) throws Exception {
         config.validate();
         if (operation == null || !SAFE_OPERATION.matcher(operation).matches())
             throw new IllegalArgumentException("Unsafe DuckDB operation name");
@@ -70,24 +85,12 @@ final class DuckDbResourcePolicy {
                     archiveRoot.toRealPath() : archiveRoot;
             requireDisjointRoots(realArchiveRoot, realTemporaryRoot);
             initializeTemporaryRoot(realTemporaryRoot);
-            operationDirectory = realTemporaryRoot.resolve(
-                    operation + '-' + UUID.randomUUID()).normalize();
-            if (!operationDirectory.getParent().equals(realTemporaryRoot))
-                throw new IllegalStateException(
-                        "DuckDB operation directory escaped its configured parent");
-            if (supportsPosix(realTemporaryRoot))
-                Files.createDirectory(operationDirectory,
-                        PosixFilePermissions.asFileAttribute(PRIVATE_DIRECTORY_PERMISSIONS));
-            else
-                Files.createDirectory(operationDirectory);
-            BasicFileAttributes attributes = Files.readAttributes(
-                    operationDirectory, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            if (!attributes.isDirectory() || attributes.isSymbolicLink())
-                throw new IllegalStateException(
-                        "DuckDB operation directory creation was redirected");
-            requirePrivatePosixDirectory(operationDirectory);
+            operationDirectory = createOperationDirectory(realTemporaryRoot, operation);
 
-            connection = DriverManager.getConnection("jdbc:duckdb:");
+            String jdbcUrl = fileBacked
+                    ? "jdbc:duckdb:" + operationDirectory.resolve("work.duckdb")
+                    : "jdbc:duckdb:";
+            connection = DriverManager.getConnection(jdbcUrl);
             try (Statement statement = connection.createStatement()) {
                 statement.execute("SET memory_limit='" + config.duckDbMemoryLimitMegabytes + "MB'");
                 statement.execute("SET threads=" + config.duckDbThreads);
@@ -98,6 +101,7 @@ final class DuckDbResourcePolicy {
                 // archive's explicitly ordered writes/reads and can retain a
                 // large extra buffer during near-cap operations.
                 statement.execute("SET preserve_insertion_order=false");
+                statement.execute("SET parquet_metadata_cache=true");
             }
             return new Session(connection, realTemporaryRoot, operationDirectory, permit);
         } catch (Exception | Error error) {
@@ -107,6 +111,48 @@ final class DuckDbResourcePolicy {
             permit.close();
             throw error;
         }
+    }
+
+    /**
+     * Creates a private 0700 scratch directory inside {@code duckDbTemporaryDirectory}
+     * without occupying a DuckDB session permit. Recognized directories left
+     * behind after a hard crash are reclaimed automatically on next startup.
+     */
+    static ScratchDirectory openScratchDirectory(TieredArchiveConfig config, String operation) throws Exception {
+        config.validate();
+        if (operation == null || !SAFE_OPERATION.matcher(operation).matches())
+            throw new IllegalArgumentException("Unsafe DuckDB operation name");
+        Path archiveRoot = Path.of(config.rootDirectory).toAbsolutePath().normalize();
+        Path temporaryRoot = Path.of(config.duckDbTemporaryDirectory).toAbsolutePath().normalize();
+        requireDisjointRoots(archiveRoot, temporaryRoot);
+        preparePrivateDirectory(temporaryRoot);
+        Path realTemporaryRoot = temporaryRoot.toRealPath();
+        Path realArchiveRoot = Files.exists(archiveRoot, LinkOption.NOFOLLOW_LINKS) ?
+                archiveRoot.toRealPath() : archiveRoot;
+        requireDisjointRoots(realArchiveRoot, realTemporaryRoot);
+        initializeTemporaryRoot(realTemporaryRoot);
+        Path dir = createOperationDirectory(realTemporaryRoot, operation);
+        return new ScratchDirectory(realTemporaryRoot, dir);
+    }
+
+    private static Path createOperationDirectory(Path realTemporaryRoot, String operation) throws IOException {
+        Path operationDirectory = realTemporaryRoot.resolve(
+                operation + '-' + UUID.randomUUID()).normalize();
+        if (!operationDirectory.getParent().equals(realTemporaryRoot))
+            throw new IllegalStateException(
+                    "DuckDB operation directory escaped its configured parent");
+        if (supportsPosix(realTemporaryRoot))
+            Files.createDirectory(operationDirectory,
+                    PosixFilePermissions.asFileAttribute(PRIVATE_DIRECTORY_PERMISSIONS));
+        else
+            Files.createDirectory(operationDirectory);
+        BasicFileAttributes attributes = Files.readAttributes(
+                operationDirectory, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!attributes.isDirectory() || attributes.isSymbolicLink())
+            throw new IllegalStateException(
+                    "DuckDB operation directory creation was redirected");
+        requirePrivatePosixDirectory(operationDirectory);
+        return operationDirectory;
     }
 
     private static void preparePrivateDirectory(Path directory) throws IOException {
@@ -392,6 +438,10 @@ final class DuckDbResourcePolicy {
             return permit.shouldYield();
         }
 
+        boolean hasWaitingRequests() {
+            return permit.hasWaitingRequests();
+        }
+
         @Override
         public synchronized void close() {
             if (closed)
@@ -419,6 +469,33 @@ final class DuckDbResourcePolicy {
         }
     }
 
+    static final class ScratchDirectory implements AutoCloseable {
+        private final Path temporaryRoot;
+        private final Path directory;
+        private boolean closed;
+
+        private ScratchDirectory(Path temporaryRoot, Path directory) {
+            this.temporaryRoot = temporaryRoot;
+            this.directory = directory;
+        }
+
+        Path path() {
+            return directory;
+        }
+
+        @Override
+        public synchronized void close() {
+            if (closed)
+                return;
+            closed = true;
+            Throwable failure = new IllegalStateException("DuckDB scratch cleanup failed");
+            int priorSuppressed = failure.getSuppressed().length;
+            deleteOperationDirectory(temporaryRoot, directory, failure);
+            if (failure.getSuppressed().length != priorSuppressed)
+                throw new IllegalStateException("Cannot close DuckDB scratch directory", failure);
+        }
+    }
+
     /**
      * Fair process-wide admission.  Every active and waiting request keeps its
      * configured cap registered, so independently configured stores cannot
@@ -427,13 +504,32 @@ final class DuckDbResourcePolicy {
      * reserving at least one session for interactive/lifecycle work whenever
      * the effective global cap exceeds one.
      */
+    static final long ANTI_STARVATION_AGING_NANOS = TimeUnit.SECONDS.toNanos(5);
+
+    static void setNanoClockForTesting(LongSupplier clock) {
+        ADMISSION.setNanoClock(clock);
+    }
+
+    static boolean hasInteractiveWaiters() {
+        return ADMISSION.hasInteractiveWaiters();
+    }
+
+    static int waitingCountForTesting() {
+        return ADMISSION.waitingCount();
+    }
+
     private static final class AdmissionController {
         private final ReentrantLock lock = new ReentrantLock(true);
         private final Condition capacityChanged = lock.newCondition();
         private final java.util.LinkedList<AdmissionRequest> waiting = new java.util.LinkedList<>();
         private final TreeMap<Integer, Integer> registeredLimits = new TreeMap<>();
+        private volatile LongSupplier nanoClock = System::nanoTime;
         private int active;
         private int activeBackgroundCount;
+
+        void setNanoClock(LongSupplier clock) {
+            this.nanoClock = clock == null ? System::nanoTime : clock;
+        }
 
         private static boolean isHighPriorityWaiter(String operation) {
             return "point-query".equals(operation)
@@ -446,14 +542,26 @@ final class DuckDbResourcePolicy {
 
         static boolean isBackgroundCountOperation(String operation) {
             return "cold-cql-count".equals(operation)
-                    || "cold-cql-id-count".equals(operation);
+                    || "cold-cql-id-count".equals(operation)
+                    || "archive-compaction".equals(operation)
+                    || "compaction-verify".equals(operation)
+                    || "summary-backfill".equals(operation);
         }
 
         private void enqueueRequest(AdmissionRequest request) {
+            long now = request.enqueuedAtNanos();
+            int minInsertAt = 0;
+            int index = 0;
+            for (AdmissionRequest queued : waiting) {
+                if (now - queued.enqueuedAtNanos() >= ANTI_STARVATION_AGING_NANOS) {
+                    minInsertAt = index + 1;
+                }
+                index++;
+            }
             if ("point-query".equals(request.operation())) {
                 int insertAt = 0;
                 for (AdmissionRequest queued : waiting) {
-                    if (!isHighPriorityWaiter(queued.operation())) {
+                    if (insertAt >= minInsertAt && !isHighPriorityWaiter(queued.operation())) {
                         waiting.add(insertAt, request);
                         return;
                     }
@@ -462,7 +570,7 @@ final class DuckDbResourcePolicy {
             } else if (!isBackgroundCountOperation(request.operation())) {
                 int insertAt = 0;
                 for (AdmissionRequest queued : waiting) {
-                    if (isBackgroundCountOperation(queued.operation())) {
+                    if (insertAt >= minInsertAt && isBackgroundCountOperation(queued.operation())) {
                         waiting.add(insertAt, request);
                         return;
                     }
@@ -481,6 +589,37 @@ final class DuckDbResourcePolicy {
                     return queued;
             }
             return null;
+        }
+
+        boolean hasWaitingRequests() {
+            lock.lock();
+            try {
+                return !waiting.isEmpty();
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        boolean hasInteractiveWaiters() {
+            lock.lock();
+            try {
+                for (AdmissionRequest queued : waiting) {
+                    if (!isBackgroundCountOperation(queued.operation()))
+                        return true;
+                }
+                return false;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        int waitingCount() {
+            lock.lock();
+            try {
+                return waiting.size();
+            } finally {
+                lock.unlock();
+            }
         }
 
         boolean shouldBackgroundYield(boolean backgroundPermit) {
@@ -505,7 +644,6 @@ final class DuckDbResourcePolicy {
 
         AdmissionPermit acquire(int limit, int timeoutSeconds, String operation) throws Exception {
             long remaining = TimeUnit.SECONDS.toNanos(timeoutSeconds);
-            AdmissionRequest request = new AdmissionRequest(operation);
             boolean background = isBackgroundCountOperation(operation);
             try {
                 lock.lockInterruptibly();
@@ -515,6 +653,7 @@ final class DuckDbResourcePolicy {
                         "Interrupted while waiting for DuckDB session capacity for operation " +
                                 operation, interrupted);
             }
+            AdmissionRequest request = new AdmissionRequest(operation, nanoClock.getAsLong());
             try {
                 enqueueRequest(request);
                 addLimit(limit);
@@ -580,13 +719,19 @@ final class DuckDbResourcePolicy {
 
     private static final class AdmissionRequest {
         private final String operation;
+        private final long enqueuedAtNanos;
 
-        private AdmissionRequest(String operation) {
+        private AdmissionRequest(String operation, long enqueuedAtNanos) {
             this.operation = operation;
+            this.enqueuedAtNanos = enqueuedAtNanos;
         }
 
         private String operation() {
             return operation;
+        }
+
+        private long enqueuedAtNanos() {
+            return enqueuedAtNanos;
         }
     }
 
@@ -608,6 +753,14 @@ final class DuckDbResourcePolicy {
                     return false;
             }
             return controller.shouldBackgroundYield(background);
+        }
+
+        boolean hasWaitingRequests() {
+            synchronized (this) {
+                if (closed)
+                    return false;
+            }
+            return controller.hasWaitingRequests();
         }
 
         @Override

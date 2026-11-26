@@ -7,7 +7,10 @@ import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
@@ -55,6 +58,10 @@ public final class ArchiveCatalog {
             "sha256:7aa2b6dd22cbed4499eb9fb16966323bbf90d14bff4d35e03a1670868fb2f8e8";
     static final long MAX_BACKUP_ARCHIVE_GENERATIONS = 1_000_000L;
     static final long MAX_BACKUP_ARCHIVE_GENERATION_INVENTORY_BYTES = 37_000_000L;
+    static final int SUMMARY_GENERATION_BATCH_SIZE = 2_048;
+    static final long SCHEMA_REINDEX_SMALL_TABLE_BYTES = 256L * 1024L * 1024L;
+    static final long SCHEMA_REINDEX_MIN_DEAD_TUPLES = 50_000L;
+    static final double SCHEMA_REINDEX_MIN_DEAD_RATIO = 0.10d;
     private static final long MIGRATION_LOCK = 0x4f5343415253544fL;
 
     private final SqlConnectionProvider connections;
@@ -357,59 +364,82 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS gamma_high_fault_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS gamma_low_fault_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS neutron_fault_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS neutron_high_fault_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS extended_occupancy_fault_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS tamper_true_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS rs350_gamma_alarm_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS rs350_neutron_alarm_count bigint");
-                statement.execute("UPDATE oscar_archive_schema SET " +
-                        "unadjudicated_gamma_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
-                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END, " +
-                        "unadjudicated_neutron_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END, " +
-                        "unadjudicated_gamma_neutron_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END, " +
-                        "adjudicated_gamma_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
-                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END, " +
-                        "adjudicated_neutron_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END, " +
-                        "adjudicated_gamma_neutron_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END " +
-                        "WHERE summary_populated AND (" +
-                        "  COALESCE(any_alarm_count, 0) = 0 OR " +
-                        "  COALESCE(unadjudicated_alarm_count, 0) = 0 OR " +
-                        "  COALESCE(adjudicated_alarm_count, 0) = 0 OR " +
-                        "  (COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) OR " +
-                        "  (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) OR " +
-                        "  (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0)" +
-                        ") AND (" +
-                        "  unadjudicated_gamma_alarm_count IS NULL OR " +
-                        "  unadjudicated_neutron_alarm_count IS NULL OR " +
-                        "  unadjudicated_gamma_neutron_alarm_count IS NULL" +
-                        ")");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS alarm_category_gamma_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS alarm_category_neutron_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_bloom bytea");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_min_norm text");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_max_norm text");
+                // ModuleRegistry.loadAllModules enforces a 60-second datastore startup timeout.
+                // On real multi-day/multi-year deployments (> 64 generations), defer multi-million-row
+                // oscar_archive_schema backfills to bounded newest-first committed batches on
+                // OscarTieredObsStore's background backfill thread so upgrades never timeout or crash-loop.
+                int inlineLimit = inlineMigrationMaxGenerations;
+                boolean tinyArchiveForInlineBackfill;
+                try (PreparedStatement genCountProbe = connection.prepareStatement(
+                        "SELECT count(*) <= ? FROM (SELECT 1 FROM oscar_archive_generation LIMIT ?) t")) {
+                    genCountProbe.setInt(1, inlineLimit);
+                    genCountProbe.setInt(2, inlineLimit + 1);
+                    try (ResultSet rs = genCountProbe.executeQuery()) {
+                        rs.next();
+                        tinyArchiveForInlineBackfill = rs.getBoolean(1);
+                    }
+                }
+                if (tinyArchiveForInlineBackfill) {
+                    statement.execute("UPDATE oscar_archive_schema SET " +
+                            "unadjudicated_gamma_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
+                            "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END, " +
+                            "unadjudicated_neutron_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END, " +
+                            "unadjudicated_gamma_neutron_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END, " +
+                            "adjudicated_gamma_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
+                            "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END, " +
+                            "adjudicated_neutron_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END, " +
+                            "adjudicated_gamma_neutron_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END " +
+                            "WHERE summary_populated AND (" +
+                            "  COALESCE(any_alarm_count, 0) = 0 OR " +
+                            "  COALESCE(unadjudicated_alarm_count, 0) = 0 OR " +
+                            "  COALESCE(adjudicated_alarm_count, 0) = 0 OR " +
+                            "  (COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) OR " +
+                            "  (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) OR " +
+                            "  (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0)" +
+                            ") AND (" +
+                            "  unadjudicated_gamma_alarm_count IS NULL OR " +
+                            "  unadjudicated_neutron_alarm_count IS NULL OR " +
+                            "  unadjudicated_gamma_neutron_alarm_count IS NULL" +
+                            ")");
+                }
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_archive_schema_datastream_idx " +
                         "ON oscar_archive_schema (datastream_id, generation_id)");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_obs_latest (" +
@@ -420,13 +450,40 @@ public final class ArchiveCatalog {
                         "result_json jsonb NOT NULL, schema_json jsonb NOT NULL, profile text NOT NULL, " +
                         "updated_at timestamptz NOT NULL DEFAULT now(), " +
                         "PRIMARY KEY(store_key, id_scope, datastream_id))");
-                statement.execute("INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
-                        "SELECT DISTINCT encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), schema_json " +
-                        "FROM oscar_archive_schema WHERE schema_json IS NOT NULL " +
-                        "ON CONFLICT (schema_sha256) DO NOTHING");
-                migratedSchemaRows = statement.executeUpdate("UPDATE oscar_archive_schema " +
-                        "SET schema_sha256=encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), " +
-                        "schema_json=NULL WHERE schema_json IS NOT NULL");
+                if (tinyArchiveForInlineBackfill) {
+                    statement.execute("INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
+                            "SELECT DISTINCT encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), schema_json " +
+                            "FROM oscar_archive_schema WHERE schema_json IS NOT NULL " +
+                            "ON CONFLICT (schema_sha256) DO NOTHING");
+                    migratedSchemaRows = statement.executeUpdate("UPDATE oscar_archive_schema " +
+                            "SET schema_sha256=encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), " +
+                            "schema_json=NULL WHERE schema_json IS NOT NULL");
+                    // Schema-driven zero-fill for newly added extended fault / RS-350 alarmCategoryCode
+                    // summary columns so datastreams whose SWE schema cannot emit those fields become
+                    // immediately summary-ready without scanning Parquet files.
+                    statement.execute("UPDATE oscar_archive_schema " +
+                            "SET neutron_high_fault_count = 0 " +
+                            "WHERE summary_populated AND neutron_high_fault_count IS NULL AND (" +
+                            "  COALESCE(row_count, 0) = 0 OR schema_sha256 IN (" +
+                            "    SELECT schema_sha256 FROM oscar_archive_schema_blob " +
+                            "    WHERE position('alarmState' in schema_json::text) = 0 " +
+                            "       OR ((position('Fault - Gamma High' in schema_json::text) > 0 " +
+                            "            OR position('Fault - Extended Occupancy' in schema_json::text) > 0) " +
+                            "           AND position('Fault - Neutron High' in schema_json::text) = 0)" +
+                            "  )" +
+                            ")");
+                    statement.execute("UPDATE oscar_archive_schema " +
+                            "SET alarm_category_gamma_count = COALESCE(alarm_category_gamma_count, 0), " +
+                            "    alarm_category_neutron_count = COALESCE(alarm_category_neutron_count, 0) " +
+                            "WHERE summary_populated " +
+                            "  AND (alarm_category_gamma_count IS NULL OR alarm_category_neutron_count IS NULL) " +
+                            "  AND (" +
+                            "    COALESCE(row_count, 0) = 0 OR schema_sha256 IN (" +
+                            "      SELECT schema_sha256 FROM oscar_archive_schema_blob " +
+                            "      WHERE position('alarmCategoryCode' in schema_json::text) = 0" +
+                            "    )" +
+                            "  )");
+                }
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_event_locator (" +
                         "store_key text NOT NULL, id_scope integer NOT NULL, public_id text NOT NULL, " +
                         "observation_id bigint NOT NULL, generation_id uuid REFERENCES oscar_archive_generation(id), " +
@@ -1140,7 +1197,7 @@ public final class ArchiveCatalog {
                     blobStatement.executeBatch();
                     statement.executeBatch();
                 }
-                populateGenerationSummariesAndLatest(connection, generation);
+                populateGenerationSummariesAndLatest(connection, generation, resultTimeBounds.ocrByStream());
                 try (PreparedStatement statement = connection.prepareStatement(
                         "UPDATE oscar_archive_job SET state='ACTIVE', updated_at=now() " +
                                 "WHERE id=? AND store_key=? AND id_scope=?")) {
@@ -1246,7 +1303,10 @@ public final class ArchiveCatalog {
         return union.append(") o").toString();
     }
 
-    private record ResultTimeBounds(Instant minResultTime, Instant maxResultTime) {}
+    private record ResultTimeBounds(
+            Instant minResultTime,
+            Instant maxResultTime,
+            Map<Long, OcrBloomFilter.Snapshot> ocrByStream) {}
 
     /**
      * Streams the immutable export back into a transaction-local relation.
@@ -1271,6 +1331,7 @@ public final class ArchiveCatalog {
         long maximumId = Long.MIN_VALUE;
         Instant maxResultTime = generation.maxResultTime();
         Instant minResultTime = generation.minResultTime();
+        Map<Long, OcrBloomFilter.Accumulator> ocrAccumulators = new HashMap<>();
         try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(
                 resourceConfig, "activation-stage")) {
             Path localParquet = ArchiveExporter.stageToLocalDirectory(
@@ -1291,9 +1352,10 @@ public final class ArchiveCatalog {
                     Long foiId = rows.getObject(6, Long.class);
                     int archiveVersion = rows.getInt(10);
                     String profile = rows.getString(11);
+                    int expectedArchiveVersion = TieredArchiveConfig.isV2ArchiveProfile(generation.profile()) ? 2 : 1;
                     if (exportedIdScope != idScope || exportedDataStreamScope != idScope ||
                             (foiId == null ? foiScope != null : foiScope == null || foiScope != idScope) ||
-                            archiveVersion != 1 || !generation.profile().equals(profile))
+                            archiveVersion != expectedArchiveVersion || !generation.profile().equals(profile))
                         throw new IllegalStateException("Archive activation ledger metadata does not match its generation");
 
                     stage.setLong(1, observationId);
@@ -1320,6 +1382,10 @@ public final class ArchiveCatalog {
                             minResultTime = candidateResultTime;
                     }
                     String resultJson = rows.getString(9);
+                    if (!TieredArchiveConfig.PROFILE_RAW_TELEMETRY.equals(generation.profile())) {
+                        ocrAccumulators.computeIfAbsent(dataStreamId, ignored -> new OcrBloomFilter.Accumulator())
+                                .addFromResultJson(resultJson);
+                    }
                     if (resultJson == null)
                         stage.setNull(6, Types.VARCHAR);
                     else
@@ -1341,11 +1407,17 @@ public final class ArchiveCatalog {
         try (Statement analyze = postgres.createStatement()) {
             analyze.execute("ANALYZE oscar_archive_activation_row");
         }
-        return new ResultTimeBounds(minResultTime, maxResultTime);
+        Map<Long, OcrBloomFilter.Snapshot> ocrSnapshots = new HashMap<>(ocrAccumulators.size() * 2);
+        for (Map.Entry<Long, OcrBloomFilter.Accumulator> entry : ocrAccumulators.entrySet()) {
+            ocrSnapshots.put(entry.getKey(), entry.getValue().finish());
+        }
+        return new ResultTimeBounds(minResultTime, maxResultTime, ocrSnapshots);
     }
 
     private void populateGenerationSummariesAndLatest(
-            Connection connection, ArchiveGeneration generation) throws SQLException {
+            Connection connection,
+            ArchiveGeneration generation,
+            Map<Long, OcrBloomFilter.Snapshot> ocrByStream) throws SQLException {
         String isUnadjudicatedJson = "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0) " +
                 "OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') = '0'))";
         String isAdjudicatedJson = "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0) " +
@@ -1371,10 +1443,13 @@ public final class ArchiveCatalog {
                 "gamma_high_fault_count = agg.gamma_high_fault_count, " +
                 "gamma_low_fault_count = agg.gamma_low_fault_count, " +
                 "neutron_fault_count = agg.neutron_fault_count, " +
+                "neutron_high_fault_count = agg.neutron_high_fault_count, " +
                 "extended_occupancy_fault_count = agg.extended_occupancy_fault_count, " +
                 "tamper_true_count = agg.tamper_true_count, " +
                 "rs350_gamma_alarm_count = agg.rs350_gamma_alarm_count, " +
-                "rs350_neutron_alarm_count = agg.rs350_neutron_alarm_count " +
+                "rs350_neutron_alarm_count = agg.rs350_neutron_alarm_count, " +
+                "alarm_category_gamma_count = agg.alarm_category_gamma_count, " +
+                "alarm_category_neutron_count = agg.alarm_category_neutron_count " +
                 "FROM (" +
                 "SELECT datastream_id, " +
                 "count(*)::bigint AS row_count, " +
@@ -1396,15 +1471,40 @@ public final class ArchiveCatalog {
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma High\"'::jsonb)::bigint AS gamma_high_fault_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma Low\"'::jsonb)::bigint AS gamma_low_fault_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Neutron\"'::jsonb)::bigint AS neutron_fault_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Neutron High\"'::jsonb)::bigint AS neutron_high_fault_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Extended Occupancy\"'::jsonb)::bigint AS extended_occupancy_fault_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'tamperStatus' = 'true'::jsonb)::bigint AS tamper_true_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Gamma%')::bigint AS rs350_gamma_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Neutron%')::bigint AS rs350_neutron_alarm_count " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Neutron%')::bigint AS rs350_neutron_alarm_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmCategoryCode' = '\"Gamma\"'::jsonb)::bigint AS alarm_category_gamma_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmCategoryCode' = '\"Neutron\"'::jsonb)::bigint AS alarm_category_neutron_count " +
                 "FROM oscar_archive_activation_row GROUP BY datastream_id" +
                 ") agg WHERE s.generation_id = ? AND s.datastream_id = agg.datastream_id";
         try (PreparedStatement statement = connection.prepareStatement(updateSummarySql)) {
             statement.setObject(1, generation.id());
             statement.executeUpdate();
+        }
+        if (ocrByStream != null && !ocrByStream.isEmpty()) {
+            try (PreparedStatement updateOcr = connection.prepareStatement(
+                    "UPDATE oscar_archive_schema SET ocr_bloom = ?, ocr_min_norm = ?, ocr_max_norm = ? " +
+                            "WHERE generation_id = ? AND datastream_id = ?")) {
+                for (Map.Entry<Long, OcrBloomFilter.Snapshot> entry : ocrByStream.entrySet()) {
+                    OcrBloomFilter.Snapshot snap = entry.getValue();
+                    updateOcr.setBytes(1, snap.bloomBytes());
+                    if (snap.minNorm() == null)
+                        updateOcr.setNull(2, Types.VARCHAR);
+                    else
+                        updateOcr.setString(2, snap.minNorm());
+                    if (snap.maxNorm() == null)
+                        updateOcr.setNull(3, Types.VARCHAR);
+                    else
+                        updateOcr.setString(3, snap.maxNorm());
+                    updateOcr.setObject(4, generation.id());
+                    updateOcr.setLong(5, entry.getKey());
+                    updateOcr.addBatch();
+                }
+                updateOcr.executeBatch();
+            }
         }
 
         String insertLocatorSql = "INSERT INTO oscar_event_locator(" +
@@ -1557,11 +1657,21 @@ public final class ArchiveCatalog {
                                               Long minObservationId, Long maxObservationId,
                                               Set<Long> dataStreams, Instant minResultTime,
                                               Instant maxResultTime) {
-        if (dataStreams != null && dataStreams.isEmpty())
+        return candidates(start, end, observationId, minObservationId, maxObservationId,
+                dataStreams, minResultTime, maxResultTime, null);
+    }
+
+    public List<ArchiveGeneration> candidates(Instant start, Instant end, Long observationId,
+                                              Long minObservationId, Long maxObservationId,
+                                              Set<Long> dataStreams, Instant minResultTime,
+                                              Instant maxResultTime, Set<String> allowedProfiles) {
+        if ((dataStreams != null && dataStreams.isEmpty()) ||
+                (allowedProfiles != null && allowedProfiles.isEmpty()))
             return List.of();
         try (Connection connection = connections.open()) {
             return candidates(connection, start, end, observationId,
-                    minObservationId, maxObservationId, dataStreams, minResultTime, maxResultTime);
+                    minObservationId, maxObservationId, dataStreams, minResultTime, maxResultTime,
+                    allowedProfiles);
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot plan archive query", e);
         }
@@ -1575,7 +1685,7 @@ public final class ArchiveCatalog {
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
                                                Instant end, Long observationId)
             throws SQLException {
-        return candidates(connection, start, end, observationId, null, null, null, null, null);
+        return candidates(connection, start, end, observationId, null, null, null, null, null, null);
     }
 
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
@@ -1584,7 +1694,7 @@ public final class ArchiveCatalog {
                                                Set<Long> dataStreams)
             throws SQLException {
         return candidates(connection, start, end, observationId,
-                minObservationId, maxObservationId, dataStreams, null, null);
+                minObservationId, maxObservationId, dataStreams, null, null, null);
     }
 
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
@@ -1593,7 +1703,7 @@ public final class ArchiveCatalog {
                                                Set<Long> dataStreams, Instant minResultTime)
             throws SQLException {
         return candidates(connection, start, end, observationId,
-                minObservationId, maxObservationId, dataStreams, minResultTime, null);
+                minObservationId, maxObservationId, dataStreams, minResultTime, null, null);
     }
 
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
@@ -1602,19 +1712,33 @@ public final class ArchiveCatalog {
                                                Set<Long> dataStreams, Instant minResultTime,
                                                Instant maxResultTime)
             throws SQLException {
-        if (dataStreams != null && dataStreams.isEmpty())
+        return candidates(connection, start, end, observationId,
+                minObservationId, maxObservationId, dataStreams, minResultTime, maxResultTime, null);
+    }
+
+    public List<ArchiveGeneration> candidates(Connection connection, Instant start,
+                                               Instant end, Long observationId,
+                                               Long minObservationId, Long maxObservationId,
+                                               Set<Long> dataStreams, Instant minResultTime,
+                                               Instant maxResultTime, Set<String> allowedProfiles)
+            throws SQLException {
+        if ((dataStreams != null && dataStreams.isEmpty()) ||
+                (allowedProfiles != null && allowedProfiles.isEmpty()))
             return List.of();
         boolean filterIdRange = observationId == null &&
                 minObservationId != null && maxObservationId != null;
         boolean filterDataStreams = dataStreams != null;
+        boolean filterProfiles = allowedProfiles != null;
         String sql = (observationId != null ? "SELECT DISTINCT " : "SELECT ") +
                 "g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
                 "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
                 "FROM oscar_archive_generation g ";
         if (observationId != null)
             sql += "JOIN oscar_archive_id_block b ON b.generation_id=g.id ";
-        sql += "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
-                "AND g.window_start < ? AND g.window_end > ? ";
+        sql += "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') ";
+        if (filterProfiles)
+            sql += "AND g.profile=ANY (?::text[]) ";
+        sql += "AND g.window_start < ? AND g.window_end > ? ";
         if (minResultTime != null)
             sql += "AND (g.max_result_time IS NULL OR g.max_result_time >= ?) ";
         if (maxResultTime != null)
@@ -1629,6 +1753,9 @@ public final class ArchiveCatalog {
         sql += "ORDER BY g.window_start, g.id";
 
         List<ArchiveGeneration> generations = new ArrayList<>();
+        java.sql.Array profileArray = filterProfiles
+                ? connection.createArrayOf("text", allowedProfiles.toArray(String[]::new))
+                : null;
         java.sql.Array streamArray = filterDataStreams
                 ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                 : null;
@@ -1647,6 +1774,8 @@ public final class ArchiveCatalog {
                 int parameter = 1;
                 statement.setString(parameter++, storeKey);
                 statement.setInt(parameter++, idScope);
+                if (profileArray != null)
+                    statement.setArray(parameter++, profileArray);
                 UtcJdbcTime.setInstant(statement, parameter++, end);
                 UtcJdbcTime.setInstant(statement, parameter++, start);
                 if (minResultTime != null)
@@ -1668,6 +1797,8 @@ public final class ArchiveCatalog {
                 }
             }
         } finally {
+            if (profileArray != null)
+                profileArray.free();
             if (streamArray != null)
                 streamArray.free();
         }
@@ -1826,7 +1957,13 @@ public final class ArchiveCatalog {
      */
     public List<ArchiveGeneration> candidatesPotentiallyNewerThanResultTime(
             Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime) {
-        return candidates(start, end, null, null, null, dataStreams, minResultTime, null);
+        return candidates(start, end, null, null, null, dataStreams, minResultTime, null, null);
+    }
+
+    public List<ArchiveGeneration> candidatesPotentiallyNewerThanResultTime(
+            Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime,
+            Set<String> allowedProfiles) {
+        return candidates(start, end, null, null, null, dataStreams, minResultTime, null, allowedProfiles);
     }
 
     /**
@@ -1876,19 +2013,31 @@ public final class ArchiveCatalog {
     public InitialCandidateBatch candidatesInitialClusters(
             Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime,
             Instant maxResultTime, boolean descending, int batchLimit) {
+        return candidatesInitialClusters(
+                start, end, dataStreams, minResultTime, maxResultTime, descending, batchLimit, null);
+    }
+
+    public InitialCandidateBatch candidatesInitialClusters(
+            Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime,
+            Instant maxResultTime, boolean descending, int batchLimit,
+            Set<String> allowedProfiles) {
         if (batchLimit < 2)
             throw new IllegalArgumentException("Candidate batch limit must be at least 2");
-        if (dataStreams != null && dataStreams.isEmpty())
+        if ((dataStreams != null && dataStreams.isEmpty()) ||
+                (allowedProfiles != null && allowedProfiles.isEmpty()))
             return new InitialCandidateBatch(List.of(), true);
         boolean filterDataStreams = dataStreams != null;
+        boolean filterProfiles = allowedProfiles != null;
         String orderBy = descending
                 ? "ORDER BY g.window_end DESC, g.window_start DESC, g.id ASC LIMIT ?"
                 : "ORDER BY g.window_start ASC, g.window_end ASC, g.id ASC LIMIT ?";
         String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
                 "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
                 "FROM oscar_archive_generation g " +
-                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
-                "AND g.window_start < ? AND g.window_end > ? ";
+                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') ";
+        if (filterProfiles)
+            sql += "AND g.profile=ANY (?::text[]) ";
+        sql += "AND g.window_start < ? AND g.window_end > ? ";
         if (minResultTime != null)
             sql += "AND (g.max_result_time IS NULL OR g.max_result_time >= ?) ";
         if (maxResultTime != null)
@@ -1900,6 +2049,9 @@ public final class ArchiveCatalog {
 
         List<ArchiveGeneration> fetched = new ArrayList<>();
         try (Connection connection = connections.open()) {
+            java.sql.Array profileArray = filterProfiles
+                    ? connection.createArrayOf("text", allowedProfiles.toArray(String[]::new))
+                    : null;
             java.sql.Array streamArray = filterDataStreams
                     ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                     : null;
@@ -1918,6 +2070,8 @@ public final class ArchiveCatalog {
                     int parameter = 1;
                     statement.setString(parameter++, storeKey);
                     statement.setInt(parameter++, idScope);
+                    if (profileArray != null)
+                        statement.setArray(parameter++, profileArray);
                     UtcJdbcTime.setInstant(statement, parameter++, end);
                     UtcJdbcTime.setInstant(statement, parameter++, start);
                     if (minResultTime != null)
@@ -1933,6 +2087,8 @@ public final class ArchiveCatalog {
                     }
                 }
             } finally {
+                if (profileArray != null)
+                    profileArray.free();
                 if (streamArray != null)
                     streamArray.free();
             }
@@ -1963,7 +2119,7 @@ public final class ArchiveCatalog {
         }
         if (clusters.size() < 2) {
             List<ArchiveGeneration> all = candidates(
-                    start, end, null, null, null, dataStreams, minResultTime, maxResultTime);
+                    start, end, null, null, null, dataStreams, minResultTime, maxResultTime, allowedProfiles);
             return new InitialCandidateBatch(all, true);
         }
         List<List<ArchiveGeneration>> completeClusters = descending
@@ -1977,10 +2133,23 @@ public final class ArchiveCatalog {
         return new InitialCandidateBatch(completePrefix, false);
     }
 
+    static boolean shouldReindexArchiveSchema(long relationBytes, long deadTuples, long liveTuples) {
+        if (relationBytes < SCHEMA_REINDEX_SMALL_TABLE_BYTES)
+            return true;
+        if (deadTuples >= SCHEMA_REINDEX_MIN_DEAD_TUPLES)
+            return true;
+        return liveTuples > 0L && (double) deadTuples >= liveTuples * SCHEMA_REINDEX_MIN_DEAD_RATIO;
+    }
+
     /**
      * Rebuilds B-tree indexes online on the mutable observation parent table
      * and its companion datastream metadata table so multi-year DELETE/UPDATE
      * churn cannot accumulate unbounded dead index pages.
+     *
+     * <p>Reindexing {@code oscar_archive_schema} is bloat-gated once the table
+     * exceeds {@code 256 MiB} so multi-year append-only {@code RAW_TELEMETRY}
+     * archives do not pay multi-gigabyte nightly B-tree rebuilds while still
+     * reclaiming dead pages after large compactions or purges.</p>
      */
     public void reindexMutableTables(String observationTable, String dataStreamTable) {
         String observations = safeIdentifier(observationTable);
@@ -1995,7 +2164,19 @@ public final class ArchiveCatalog {
                     statement.execute("REINDEX TABLE CONCURRENTLY " + observations);
                     statement.execute("REINDEX TABLE CONCURRENTLY oscar_obs_stage_owner");
                 }
-                statement.execute("REINDEX TABLE CONCURRENTLY oscar_archive_schema");
+                boolean reindexArchiveSchema = true;
+                try (ResultSet stats = statement.executeQuery(
+                        "SELECT COALESCE(pg_relation_size('oscar_archive_schema'::regclass), 0), " +
+                                "COALESCE(s.n_dead_tup, 0), COALESCE(s.n_live_tup, 0) " +
+                                "FROM pg_stat_user_tables s " +
+                                "WHERE s.relid = 'oscar_archive_schema'::regclass")) {
+                    if (stats.next()) {
+                        reindexArchiveSchema = shouldReindexArchiveSchema(
+                                stats.getLong(1), stats.getLong(2), stats.getLong(3));
+                    }
+                }
+                if (reindexArchiveSchema)
+                    statement.execute("REINDEX TABLE CONCURRENTLY oscar_archive_schema");
                 statement.execute("REINDEX TABLE CONCURRENTLY " + dataStreams);
             } finally {
                 if (!oldAutoCommit)
@@ -2053,6 +2234,235 @@ public final class ArchiveCatalog {
                 ") dup WHERE o.id = dup.id");
     }
 
+    private volatile int inlineMigrationMaxGenerations = 64;
+
+    void setInlineMigrationMaxGenerationsForTesting(int maxGenerations) {
+        this.inlineMigrationMaxGenerations = Math.max(0, maxGenerations);
+    }
+
+    /**
+     * Returns {@code true} when {@code oscar_archive_generation} holds at most
+     * {@code maxGenerations} rows (bounded probe, never scans full history).
+     */
+    public boolean hasAtMostGenerations(int maxGenerations) {
+        if (maxGenerations < 0)
+            return false;
+        String sql = "SELECT count(*) <= ? FROM (SELECT 1 FROM oscar_archive_generation LIMIT ?) t";
+        try (Connection connection = connections.open();
+             PreparedStatement stmt = connection.prepareStatement(sql)) {
+            stmt.setInt(1, maxGenerations);
+            stmt.setInt(2, maxGenerations + 1);
+            try (ResultSet rs = stmt.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Bounded, newest-first committed SQL backfill for upgrade columns added to
+     * {@code oscar_archive_schema} ({@code schema_sha256} deduplication, derivable
+     * {@code unadjudicated_* / adjudicated_*} alarm splits, and schema-ineligible
+     * zero-fills for {@code neutron_high_fault_count} and {@code alarm_category_*}).
+     * Combines all pending column updates into a single per-batch UPDATE so multi-year
+     * upgrades touch each row at most once and never block datastore startup.
+     *
+     * @return number of generations updated in this batch ({@code 0} when caught up)
+     */
+    public int backfillPendingSchemaUpgradeColumnsBatch(int maxGenerations) {
+        if (maxGenerations < 1)
+            return 0;
+        List<String> ineligibleNh = new ArrayList<>();
+        List<String> ineligibleAc = new ArrayList<>();
+        List<UUID> pendingIds = new ArrayList<>();
+        boolean anyInlineSchemaJson = false;
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            loadIneligibleExtendedSchemaHashes(connection, ineligibleNh, ineligibleAc);
+            String[] nhArr = ineligibleNh.toArray(new String[0]);
+            String[] acArr = ineligibleAc.toArray(new String[0]);
+            java.sql.Array nhSqlArr = connection.createArrayOf("text", nhArr);
+            java.sql.Array acSqlArr = connection.createArrayOf("text", acArr);
+            String pendingSql = "SELECT g.id, " +
+                    "EXISTS (SELECT 1 FROM oscar_archive_schema s0 WHERE s0.generation_id = g.id AND s0.schema_json IS NOT NULL) AS has_inline_json " +
+                    "FROM oscar_archive_generation g " +
+                    "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                    "AND EXISTS (" +
+                    "  SELECT 1 FROM oscar_archive_schema s WHERE s.generation_id = g.id AND (" +
+                    "    s.schema_json IS NOT NULL " +
+                    "    OR (s.summary_populated AND (" +
+                    "      ((s.unadjudicated_gamma_alarm_count IS NULL " +
+                    "        OR s.unadjudicated_neutron_alarm_count IS NULL " +
+                    "        OR s.unadjudicated_gamma_neutron_alarm_count IS NULL) " +
+                    "       AND (COALESCE(s.any_alarm_count, 0) = 0 " +
+                    "         OR COALESCE(s.unadjudicated_alarm_count, 0) = 0 " +
+                    "         OR COALESCE(s.adjudicated_alarm_count, 0) = 0 " +
+                    "         OR (COALESCE(s.neutron_alarm_count, 0) = 0 AND COALESCE(s.gamma_neutron_alarm_count, 0) = 0) " +
+                    "         OR (COALESCE(s.gamma_alarm_count, 0) = 0 AND COALESCE(s.gamma_neutron_alarm_count, 0) = 0) " +
+                    "         OR (COALESCE(s.gamma_alarm_count, 0) = 0 AND COALESCE(s.neutron_alarm_count, 0) = 0))) " +
+                    "      OR (s.neutron_high_fault_count IS NULL " +
+                    "          AND (COALESCE(s.row_count, 0) = 0 OR s.schema_sha256 = ANY (?::text[]))) " +
+                    "      OR ((s.alarm_category_gamma_count IS NULL OR s.alarm_category_neutron_count IS NULL) " +
+                    "          AND (COALESCE(s.row_count, 0) = 0 OR s.schema_sha256 = ANY (?::text[])))" +
+                    "    ))" +
+                    "  )" +
+                    ") ORDER BY g.window_end DESC, g.id LIMIT ?";
+            try (PreparedStatement stmt = connection.prepareStatement(pendingSql)) {
+                stmt.setString(1, storeKey);
+                stmt.setInt(2, idScope);
+                stmt.setArray(3, nhSqlArr);
+                stmt.setArray(4, acSqlArr);
+                stmt.setInt(5, maxGenerations);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        pendingIds.add(rs.getObject(1, UUID.class));
+                        if (rs.getBoolean(2))
+                            anyInlineSchemaJson = true;
+                    }
+                }
+            } finally {
+                nhSqlArr.free();
+                acSqlArr.free();
+            }
+        } catch (SQLException e) {
+            return 0;
+        }
+        if (pendingIds.isEmpty())
+            return 0;
+        try (Connection connection = connections.open()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                java.sql.Array genArray = connection.createArrayOf("uuid", pendingIds.toArray(new UUID[0]));
+                try {
+                    if (anyInlineSchemaJson) {
+                        try (PreparedStatement insBlob = connection.prepareStatement(
+                                "INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
+                                        "SELECT DISTINCT encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), schema_json " +
+                                        "FROM oscar_archive_schema WHERE generation_id = ANY (?::uuid[]) AND schema_json IS NOT NULL " +
+                                        "ON CONFLICT (schema_sha256) DO NOTHING")) {
+                            insBlob.setArray(1, genArray);
+                            insBlob.executeUpdate();
+                        }
+                        try (PreparedStatement updBlob = connection.prepareStatement(
+                                "UPDATE oscar_archive_schema " +
+                                        "SET schema_sha256=encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), " +
+                                        "schema_json=NULL " +
+                                        "WHERE generation_id = ANY (?::uuid[]) AND schema_json IS NOT NULL")) {
+                            updBlob.setArray(1, genArray);
+                            updBlob.executeUpdate();
+                        }
+                        ineligibleNh.clear();
+                        ineligibleAc.clear();
+                        loadIneligibleExtendedSchemaHashes(connection, ineligibleNh, ineligibleAc);
+                    }
+                    java.sql.Array nhSqlArr = connection.createArrayOf("text", ineligibleNh.toArray(new String[0]));
+                    java.sql.Array acSqlArr = connection.createArrayOf("text", ineligibleAc.toArray(new String[0]));
+                    try (PreparedStatement upd = connection.prepareStatement(
+                            "UPDATE oscar_archive_schema SET " +
+                                    "unadjudicated_gamma_alarm_count = COALESCE(unadjudicated_gamma_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
+                                    "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "unadjudicated_neutron_alarm_count = COALESCE(unadjudicated_neutron_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "unadjudicated_gamma_neutron_alarm_count = COALESCE(unadjudicated_gamma_neutron_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "adjudicated_gamma_alarm_count = COALESCE(adjudicated_gamma_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
+                                    "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "adjudicated_neutron_alarm_count = COALESCE(adjudicated_neutron_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "adjudicated_gamma_neutron_alarm_count = COALESCE(adjudicated_gamma_neutron_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "neutron_high_fault_count = CASE " +
+                                    "  WHEN neutron_high_fault_count IS NOT NULL THEN neutron_high_fault_count " +
+                                    "  WHEN COALESCE(row_count, 0) = 0 OR schema_sha256 = ANY (?::text[]) THEN 0 " +
+                                    "  ELSE NULL END, " +
+                                    "alarm_category_gamma_count = CASE " +
+                                    "  WHEN alarm_category_gamma_count IS NOT NULL THEN alarm_category_gamma_count " +
+                                    "  WHEN COALESCE(row_count, 0) = 0 OR schema_sha256 = ANY (?::text[]) THEN 0 " +
+                                    "  ELSE NULL END, " +
+                                    "alarm_category_neutron_count = CASE " +
+                                    "  WHEN alarm_category_neutron_count IS NOT NULL THEN alarm_category_neutron_count " +
+                                    "  WHEN COALESCE(row_count, 0) = 0 OR schema_sha256 = ANY (?::text[]) THEN 0 " +
+                                    "  ELSE NULL END " +
+                                    "WHERE generation_id = ANY (?::uuid[]) AND summary_populated AND (" +
+                                    "  ((unadjudicated_gamma_alarm_count IS NULL OR unadjudicated_neutron_alarm_count IS NULL OR unadjudicated_gamma_neutron_alarm_count IS NULL) " +
+                                    "   AND (COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 " +
+                                    "     OR (COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) " +
+                                    "     OR (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) " +
+                                    "     OR (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0))) " +
+                                    "  OR (neutron_high_fault_count IS NULL AND (COALESCE(row_count, 0) = 0 OR schema_sha256 = ANY (?::text[]))) " +
+                                    "  OR ((alarm_category_gamma_count IS NULL OR alarm_category_neutron_count IS NULL) AND (COALESCE(row_count, 0) = 0 OR schema_sha256 = ANY (?::text[])))" +
+                                    ")")) {
+                        upd.setArray(1, nhSqlArr);
+                        upd.setArray(2, acSqlArr);
+                        upd.setArray(3, acSqlArr);
+                        upd.setArray(4, genArray);
+                        upd.setArray(5, nhSqlArr);
+                        upd.setArray(6, acSqlArr);
+                        upd.executeUpdate();
+                    } finally {
+                        nhSqlArr.free();
+                        acSqlArr.free();
+                    }
+                } finally {
+                    genArray.free();
+                }
+                connection.commit();
+                return pendingIds.size();
+            } catch (Exception e) {
+                connection.rollback();
+                return 0;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (SQLException e) {
+            return 0;
+        }
+    }
+
+    private static void loadIneligibleExtendedSchemaHashes(Connection connection,
+                                                           List<String> ineligibleNh,
+                                                           List<String> ineligibleAc) throws SQLException {
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT schema_sha256, " +
+                             "(position('alarmState' in schema_json::text) = 0 " +
+                             " OR ((position('Fault - Gamma High' in schema_json::text) > 0 " +
+                             "      OR position('Fault - Extended Occupancy' in schema_json::text) > 0) " +
+                             "     AND position('Fault - Neutron High' in schema_json::text) = 0)) AS inelig_nh, " +
+                             "(position('alarmCategoryCode' in schema_json::text) = 0) AS inelig_ac " +
+                             "FROM oscar_archive_schema_blob")) {
+            while (rs.next()) {
+                String hash = rs.getString(1);
+                if (hash == null)
+                    continue;
+                if (rs.getBoolean(2))
+                    ineligibleNh.add(hash);
+                if (rs.getBoolean(3))
+                    ineligibleAc.add(hash);
+            }
+        }
+    }
+
     /**
      * Incrementally populates per-datastream summary counters, event locators,
      * and {@code oscar_obs_latest} for pre-upgrade archive generations.
@@ -2060,30 +2470,6 @@ public final class ArchiveCatalog {
     public int backfillGenerationSummariesBatch(Path archiveRoot, int maxGenerations) {
         if (archiveRoot == null || maxGenerations < 1)
             return 0;
-        try (Connection connection = connections.open();
-             PreparedStatement fastPath = connection.prepareStatement(
-                     "UPDATE oscar_archive_schema s SET " +
-                     "summary_populated = TRUE, " +
-                     "unadjudicated_gamma_alarm_count = COALESCE(s.unadjudicated_gamma_alarm_count, 0), " +
-                     "unadjudicated_neutron_alarm_count = COALESCE(s.unadjudicated_neutron_alarm_count, 0), " +
-                     "unadjudicated_gamma_neutron_alarm_count = COALESCE(s.unadjudicated_gamma_neutron_alarm_count, 0), " +
-                     "adjudicated_gamma_alarm_count = COALESCE(s.adjudicated_gamma_alarm_count, 0), " +
-                     "adjudicated_neutron_alarm_count = COALESCE(s.adjudicated_neutron_alarm_count, 0), " +
-                     "adjudicated_gamma_neutron_alarm_count = COALESCE(s.adjudicated_gamma_neutron_alarm_count, 0) " +
-                     "FROM oscar_archive_generation g, " + safeIdentifier(storeKey + "_datastreams") + " d, oscar_obs_latest l " +
-                     "WHERE g.id = s.generation_id AND g.store_key=? AND g.id_scope=? " +
-                     "AND (NOT s.summary_populated OR s.unadjudicated_gamma_alarm_count IS NULL) " +
-                     "AND d.id = s.datastream_id " +
-                     "AND l.store_key = g.store_key AND l.id_scope = g.id_scope AND l.datastream_id = s.datastream_id " +
-                     "AND l.phenomenon_time >= g.window_end " +
-                     "AND COALESCE(d.data->>'outputName', d.data->'recordSchema'->>'name', '') " +
-                     "    NOT IN ('occupancy', 'tamper', 'connectionStatus', 'occupancyStatus', 'adjudication', 'report')")) {
-            fastPath.setString(1, storeKey);
-            fastPath.setInt(2, idScope);
-            fastPath.executeUpdate();
-        } catch (Exception ignored) {
-            // Optional fast-path when datastream table is accessible.
-        }
         List<ArchiveGeneration> pending = new ArrayList<>();
         String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
                 "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
@@ -2104,8 +2490,66 @@ public final class ArchiveCatalog {
         } catch (SQLException e) {
             return 0;
         }
-        int backfilled = 0;
-        for (ArchiveGeneration generation : pending) {
+        if (pending.isEmpty())
+            return 0;
+        // Scoped fast-path strictly for the bounded pending batch (never a full-table UPDATE)
+        try (Connection connection = connections.open()) {
+            java.sql.Array genArray = connection.createArrayOf("uuid",
+                    pending.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
+            try (PreparedStatement fastPath = connection.prepareStatement(
+                    "UPDATE oscar_archive_schema s SET " +
+                            "summary_populated = TRUE, " +
+                            "unadjudicated_gamma_alarm_count = COALESCE(s.unadjudicated_gamma_alarm_count, 0), " +
+                            "unadjudicated_neutron_alarm_count = COALESCE(s.unadjudicated_neutron_alarm_count, 0), " +
+                            "unadjudicated_gamma_neutron_alarm_count = COALESCE(s.unadjudicated_gamma_neutron_alarm_count, 0), " +
+                            "adjudicated_gamma_alarm_count = COALESCE(s.adjudicated_gamma_alarm_count, 0), " +
+                            "adjudicated_neutron_alarm_count = COALESCE(s.adjudicated_neutron_alarm_count, 0), " +
+                            "adjudicated_gamma_neutron_alarm_count = COALESCE(s.adjudicated_gamma_neutron_alarm_count, 0) " +
+                            "FROM oscar_archive_generation g, " + safeIdentifier(storeKey + "_datastreams") + " d, oscar_obs_latest l " +
+                            "WHERE g.id = s.generation_id AND g.id = ANY (?::uuid[]) AND g.store_key=? AND g.id_scope=? " +
+                            "AND (NOT s.summary_populated OR s.unadjudicated_gamma_alarm_count IS NULL) " +
+                            "AND d.id = s.datastream_id " +
+                            "AND l.store_key = g.store_key AND l.id_scope = g.id_scope AND l.datastream_id = s.datastream_id " +
+                            "AND l.phenomenon_time >= g.window_end " +
+                            "AND COALESCE(d.data->>'outputName', d.data->'recordSchema'->>'name', '') " +
+                            "    NOT IN ('occupancy', 'tamper', 'connectionStatus', 'occupancyStatus', 'adjudication', 'report')")) {
+                fastPath.setArray(1, genArray);
+                fastPath.setString(2, storeKey);
+                fastPath.setInt(3, idScope);
+                fastPath.executeUpdate();
+            } finally {
+                genArray.free();
+            }
+        } catch (Exception ignored) {
+            // Optional fast-path when datastream table is accessible.
+        }
+        // Re-check which of the bounded pending generations still need Parquet backfill
+        List<ArchiveGeneration> stillPending = new ArrayList<>();
+        try (Connection connection = connections.open()) {
+            java.sql.Array genArray = connection.createArrayOf("uuid",
+                    pending.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
+            try (PreparedStatement recheck = connection.prepareStatement(
+                    "SELECT DISTINCT generation_id FROM oscar_archive_schema " +
+                            "WHERE generation_id = ANY (?::uuid[]) " +
+                            "AND (NOT summary_populated OR unadjudicated_gamma_alarm_count IS NULL)")) {
+                recheck.setArray(1, genArray);
+                Set<UUID> remaining = new HashSet<>();
+                try (ResultSet rs = recheck.executeQuery()) {
+                    while (rs.next())
+                        remaining.add(rs.getObject(1, UUID.class));
+                }
+                for (ArchiveGeneration g : pending) {
+                    if (remaining.contains(g.id()))
+                        stillPending.add(g);
+                }
+            } finally {
+                genArray.free();
+            }
+        } catch (SQLException e) {
+            stillPending = pending;
+        }
+        int backfilled = pending.size() - stillPending.size();
+        for (ArchiveGeneration generation : stillPending) {
             try (Connection connection = connections.open()) {
                 boolean oldAutoCommit = connection.getAutoCommit();
                 connection.setAutoCommit(false);
@@ -2129,7 +2573,7 @@ public final class ArchiveCatalog {
                             updateBounds.executeUpdate();
                         }
                     }
-                    populateGenerationSummariesAndLatest(connection, generation);
+                    populateGenerationSummariesAndLatest(connection, generation, bounds.ocrByStream());
                     connection.commit();
                     backfilled++;
                 } catch (Exception ignored) {
@@ -2142,6 +2586,274 @@ public final class ArchiveCatalog {
             }
         }
         return backfilled;
+    }
+
+    /**
+     * Targeted DuckDB backfill for extended fault ({@code Fault - Neutron High})
+     * and RS-350 {@code alarmCategoryCode} summary counters on pre-upgrade archive
+     * generations without staging rows into PostgreSQL temporary tables.
+     *
+     * @return number of generations backfilled, {@code 0} when no readable pending
+     *         generations remain, or {@code -1} when DuckDB background admission
+     *         was transiently busy so the caller should retry after a short backoff.
+     */
+    public int backfillExtendedSummaryCountersBatch(Path archiveRoot, int maxGenerations) {
+        if (archiveRoot == null || maxGenerations < 1)
+            return 0;
+        List<ArchiveGeneration> pending = new ArrayList<>();
+        String pendingSql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
+                "FROM oscar_archive_generation g " +
+                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
+                "WHERE s.generation_id=g.id AND s.summary_populated " +
+                "AND (s.neutron_high_fault_count IS NULL OR s.alarm_category_gamma_count IS NULL " +
+                "OR s.alarm_category_neutron_count IS NULL)) " +
+                "ORDER BY g.window_end DESC, g.id LIMIT ?";
+        Map<UUID, Set<Long>> neededStreamsByGen = new HashMap<>();
+        Set<UUID> gensNeedingNh = new HashSet<>();
+        Set<UUID> gensNeedingAc = new HashSet<>();
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            try (PreparedStatement statement = connection.prepareStatement(pendingSql)) {
+                statement.setString(1, storeKey);
+                statement.setInt(2, idScope);
+                statement.setInt(3, maxGenerations);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next())
+                        pending.add(readGeneration(result));
+                }
+            }
+            if (pending.isEmpty())
+                return 0;
+            java.sql.Array genArray = connection.createArrayOf("uuid",
+                    pending.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
+            try (PreparedStatement streamsStmt = connection.prepareStatement(
+                    "SELECT generation_id, datastream_id, " +
+                            "(neutron_high_fault_count IS NULL) AS need_nh, " +
+                            "(alarm_category_gamma_count IS NULL OR alarm_category_neutron_count IS NULL) AS need_ac " +
+                            "FROM oscar_archive_schema " +
+                            "WHERE generation_id = ANY (?::uuid[]) AND summary_populated " +
+                            "AND (neutron_high_fault_count IS NULL OR alarm_category_gamma_count IS NULL " +
+                            "OR alarm_category_neutron_count IS NULL)")) {
+                streamsStmt.setArray(1, genArray);
+                try (ResultSet rs = streamsStmt.executeQuery()) {
+                    while (rs.next()) {
+                        UUID genId = rs.getObject(1, UUID.class);
+                        neededStreamsByGen
+                                .computeIfAbsent(genId, ignored -> new HashSet<>())
+                                .add(rs.getLong(2));
+                        if (rs.getBoolean(3))
+                            gensNeedingNh.add(genId);
+                        if (rs.getBoolean(4))
+                            gensNeedingAc.add(genId);
+                    }
+                }
+            } finally {
+                genArray.free();
+            }
+        } catch (SQLException e) {
+            return 0;
+        }
+        if (neededStreamsByGen.isEmpty())
+            return 0;
+
+        Path realRoot;
+        try {
+            Path normalizedRoot = archiveRoot.toAbsolutePath().normalize();
+            if (!Files.isDirectory(normalizedRoot))
+                return 0;
+            realRoot = normalizedRoot.toRealPath();
+        } catch (Exception e) {
+            return 0;
+        }
+
+        List<ArchiveGeneration> readable = new ArrayList<>(pending.size());
+        Map<UUID, Path> realPathByGen = new HashMap<>(pending.size() * 2);
+        for (ArchiveGeneration generation : pending) {
+            Set<Long> needed = neededStreamsByGen.get(generation.id());
+            if (needed == null || needed.isEmpty())
+                continue;
+            Path resolved = resolveReadableArchiveFile(realRoot, generation.objectPath());
+            if (resolved != null) {
+                readable.add(generation);
+                realPathByGen.put(generation.id(), resolved);
+            }
+        }
+        if (readable.isEmpty())
+            return 0;
+
+        int backfilled = 0;
+        boolean transientBusy = false;
+        boolean stageFor9p = ParquetArchiveReader.isPathOn9pMount(realRoot);
+        final int chunkSize = stageFor9p ? 8 : 16;
+        for (int start = 0; start < readable.size(); start += chunkSize) {
+            List<ArchiveGeneration> chunk = readable.subList(start, Math.min(readable.size(), start + chunkSize));
+            Set<Long> chunkStreams = new HashSet<>();
+            boolean chunkNeedNh = false;
+            boolean chunkNeedAc = false;
+            for (ArchiveGeneration gen : chunk) {
+                chunkStreams.addAll(neededStreamsByGen.getOrDefault(gen.id(), Set.of()));
+                if (gensNeedingNh.contains(gen.id()))
+                    chunkNeedNh = true;
+                if (gensNeedingAc.contains(gen.id()))
+                    chunkNeedAc = true;
+            }
+            if (chunkStreams.isEmpty() || (!chunkNeedNh && !chunkNeedAc))
+                continue;
+
+            List<Long> sortedStreams = new ArrayList<>(chunkStreams);
+            sortedStreams.sort(Long::compareTo);
+            StringBuilder streamList = new StringBuilder(sortedStreams.size() * 6);
+            for (int i = 0; i < sortedStreams.size(); i++) {
+                if (i > 0)
+                    streamList.append(',');
+                streamList.append(sortedStreams.get(i));
+            }
+
+            // Pre-filter in WHERE so non-matching rows (~99.99% of telemetry) never enter DuckDB's
+            // GROUP BY hash aggregate, and omit FILTER expressions for columns already populated.
+            List<String> whereMatchTerms = new ArrayList<>(3);
+            if (chunkNeedNh)
+                whereMatchTerms.add("contains(result_json, 'Fault - Neutron High')");
+            if (chunkNeedAc)
+                whereMatchTerms.add("contains(result_json, 'alarmCategoryCode')");
+            whereMatchTerms.add("contains(result_json, '\\u')");
+
+            String nhExpr = chunkNeedNh
+                    ? "count(*) FILTER (WHERE json_valid(result_json) " +
+                      "  AND json_type(json_extract(result_json, '$.alarmState')) = 'VARCHAR' " +
+                      "  AND json_extract_string(result_json, '$.alarmState') = 'Fault - Neutron High')::bigint"
+                    : "0::bigint";
+            String acGammaExpr = chunkNeedAc
+                    ? "count(*) FILTER (WHERE json_valid(result_json) " +
+                      "  AND json_type(json_extract(result_json, '$.alarmCategoryCode')) = 'VARCHAR' " +
+                      "  AND json_extract_string(result_json, '$.alarmCategoryCode') = 'Gamma')::bigint"
+                    : "0::bigint";
+            String acNeutronExpr = chunkNeedAc
+                    ? "count(*) FILTER (WHERE json_valid(result_json) " +
+                      "  AND json_type(json_extract(result_json, '$.alarmCategoryCode')) = 'VARCHAR' " +
+                      "  AND json_extract_string(result_json, '$.alarmCategoryCode') = 'Neutron')::bigint"
+                    : "0::bigint";
+
+            Map<UUID, Map<Long, long[]>> countsByGenStream = new HashMap<>(chunk.size() * 2);
+            try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(
+                    resourceConfig, "summary-backfill")) {
+                Map<String, UUID> genByPathString = new HashMap<>(chunk.size() * 2);
+                Map<Path, UUID> genByNormPath = new HashMap<>(chunk.size() * 2);
+                StringBuilder fileList = new StringBuilder();
+                int idx = 0;
+                for (ArchiveGeneration gen : chunk) {
+                    Path sourceFile = realPathByGen.get(gen.id());
+                    // On Windows WSL 2 9p/drvfs bind mounts, DuckDB C++ pread(>=64 KiB) can fail
+                    // with ENOMEM; stage into the ext4 operationDirectory via 16 KiB bounded reads.
+                    Path readableFile = stageFor9p
+                            ? ArchiveExporter.stageToLocalDirectory(
+                                    sourceFile, duckSession.operationDirectory(), "bf-" + (idx++) + ".parquet")
+                            : sourceFile;
+                    String pathStr = readableFile.toString();
+                    if (fileList.length() > 0)
+                        fileList.append(',');
+                    fileList.append('\'').append(pathStr.replace("'", "''")).append('\'');
+                    genByPathString.put(pathStr, gen.id());
+                    genByNormPath.put(readableFile.toAbsolutePath().normalize(), gen.id());
+                }
+                String duckSql = "SELECT filename, datastream_id, " +
+                        nhExpr + ", " + acGammaExpr + ", " + acNeutronExpr + " " +
+                        "FROM read_parquet([" + fileList + "], filename=true, union_by_name=true) " +
+                        "WHERE datastream_id IN (" + streamList + ") " +
+                        "AND result_json IS NOT NULL " +
+                        "AND (" + String.join(" OR ", whereMatchTerms) + ") " +
+                        "GROUP BY filename, datastream_id";
+                try (Statement stmt = duckSession.connection().createStatement();
+                     ResultSet rs = stmt.executeQuery(duckSql)) {
+                    while (rs.next()) {
+                        String rawFile = rs.getString(1);
+                        UUID genId = genByPathString.get(rawFile);
+                        if (genId == null && rawFile != null) {
+                            genId = genByNormPath.get(Path.of(rawFile).toAbsolutePath().normalize());
+                        }
+                        if (genId == null)
+                            continue;
+                        long dsId = rs.getLong(2);
+                        long[] counts = new long[]{rs.getLong(3), rs.getLong(4), rs.getLong(5)};
+                        countsByGenStream.computeIfAbsent(genId, ignored -> new HashMap<>()).put(dsId, counts);
+                    }
+                }
+            } catch (java.sql.SQLTransientException busy) {
+                transientBusy = true;
+                break;
+            } catch (Exception ignored) {
+                continue;
+            }
+
+            try (Connection connection = connections.open()) {
+                boolean oldAutoCommit = connection.getAutoCommit();
+                connection.setAutoCommit(false);
+                try (PreparedStatement update = connection.prepareStatement(
+                        "UPDATE oscar_archive_schema SET " +
+                                "neutron_high_fault_count = COALESCE(neutron_high_fault_count, ?), " +
+                                "alarm_category_gamma_count = COALESCE(alarm_category_gamma_count, ?), " +
+                                "alarm_category_neutron_count = COALESCE(alarm_category_neutron_count, ?) " +
+                                "WHERE generation_id = ? AND datastream_id = ?")) {
+                    int batchCount = 0;
+                    for (ArchiveGeneration gen : chunk) {
+                        Map<Long, long[]> streamCounts = countsByGenStream.getOrDefault(gen.id(), Map.of());
+                        for (Long dsId : neededStreamsByGen.getOrDefault(gen.id(), Set.of())) {
+                            long[] c = streamCounts.get(dsId);
+                            update.setLong(1, c != null ? c[0] : 0L);
+                            update.setLong(2, c != null ? c[1] : 0L);
+                            update.setLong(3, c != null ? c[2] : 0L);
+                            update.setObject(4, gen.id());
+                            update.setLong(5, dsId);
+                            update.addBatch();
+                            batchCount++;
+                            if (batchCount % 500 == 0)
+                                update.executeBatch();
+                        }
+                    }
+                    if (batchCount > 0)
+                        update.executeBatch();
+                    connection.commit();
+                    backfilled += chunk.size();
+                } catch (Exception ignored) {
+                    connection.rollback();
+                } finally {
+                    connection.setAutoCommit(oldAutoCommit);
+                }
+            } catch (Exception ignored) {
+                // Best-effort background backfill.
+            }
+        }
+        return (backfilled == 0 && transientBusy) ? -1 : backfilled;
+    }
+
+    private static Path resolveReadableArchiveFile(Path realRoot, Path relativeObjectPath) {
+        if (relativeObjectPath == null || relativeObjectPath.isAbsolute())
+            return null;
+        try {
+            Path candidate = realRoot.resolve(relativeObjectPath).normalize();
+            if (!candidate.startsWith(realRoot))
+                return null;
+            Path current = realRoot;
+            for (Path part : realRoot.relativize(candidate)) {
+                current = current.resolve(part);
+                if (!Files.exists(current, LinkOption.NOFOLLOW_LINKS))
+                    return null;
+                BasicFileAttributes attrs = Files.readAttributes(
+                        current, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                if (attrs.isSymbolicLink())
+                    return null;
+            }
+            BasicFileAttributes fileAttrs = Files.readAttributes(
+                    candidate, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!fileAttrs.isRegularFile())
+                return null;
+            Path realFile = candidate.toRealPath();
+            return realFile.startsWith(realRoot) ? realFile : null;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     /**
@@ -2181,6 +2893,47 @@ public final class ArchiveCatalog {
             throw new IllegalStateException("Cannot inspect archived datastreams", e);
         }
         return present;
+    }
+
+    /**
+     * Returns the subset of {@code dataStreams} that currently appear in any
+     * active/sealed telemetry-only generation ({@code RAW_TELEMETRY} or
+     * {@code DAILY_TELEMETRY}). Used once per event datastream to confirm
+     * whether pure event queries can safely restrict catalog scans to
+     * {@link TieredArchiveConfig#EVENT_QUERY_PROFILES} without risking
+     * invisibility if a future release promotes a formerly-telemetry output.
+     */
+    public Set<Long> dataStreamsWithTelemetryProfiles(Collection<Long> dataStreams) {
+        if (dataStreams == null || dataStreams.isEmpty())
+            return Set.of();
+        String sql = "SELECT u.ds_id " +
+                "FROM unnest(?::bigint[]) AS u(ds_id) " +
+                "WHERE EXISTS (" +
+                "SELECT 1 FROM oscar_archive_schema s " +
+                "JOIN oscar_archive_generation g ON g.id = s.generation_id " +
+                "WHERE s.datastream_id = u.ds_id " +
+                "AND g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                "AND g.profile IN ('" + TieredArchiveConfig.PROFILE_RAW_TELEMETRY +
+                "','" + TieredArchiveConfig.PROFILE_DAILY_TELEMETRY + "'))";
+        Set<Long> inTelemetry = new HashSet<>();
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            java.sql.Array streamArray = connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new));
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setArray(1, streamArray);
+                statement.setString(2, storeKey);
+                statement.setInt(3, idScope);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next())
+                        inTelemetry.add(result.getLong(1));
+                }
+            } finally {
+                streamArray.free();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect telemetry profile presence for datastreams", e);
+        }
+        return inTelemetry;
     }
 
     private static ArchiveGeneration readGeneration(ResultSet result) throws SQLException {
@@ -3244,37 +3997,41 @@ public final class ArchiveCatalog {
         }
         if (summaryExpr == null)
             return working;
+        if ("0::bigint".equals(summaryExpr))
+            return List.of();
 
         boolean filterStreams = dataStreams != null;
-        boolean omitGenFilter = filterStreams && working.size() > 64;
         String sql = "SELECT s.generation_id FROM oscar_archive_schema s WHERE " +
-                (omitGenFilter
-                        ? "s.datastream_id=ANY (?::bigint[])"
-                        : "s.generation_id=ANY (?::uuid[])" +
-                          (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "")) +
+                "s.generation_id=ANY (?::uuid[])" +
+                (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "") +
                 " GROUP BY s.generation_id " +
                 "HAVING BOOL_AND(s.summary_populated) AND COALESCE(SUM(" + summaryExpr + "), 0) = 0";
         Set<UUID> prune = new HashSet<>();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
-            java.sql.Array genArray = omitGenFilter ? null : connection.createArrayOf("uuid",
-                    working.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
             java.sql.Array streamArray = filterStreams
                     ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                     : null;
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                int param = 1;
-                if (genArray != null)
-                    statement.setArray(param++, genArray);
-                if (streamArray != null)
-                    statement.setArray(param, streamArray);
-                try (ResultSet result = statement.executeQuery()) {
-                    while (result.next())
-                        prune.add(result.getObject(1, UUID.class));
+                for (int offset = 0; offset < working.size(); offset += SUMMARY_GENERATION_BATCH_SIZE) {
+                    int end = Math.min(offset + SUMMARY_GENERATION_BATCH_SIZE, working.size());
+                    UUID[] batchIds = new UUID[end - offset];
+                    for (int i = offset; i < end; i++)
+                        batchIds[i - offset] = working.get(i).id();
+                    java.sql.Array genArray = connection.createArrayOf("uuid", batchIds);
+                    try {
+                        statement.setArray(1, genArray);
+                        if (streamArray != null)
+                            statement.setArray(2, streamArray);
+                        try (ResultSet result = statement.executeQuery()) {
+                            while (result.next())
+                                prune.add(result.getObject(1, UUID.class));
+                        }
+                    } finally {
+                        genArray.free();
+                    }
                 }
             } finally {
-                if (genArray != null)
-                    genArray.free();
                 if (streamArray != null)
                     streamArray.free();
             }
@@ -3421,6 +4178,10 @@ public final class ArchiveCatalog {
 
         if (summarySpec == null && timeContainedSpec == null)
             return new CandidateSelectionPlan(working, List.of());
+        if (summarySpec != null &&
+                "0::bigint".equals(summarySpec.upperBoundExpr()) &&
+                "true".equals(summarySpec.exactReadyExpr()))
+            return new CandidateSelectionPlan(List.of(), List.of());
 
         String upperExpr = summarySpec != null ? summarySpec.upperBoundExpr() : timeContainedSpec.upperBoundExpr();
         String exactReadyExpr = summarySpec != null ? summarySpec.exactReadyExpr() : "false";
@@ -3435,7 +4196,6 @@ public final class ArchiveCatalog {
         String tcExactExpr = checkTimeContained ? timeContainedSpec.exactExpr() : "0::bigint";
 
         boolean filterStreams = dataStreams != null;
-        boolean omitGenFilter = filterStreams && working.size() > 64;
         String sql = "SELECT s.generation_id, " +
                 "BOOL_AND(s.summary_populated), " +
                 "COALESCE(SUM(" + upperExpr + "), 0)::bigint, " +
@@ -3446,11 +4206,8 @@ public final class ArchiveCatalog {
                         : "") +
                 " FROM oscar_archive_schema s " +
                 (checkTimeContained ? "LEFT JOIN oscar_archive_schema_blob b ON b.schema_sha256 = s.schema_sha256 " : "") +
-                "WHERE " +
-                (omitGenFilter
-                        ? "s.datastream_id=ANY (?::bigint[])"
-                        : "s.generation_id=ANY (?::uuid[])" +
-                          (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "")) +
+                "WHERE s.generation_id=ANY (?::uuid[])" +
+                (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "") +
                 " GROUP BY s.generation_id";
 
         Map<UUID, Boolean> populatedByGen = new HashMap<>();
@@ -3461,33 +4218,38 @@ public final class ArchiveCatalog {
         Map<UUID, Long> tcExactByGen = checkTimeContained ? new HashMap<>() : Map.of();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
-            java.sql.Array genArray = omitGenFilter ? null : connection.createArrayOf("uuid",
-                    working.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
             java.sql.Array streamArray = filterStreams
                     ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                     : null;
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                int param = 1;
-                if (genArray != null)
-                    statement.setArray(param++, genArray);
-                if (streamArray != null)
-                    statement.setArray(param, streamArray);
-                try (ResultSet result = statement.executeQuery()) {
-                    while (result.next()) {
-                        UUID genId = result.getObject(1, UUID.class);
-                        populatedByGen.put(genId, result.getBoolean(2));
-                        upperByGen.put(genId, result.getLong(3));
-                        exactReadyByGen.put(genId, result.getBoolean(4));
-                        exactByGen.put(genId, result.getLong(5));
-                        if (checkTimeContained) {
-                            tcReadyByGen.put(genId, result.getBoolean(6));
-                            tcExactByGen.put(genId, result.getLong(7));
+                for (int offset = 0; offset < working.size(); offset += SUMMARY_GENERATION_BATCH_SIZE) {
+                    int end = Math.min(offset + SUMMARY_GENERATION_BATCH_SIZE, working.size());
+                    UUID[] batchIds = new UUID[end - offset];
+                    for (int i = offset; i < end; i++)
+                        batchIds[i - offset] = working.get(i).id();
+                    java.sql.Array genArray = connection.createArrayOf("uuid", batchIds);
+                    try {
+                        statement.setArray(1, genArray);
+                        if (streamArray != null)
+                            statement.setArray(2, streamArray);
+                        try (ResultSet result = statement.executeQuery()) {
+                            while (result.next()) {
+                                UUID genId = result.getObject(1, UUID.class);
+                                populatedByGen.put(genId, result.getBoolean(2));
+                                upperByGen.put(genId, result.getLong(3));
+                                exactReadyByGen.put(genId, result.getBoolean(4));
+                                exactByGen.put(genId, result.getLong(5));
+                                if (checkTimeContained) {
+                                    tcReadyByGen.put(genId, result.getBoolean(6));
+                                    tcExactByGen.put(genId, result.getLong(7));
+                                }
+                            }
                         }
+                    } finally {
+                        genArray.free();
                     }
                 }
             } finally {
-                if (genArray != null)
-                    genArray.free();
                 if (streamArray != null)
                     streamArray.free();
             }
@@ -3848,6 +4610,10 @@ public final class ArchiveCatalog {
             JsonCqlEvaluator.TimeContainedSummarySpec timeContainedSpec) {
         if (candidates == null || candidates.isEmpty() || (summarySpec == null && timeContainedSpec == null))
             return new ColdSummaryPlan(0L, candidates == null ? List.of() : candidates, List.of());
+        if (summarySpec != null &&
+                "0::bigint".equals(summarySpec.upperBoundExpr()) &&
+                "true".equals(summarySpec.exactReadyExpr()))
+            return new ColdSummaryPlan(0L, List.of(), List.of());
         String upperExpr = summarySpec != null ? summarySpec.upperBoundExpr() : timeContainedSpec.upperBoundExpr();
         String exactReadyExpr = summarySpec != null ? summarySpec.exactReadyExpr() : "false";
         String exactExpr = summarySpec != null ? summarySpec.exactExpr() : "0::bigint";
@@ -3860,7 +4626,6 @@ public final class ArchiveCatalog {
         String tcExactExpr = checkTimeContained ? timeContainedSpec.exactExpr() : "0::bigint";
 
         boolean filterStreams = dataStreams != null;
-        boolean omitGenFilter = filterStreams && candidates.size() > 64;
         String sql = "SELECT s.generation_id, BOOL_AND(s.summary_populated), " +
                 "COALESCE(SUM(" + upperExpr + "), 0)::bigint, " +
                 "BOOL_AND(" + exactReadyExpr + "), " +
@@ -3869,11 +4634,8 @@ public final class ArchiveCatalog {
                 "COALESCE(SUM(" + tcExactExpr + "), 0)::bigint " +
                 "FROM oscar_archive_schema s " +
                 (checkTimeContained ? "LEFT JOIN oscar_archive_schema_blob b ON b.schema_sha256 = s.schema_sha256 " : "") +
-                "WHERE " +
-                (omitGenFilter
-                        ? "s.datastream_id=ANY (?::bigint[])"
-                        : "s.generation_id=ANY (?::uuid[])" +
-                          (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "")) +
+                "WHERE s.generation_id=ANY (?::uuid[])" +
+                (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "") +
                 " GROUP BY s.generation_id";
         Map<UUID, Boolean> populatedByGen = new HashMap<>();
         Map<UUID, Long> upperByGen = new HashMap<>();
@@ -3883,33 +4645,38 @@ public final class ArchiveCatalog {
         Map<UUID, Long> tcExactByGen = checkTimeContained ? new HashMap<>() : Map.of();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
-            java.sql.Array genArray = omitGenFilter ? null : connection.createArrayOf("uuid",
-                    candidates.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
             java.sql.Array streamArray = filterStreams
                     ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                     : null;
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                int param = 1;
-                if (genArray != null)
-                    statement.setArray(param++, genArray);
-                if (streamArray != null)
-                    statement.setArray(param, streamArray);
-                try (ResultSet result = statement.executeQuery()) {
-                    while (result.next()) {
-                        UUID genId = result.getObject(1, UUID.class);
-                        populatedByGen.put(genId, result.getBoolean(2));
-                        upperByGen.put(genId, result.getLong(3));
-                        exactReadyByGen.put(genId, result.getBoolean(4));
-                        exactByGen.put(genId, result.getLong(5));
-                        if (checkTimeContained) {
-                            tcReadyByGen.put(genId, result.getBoolean(6));
-                            tcExactByGen.put(genId, result.getLong(7));
+                for (int offset = 0; offset < candidates.size(); offset += SUMMARY_GENERATION_BATCH_SIZE) {
+                    int end = Math.min(offset + SUMMARY_GENERATION_BATCH_SIZE, candidates.size());
+                    UUID[] batchIds = new UUID[end - offset];
+                    for (int i = offset; i < end; i++)
+                        batchIds[i - offset] = candidates.get(i).id();
+                    java.sql.Array genArray = connection.createArrayOf("uuid", batchIds);
+                    try {
+                        statement.setArray(1, genArray);
+                        if (streamArray != null)
+                            statement.setArray(2, streamArray);
+                        try (ResultSet result = statement.executeQuery()) {
+                            while (result.next()) {
+                                UUID genId = result.getObject(1, UUID.class);
+                                populatedByGen.put(genId, result.getBoolean(2));
+                                upperByGen.put(genId, result.getLong(3));
+                                exactReadyByGen.put(genId, result.getBoolean(4));
+                                exactByGen.put(genId, result.getLong(5));
+                                if (checkTimeContained) {
+                                    tcReadyByGen.put(genId, result.getBoolean(6));
+                                    tcExactByGen.put(genId, result.getLong(7));
+                                }
+                            }
                         }
+                    } finally {
+                        genArray.free();
                     }
                 }
             } finally {
-                if (genArray != null)
-                    genArray.free();
                 if (streamArray != null)
                     streamArray.free();
             }
@@ -4233,24 +5000,31 @@ public final class ArchiveCatalog {
                 "AND generation.store_key=tombstone.store_key AND generation.id_scope=tombstone.id_scope " +
                 "AND generation.state IN ('ACTIVE','SEALED')";
         Map<UUID, Set<Long>> byGeneration = new HashMap<>();
+        List<UUID> idList = generationIds instanceof List<UUID> list ? list : new ArrayList<>(generationIds);
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
-            java.sql.Array genArray = connection.createArrayOf("uuid", generationIds.toArray());
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                statement.setArray(1, genArray);
                 statement.setString(2, storeKey);
                 statement.setInt(3, idScope);
                 statement.setString(4, storeKey);
                 statement.setInt(5, idScope);
-                try (ResultSet result = statement.executeQuery()) {
-                    while (result.next()) {
-                        UUID genId = result.getObject(1, UUID.class);
-                        long obsId = result.getLong(2);
-                        byGeneration.computeIfAbsent(genId, ignored -> new HashSet<>()).add(obsId);
+                for (int offset = 0; offset < idList.size(); offset += SUMMARY_GENERATION_BATCH_SIZE) {
+                    int end = Math.min(offset + SUMMARY_GENERATION_BATCH_SIZE, idList.size());
+                    UUID[] batchIds = idList.subList(offset, end).toArray(UUID[]::new);
+                    java.sql.Array genArray = connection.createArrayOf("uuid", batchIds);
+                    try {
+                        statement.setArray(1, genArray);
+                        try (ResultSet result = statement.executeQuery()) {
+                            while (result.next()) {
+                                UUID genId = result.getObject(1, UUID.class);
+                                long obsId = result.getLong(2);
+                                byGeneration.computeIfAbsent(genId, ignored -> new HashSet<>()).add(obsId);
+                            }
+                        }
+                    } finally {
+                        genArray.free();
                     }
                 }
-            } finally {
-                genArray.free();
             }
             return byGeneration;
         } catch (SQLException e) {
@@ -5027,14 +5801,16 @@ public final class ArchiveCatalog {
                         "UPDATE oscar_obs_overlay SET " +
                                 "base_summary_mask=?, base_datastream_id=?, base_foi_id=?, base_generation_sha256=? " +
                                 "WHERE store_key=? AND id_scope=? AND generation_id=? AND observation_id=? " +
-                                "AND (base_summary_mask IS NULL OR base_generation_sha256 IS DISTINCT FROM ?)");
+                                "AND (base_summary_mask IS NULL OR (base_summary_mask & " +
+                                JsonCqlEvaluator.BIT_MASK_V2 + ") = 0 OR base_generation_sha256 IS DISTINCT FROM ?)");
                      PreparedStatement tbStmt = connection.prepareStatement(
                              "UPDATE oscar_tombstone SET " +
                                      "base_summary_mask=?, datastream_id=COALESCE(datastream_id, ?), " +
                                      "base_foi_id=?, base_generation_sha256=? " +
                                      "WHERE store_key=? AND id_scope=? AND subject_type='OBSERVATION' " +
                                      "AND generation_id=? AND subject_id=? " +
-                                     "AND (base_summary_mask IS NULL OR base_generation_sha256 IS DISTINCT FROM ?)")) {
+                                     "AND (base_summary_mask IS NULL OR (base_summary_mask & " +
+                                     JsonCqlEvaluator.BIT_MASK_V2 + ") = 0 OR base_generation_sha256 IS DISTINCT FROM ?)")) {
                     for (MutatedBaseSummaryRow row : rows) {
                         if (row.summaryMask() == null || row.generationSha256() == null)
                             continue;
@@ -5176,6 +5952,1427 @@ public final class ArchiveCatalog {
             return out;
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot inspect missing mutated observation base summary masks", e);
+        }
+    }
+
+    public Map<UUID, ParquetArchiveReader.GenerationSummary> generationSummaries(
+            Collection<UUID> generationIds, Set<Long> dataStreams) {
+        if (generationIds == null || generationIds.isEmpty())
+            return Map.of();
+        if (dataStreams != null && dataStreams.isEmpty())
+            return Map.of();
+        boolean filterStreams = dataStreams != null;
+        String sql = "SELECT generation_id, bool_and(summary_populated), " +
+                "COALESCE(SUM(row_count), 0), " +
+                "COALESCE(SUM(gamma_alarm_count), 0), " +
+                "COALESCE(SUM(neutron_alarm_count), 0), " +
+                "COALESCE(SUM(gamma_neutron_alarm_count), 0), " +
+                "COALESCE(SUM(gamma_true_count), 0), " +
+                "COALESCE(SUM(neutron_true_count), 0) " +
+                "FROM oscar_archive_schema " +
+                "WHERE generation_id = ANY (?::uuid[])" +
+                (filterStreams ? " AND datastream_id = ANY (?::bigint[])" : "") +
+                " GROUP BY generation_id";
+        Map<UUID, ParquetArchiveReader.GenerationSummary> out = new HashMap<>(generationIds.size() * 2);
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            java.sql.Array genArray = connection.createArrayOf("uuid", generationIds.toArray(UUID[]::new));
+            java.sql.Array streamArray = filterStreams
+                    ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
+                    : null;
+            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+                stmt.setArray(1, genArray);
+                if (streamArray != null)
+                    stmt.setArray(2, streamArray);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        UUID genId = rs.getObject(1, UUID.class);
+                        boolean populated = rs.getBoolean(2) && !rs.wasNull();
+                        out.put(genId, new ParquetArchiveReader.GenerationSummary(
+                                populated,
+                                rs.getLong(3),
+                                rs.getLong(4),
+                                rs.getLong(5),
+                                rs.getLong(6),
+                                rs.getLong(7),
+                                rs.getLong(8)));
+                    }
+                }
+            } finally {
+                genArray.free();
+                if (streamArray != null)
+                    streamArray.free();
+                connection.setReadOnly(oldReadOnly);
+            }
+            return out;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot load generation summary counters", e);
+        }
+    }
+
+    public List<ArchiveGeneration> pruneOcrCandidates(
+            List<ArchiveGeneration> candidates,
+            Set<Long> dataStreams,
+            org.geotools.api.filter.Filter cqlFilter) {
+        if (candidates == null || candidates.isEmpty() || cqlFilter == null)
+            return candidates;
+        Optional<JsonCqlEvaluator.OcrGenerationMatcher> matcherOpt =
+                JsonCqlEvaluator.extractOcrGenerationMatcher(cqlFilter);
+        if (matcherOpt.isEmpty())
+            return candidates;
+        JsonCqlEvaluator.OcrGenerationMatcher matcher = matcherOpt.get();
+        if (dataStreams != null && dataStreams.isEmpty())
+            return List.of();
+
+        boolean filterStreams = dataStreams != null;
+        String sql = "SELECT generation_id, ocr_bloom, ocr_min_norm, ocr_max_norm " +
+                "FROM oscar_archive_schema WHERE generation_id = ANY (?::uuid[])" +
+                (filterStreams ? " AND datastream_id = ANY (?::bigint[])" : "");
+        Map<UUID, Boolean> genMightMatch = new HashMap<>(candidates.size() * 2);
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            UUID[] genIds = candidates.stream().map(ArchiveGeneration::id).toArray(UUID[]::new);
+            java.sql.Array genArray = connection.createArrayOf("uuid", genIds);
+            java.sql.Array streamArray = filterStreams
+                    ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
+                    : null;
+            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+                stmt.setArray(1, genArray);
+                if (streamArray != null)
+                    stmt.setArray(2, streamArray);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        UUID genId = rs.getObject(1, UUID.class);
+                        if (Boolean.TRUE.equals(genMightMatch.get(genId)))
+                            continue;
+                        byte[] bloom = rs.getBytes(2);
+                        String minNorm = rs.getString(3);
+                        String maxNorm = rs.getString(4);
+                        boolean match = matcher.mightMatch(bloom, minNorm, maxNorm);
+                        genMightMatch.merge(genId, match, Boolean::logicalOr);
+                    }
+                }
+            } finally {
+                genArray.free();
+                if (streamArray != null)
+                    streamArray.free();
+                connection.setReadOnly(oldReadOnly);
+            }
+            List<ArchiveGeneration> kept = new ArrayList<>(candidates.size());
+            for (ArchiveGeneration gen : candidates) {
+                Boolean status = genMightMatch.get(gen.id());
+                if (status == null || status) {
+                    kept.add(gen);
+                }
+            }
+            return kept;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot prune OCR archive candidates", e);
+        }
+    }
+
+    public record CompactionWindowCandidate(
+            Instant windowStart,
+            Instant windowEnd,
+            List<ArchiveGeneration> sourceGenerations) {}
+
+    public record CompactionSchemaCatalog(
+            Map<Long, SchemaSnapshot> schemasByStreamId,
+            Map<Long, String> outputNameByStreamId,
+            Map<UUID, Set<Long>> streamIdsByGeneration) {}
+
+    public record FoldedOverlayCandidate(
+            long observationId,
+            UUID sourceGenerationId,
+            long dataStreamId,
+            Long foiId,
+            Instant phenomenonTime,
+            Instant resultTime,
+            String resultJson,
+            Instant updatedAt) {}
+
+    public record StreamSummaryCounters(
+            long rowCount,
+            long gammaAlarmCount,
+            long neutronAlarmCount,
+            long gammaNeutronAlarmCount,
+            long nonAlarmOccupancyCount,
+            long gammaTrueCount,
+            long neutronTrueCount,
+            long anyAlarmCount,
+            long unadjudicatedAlarmCount,
+            long adjudicatedAlarmCount,
+            long unadjudicatedGammaAlarmCount,
+            long unadjudicatedNeutronAlarmCount,
+            long unadjudicatedGammaNeutronAlarmCount,
+            long adjudicatedGammaAlarmCount,
+            long adjudicatedNeutronAlarmCount,
+            long adjudicatedGammaNeutronAlarmCount,
+            long gammaHighFaultCount,
+            long gammaLowFaultCount,
+            long neutronFaultCount,
+            long neutronHighFaultCount,
+            long extendedOccupancyFaultCount,
+            long tamperTrueCount,
+            long rs350GammaAlarmCount,
+            long rs350NeutronAlarmCount,
+            long alarmCategoryGammaCount,
+            long alarmCategoryNeutronCount,
+            OcrBloomFilter.Snapshot ocrSnapshot) {}
+
+    public record StreamLatestCandidate(
+            long dataStreamId,
+            long observationId,
+            Long foiId,
+            Instant phenomenonTime,
+            Instant resultTime,
+            String resultJson) {}
+
+    public record EventLocatorCandidate(
+            String eventId,
+            long observationId) {}
+
+    public record CompactedGenerationActivation(
+            ArchiveGeneration generation,
+            Path manifestPath,
+            long parquetBytes,
+            String manifestSha256,
+            long manifestBytes,
+            Path schemaPath,
+            String schemaSha256,
+            long schemaBytes,
+            List<SchemaSnapshot> schemas,
+            Map<Long, StreamSummaryCounters> streamSummaries,
+            List<StreamLatestCandidate> latestByStream,
+            List<EventLocatorCandidate> eventLocators,
+            String parityDetail) {}
+
+    public record CompactedRowOwner(
+            UUID targetGenerationId,
+            String targetSha256,
+            String targetProfile,
+            long dataStreamId,
+            Long foiId,
+            int summaryMask) {}
+
+    @FunctionalInterface
+    public interface MissingCompactedRowResolver {
+        Map<Long, CompactedRowOwner> resolveMissing(Set<Long> observationIds) throws Exception;
+    }
+
+    public record DeletingGenerationRecord(
+            UUID generationId,
+            UUID jobId,
+            String sha256,
+            List<Path> objectRelativePaths) {}
+
+    private static boolean relationExists(Connection connection, String tableName) throws SQLException {
+        if (tableName == null || tableName.isBlank())
+            return false;
+        String safe = safeIdentifier(tableName);
+        try (PreparedStatement stmt = connection.prepareStatement("SELECT to_regclass(?) IS NOT NULL")) {
+            stmt.setString(1, safe);
+            try (ResultSet rs = stmt.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        }
+    }
+
+    private static String buildSourceBlockedPredicate(
+            String alias, String safeObsTableOrNull, boolean hasStageOwnerTable) {
+        StringBuilder sb = new StringBuilder("(");
+        sb.append(alias).append(".state <> 'SEALED' OR NOT ").append(alias).append(".parity_verified ");
+        sb.append("OR ").append(alias).append(".activated_at > ? ");
+        if (hasStageOwnerTable) {
+            sb.append("OR EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner WHERE owner.generation_id = ")
+                    .append(alias).append(".id) ");
+        }
+        if (safeObsTableOrNull != null) {
+            sb.append("OR EXISTS (SELECT 1 FROM ").append(safeObsTableOrNull)
+                    .append(" hot WHERE hot.archivegenerationid = ").append(alias).append(".id) ");
+        }
+        sb.append("OR EXISTS (SELECT 1 FROM oscar_deletion_plan_item dpi ")
+                .append("JOIN oscar_deletion_plan dp ON dp.id = dpi.plan_id ")
+                .append("WHERE dpi.generation_id = ").append(alias).append(".id ")
+                .append("AND (dp.state = 'CONFIRMED' OR (dp.state = 'PLANNED' AND dp.expires_at > ?))) ");
+        sb.append("OR EXISTS (SELECT 1 FROM oscar_retention_hold h ")
+                .append("WHERE h.store_key = ").append(alias).append(".store_key ")
+                .append("AND h.id_scope = ").append(alias).append(".id_scope ")
+                .append("AND h.released_at IS NULL ")
+                .append("AND ((h.subject_type = 'ARCHIVE_GENERATION' AND h.subject_id = ")
+                .append(alias).append(".id::text) ")
+                .append("OR (h.subject_type = 'OBSERVATION' AND h.subject_id ~ '^[0-9]+$' ")
+                .append("AND EXISTS (SELECT 1 FROM oscar_archive_id_block b WHERE b.generation_id = ")
+                .append(alias).append(".id AND h.subject_id::bigint BETWEEN b.min_id AND b.max_id)))))");
+        return sb.toString();
+    }
+
+    public List<CompactionWindowCandidate> findEligibleUtcDaysForCompaction(
+            Instant now, String observationTable, int maxDays) {
+        if (maxDays <= 0)
+            return List.of();
+        Instant minAgeCutoff = now.minus(2, java.time.temporal.ChronoUnit.HOURS);
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            try {
+                String safeObs = relationExists(connection, observationTable)
+                        ? safeIdentifier(observationTable)
+                        : null;
+                boolean hasStageTable = relationExists(connection, "oscar_obs_stage_partition");
+                boolean hasStageOwnerTable = relationExists(connection, "oscar_obs_stage_owner");
+                String blockedExpr = buildSourceBlockedPredicate("g2", safeObs, hasStageOwnerTable);
+                String stageOverlapCheck = (safeObs != null && hasStageTable)
+                        ? "AND NOT EXISTS (SELECT 1 FROM oscar_obs_stage_partition sp " +
+                          "WHERE sp.store_key = ? AND sp.id_scope = ? " +
+                          "AND sp.state IN ('ATTACHED', 'DETACHED') " +
+                          "AND sp.window_start < d.day_end AND sp.window_end > d.day_start) "
+                        : "";
+                String daySql = "WITH raw_days AS (" +
+                        "  SELECT DISTINCT (date_trunc('day', g.window_start AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS day_start, " +
+                        "         ((date_trunc('day', g.window_start AT TIME ZONE 'UTC') + interval '1 day') AT TIME ZONE 'UTC') AS day_end " +
+                        "  FROM oscar_archive_generation g " +
+                        "  WHERE g.store_key = ? AND g.id_scope = ? AND g.profile = 'RAW_EVENTS' " +
+                        "    AND g.state IN ('ACTIVE', 'SEALED')" +
+                        ") " +
+                        "SELECT d.day_start, d.day_end FROM raw_days d " +
+                        "WHERE d.day_end <= ? " +
+                        stageOverlapCheck +
+                        "AND NOT EXISTS (" +
+                        "  SELECT 1 FROM oscar_archive_generation g2 " +
+                        "  WHERE g2.store_key = ? AND g2.id_scope = ? AND g2.profile = 'RAW_EVENTS' " +
+                        "    AND g2.state IN ('ACTIVE', 'SEALED') " +
+                        "    AND g2.window_start < d.day_end AND g2.window_end > d.day_start " +
+                        "    AND (g2.window_start < d.day_start OR g2.window_end > d.day_end OR " + blockedExpr + ")" +
+                        ") " +
+                        "ORDER BY d.day_start ASC LIMIT ?";
+
+                List<Instant[]> dayWindows = new ArrayList<>();
+                try (PreparedStatement stmt = connection.prepareStatement(daySql)) {
+                    int p = 1;
+                    stmt.setString(p++, storeKey);
+                    stmt.setInt(p++, idScope);
+                    UtcJdbcTime.setInstant(stmt, p++, minAgeCutoff);
+                    if (safeObs != null && hasStageTable) {
+                        stmt.setString(p++, safeObs);
+                        stmt.setInt(p++, idScope);
+                    }
+                    stmt.setString(p++, storeKey);
+                    stmt.setInt(p++, idScope);
+                    UtcJdbcTime.setInstant(stmt, p++, minAgeCutoff);
+                    UtcJdbcTime.setInstant(stmt, p++, now);
+                    stmt.setInt(p, maxDays);
+                    try (ResultSet rs = stmt.executeQuery()) {
+                        while (rs.next()) {
+                            dayWindows.add(new Instant[]{
+                                    UtcJdbcTime.getInstant(rs, 1),
+                                    UtcJdbcTime.getInstant(rs, 2)});
+                        }
+                    }
+                }
+                List<CompactionWindowCandidate> out = new ArrayList<>(dayWindows.size());
+                for (Instant[] bounds : dayWindows) {
+                    List<ArchiveGeneration> gens = loadGenerationsForProfileInWindow(
+                            connection, TieredArchiveConfig.PROFILE_RAW_EVENTS, bounds[0], bounds[1]);
+                    if (!gens.isEmpty()) {
+                        out.add(new CompactionWindowCandidate(bounds[0], bounds[1], gens));
+                    }
+                }
+                return out;
+            } finally {
+                connection.setReadOnly(oldReadOnly);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot discover eligible UTC days for archive compaction", e);
+        }
+    }
+
+    public List<CompactionWindowCandidate> findEligibleUtcMonthsForConsolidation(
+            Instant now, String observationTable, int maxMonths) {
+        if (maxMonths <= 0)
+            return List.of();
+        Instant monthCutoff = now.minus(15, java.time.temporal.ChronoUnit.DAYS);
+        Instant minAgeCutoff = now.minus(2, java.time.temporal.ChronoUnit.HOURS);
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            try {
+                String safeObs = relationExists(connection, observationTable)
+                        ? safeIdentifier(observationTable)
+                        : null;
+                boolean hasStageOwnerTable = relationExists(connection, "oscar_obs_stage_owner");
+                String blockedExpr = buildSourceBlockedPredicate("g2", safeObs, hasStageOwnerTable);
+                String monthSql = "WITH daily_months AS (" +
+                        "  SELECT DISTINCT (date_trunc('month', g.window_start AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS month_start, " +
+                        "         ((date_trunc('month', g.window_start AT TIME ZONE 'UTC') + interval '1 month') AT TIME ZONE 'UTC') AS month_end " +
+                        "  FROM oscar_archive_generation g " +
+                        "  WHERE g.store_key = ? AND g.id_scope = ? AND g.profile = 'DAILY_EVENTS' " +
+                        "    AND g.state IN ('ACTIVE', 'SEALED')" +
+                        ") " +
+                        "SELECT m.month_start, m.month_end FROM daily_months m " +
+                        "WHERE m.month_end <= ? " +
+                        "AND NOT EXISTS (" +
+                        "  SELECT 1 FROM oscar_archive_generation rawg " +
+                        "  WHERE rawg.store_key = ? AND rawg.id_scope = ? AND rawg.profile = 'RAW_EVENTS' " +
+                        "    AND rawg.state IN ('ACTIVE', 'SEALED') " +
+                        "    AND rawg.window_start < m.month_end AND rawg.window_end > m.month_start" +
+                        ") " +
+                        "AND NOT EXISTS (" +
+                        "  SELECT 1 FROM oscar_archive_generation g2 " +
+                        "  WHERE g2.store_key = ? AND g2.id_scope = ? AND g2.profile = 'DAILY_EVENTS' " +
+                        "    AND g2.state IN ('ACTIVE', 'SEALED') " +
+                        "    AND g2.window_start < m.month_end AND g2.window_end > m.month_start " +
+                        "    AND (g2.window_start < m.month_start OR g2.window_end > m.month_end OR " + blockedExpr + ")" +
+                        ") " +
+                        "ORDER BY m.month_start ASC LIMIT ?";
+
+                List<Instant[]> monthWindows = new ArrayList<>();
+                try (PreparedStatement stmt = connection.prepareStatement(monthSql)) {
+                    int p = 1;
+                    stmt.setString(p++, storeKey);
+                    stmt.setInt(p++, idScope);
+                    UtcJdbcTime.setInstant(stmt, p++, monthCutoff);
+                    stmt.setString(p++, storeKey);
+                    stmt.setInt(p++, idScope);
+                    stmt.setString(p++, storeKey);
+                    stmt.setInt(p++, idScope);
+                    UtcJdbcTime.setInstant(stmt, p++, minAgeCutoff);
+                    UtcJdbcTime.setInstant(stmt, p++, now);
+                    stmt.setInt(p, maxMonths);
+                    try (ResultSet rs = stmt.executeQuery()) {
+                        while (rs.next()) {
+                            monthWindows.add(new Instant[]{
+                                    UtcJdbcTime.getInstant(rs, 1),
+                                    UtcJdbcTime.getInstant(rs, 2)});
+                        }
+                    }
+                }
+                List<CompactionWindowCandidate> out = new ArrayList<>(monthWindows.size());
+                for (Instant[] bounds : monthWindows) {
+                    List<ArchiveGeneration> gens = loadGenerationsForProfileInWindow(
+                            connection, TieredArchiveConfig.PROFILE_DAILY_EVENTS, bounds[0], bounds[1]);
+                    if (!gens.isEmpty()) {
+                        out.add(new CompactionWindowCandidate(bounds[0], bounds[1], gens));
+                    }
+                }
+                return out;
+            } finally {
+                connection.setReadOnly(oldReadOnly);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot discover eligible UTC months for consolidation", e);
+        }
+    }
+
+    public List<CompactionWindowCandidate> findEligibleMonthlyGenerationsForDefrag(
+            Instant now, String observationTable, int minSettledOverlays, int maxGenerations) {
+        if (maxGenerations <= 0 || minSettledOverlays <= 0)
+            return List.of();
+        Instant minAgeCutoff = now.minus(2, java.time.temporal.ChronoUnit.HOURS);
+        Instant overlaySettledCutoff = now.minus(7, java.time.temporal.ChronoUnit.DAYS);
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            try {
+                String safeObs = relationExists(connection, observationTable)
+                        ? safeIdentifier(observationTable)
+                        : null;
+                boolean hasStageOwnerTable = relationExists(connection, "oscar_obs_stage_owner");
+                String blockedExpr = buildSourceBlockedPredicate("g", safeObs, hasStageOwnerTable);
+                String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
+                        "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, " +
+                        "g.max_result_time, g.min_result_time " +
+                        "FROM oscar_archive_generation g " +
+                        "WHERE g.store_key = ? AND g.id_scope = ? AND g.profile = 'MONTHLY_EVENTS' " +
+                        "AND g.state = 'SEALED' AND g.parity_verified = true " +
+                        "AND NOT " + blockedExpr + " " +
+                        "AND (" +
+                        "  SELECT count(*) FROM oscar_obs_overlay ov " +
+                        "  WHERE ov.store_key = g.store_key AND ov.id_scope = g.id_scope " +
+                        "    AND ov.generation_id = g.id " +
+                        "    AND ov.updated_at <= ? " +
+                        "    AND ov.phenomenon_time IS NOT NULL " +
+                        "    AND ov.phenomenon_time >= g.window_start AND ov.phenomenon_time < g.window_end " +
+                        "    AND NOT EXISTS (SELECT 1 FROM oscar_tombstone tb " +
+                        "      WHERE tb.subject_type = 'OBSERVATION' AND tb.store_key = ov.store_key " +
+                        "        AND tb.id_scope = ov.id_scope AND tb.subject_id = ov.observation_id::text)" +
+                        ") >= ? " +
+                        "ORDER BY g.window_start ASC, g.id ASC LIMIT ?";
+
+                List<CompactionWindowCandidate> out = new ArrayList<>();
+                try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+                    int p = 1;
+                    stmt.setString(p++, storeKey);
+                    stmt.setInt(p++, idScope);
+                    UtcJdbcTime.setInstant(stmt, p++, minAgeCutoff);
+                    UtcJdbcTime.setInstant(stmt, p++, now);
+                    UtcJdbcTime.setInstant(stmt, p++, overlaySettledCutoff);
+                    stmt.setInt(p++, minSettledOverlays);
+                    stmt.setInt(p, maxGenerations);
+                    try (ResultSet rs = stmt.executeQuery()) {
+                        while (rs.next()) {
+                            ArchiveGeneration gen = readGeneration(rs);
+                            out.add(new CompactionWindowCandidate(gen.start(), gen.end(), List.of(gen)));
+                        }
+                    }
+                }
+                return out;
+            } finally {
+                connection.setReadOnly(oldReadOnly);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot discover monthly generations for defragmentation", e);
+        }
+    }
+
+    private List<ArchiveGeneration> loadGenerationsForProfileInWindow(
+            Connection connection, String profile, Instant windowStart, Instant windowEnd) throws SQLException {
+        String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, " +
+                "g.max_result_time, g.min_result_time " +
+                "FROM oscar_archive_generation g " +
+                "WHERE g.store_key = ? AND g.id_scope = ? AND g.profile = ? " +
+                "AND g.state = 'SEALED' AND g.parity_verified = true " +
+                "AND g.window_start >= ? AND g.window_end <= ? " +
+                "ORDER BY g.window_start ASC, g.id ASC";
+        List<ArchiveGeneration> out = new ArrayList<>();
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            stmt.setString(1, storeKey);
+            stmt.setInt(2, idScope);
+            stmt.setString(3, profile);
+            UtcJdbcTime.setInstant(stmt, 4, windowStart);
+            UtcJdbcTime.setInstant(stmt, 5, windowEnd);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    out.add(readGeneration(rs));
+                }
+            }
+        }
+        return out;
+    }
+
+    public CompactionSchemaCatalog loadCompactionSchemas(
+            Collection<UUID> sourceGenerationIds, String dataStreamTable) {
+        if (sourceGenerationIds == null || sourceGenerationIds.isEmpty())
+            return new CompactionSchemaCatalog(Map.of(), Map.of(), Map.of());
+        Map<Long, SchemaSnapshot> schemasByStream = new HashMap<>();
+        Map<Long, String> outputNameByStream = new HashMap<>();
+        Map<UUID, Set<Long>> streamIdsByGen = new HashMap<>();
+        String sql = "SELECT s.generation_id, s.datastream_id, " +
+                "COALESCE(s.schema_json, blob.schema_json)::text AS schema_text, " +
+                "COALESCE(s.schema_json, blob.schema_json)->>'outputName' AS output_name " +
+                "FROM oscar_archive_schema s " +
+                "LEFT JOIN oscar_archive_schema_blob blob ON blob.schema_sha256 = s.schema_sha256 " +
+                "WHERE s.generation_id = ANY (?::uuid[]) " +
+                "ORDER BY s.datastream_id";
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            java.sql.Array genArray = connection.createArrayOf("uuid", sourceGenerationIds.toArray(UUID[]::new));
+            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+                stmt.setArray(1, genArray);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        UUID genId = rs.getObject(1, UUID.class);
+                        long dsId = rs.getLong(2);
+                        String schemaText = rs.getString(3);
+                        String outputName = rs.getString(4);
+                        if (genId != null)
+                            streamIdsByGen.computeIfAbsent(genId, ignored -> new HashSet<>()).add(dsId);
+                        if (schemaText != null)
+                            schemasByStream.putIfAbsent(dsId, new SchemaSnapshot(dsId, schemaText));
+                        if (outputName != null && !outputName.isBlank())
+                            outputNameByStream.putIfAbsent(dsId, outputName);
+                    }
+                }
+                if (relationExists(connection, dataStreamTable)) {
+                    List<Long> missingIds = schemasByStream.keySet().stream()
+                            .filter(dsId -> !outputNameByStream.containsKey(dsId))
+                            .toList();
+                    if (!missingIds.isEmpty()) {
+                        String safeDs = safeIdentifier(dataStreamTable);
+                        java.sql.Array dsArray = connection.createArrayOf("bigint", missingIds.toArray(Long[]::new));
+                        try (PreparedStatement dsStmt = connection.prepareStatement(
+                                "SELECT id, data::text, data->>'outputName' FROM " + safeDs +
+                                        " WHERE id = ANY (?::bigint[])")) {
+                            dsStmt.setArray(1, dsArray);
+                            try (ResultSet dsRs = dsStmt.executeQuery()) {
+                                while (dsRs.next()) {
+                                    long dsId = dsRs.getLong(1);
+                                    String dataText = dsRs.getString(2);
+                                    String outName = dsRs.getString(3);
+                                    if (dataText != null)
+                                        schemasByStream.putIfAbsent(dsId, new SchemaSnapshot(dsId, dataText));
+                                    if (outName != null && !outName.isBlank())
+                                        outputNameByStream.putIfAbsent(dsId, outName);
+                                }
+                            }
+                        } finally {
+                            dsArray.free();
+                        }
+                    }
+                }
+            } finally {
+                genArray.free();
+                connection.setReadOnly(oldReadOnly);
+            }
+            return new CompactionSchemaCatalog(schemasByStream, outputNameByStream, streamIdsByGen);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot load compaction schema metadata", e);
+        }
+    }
+
+    public Map<Long, FoldedOverlayCandidate> loadSettledOverlaysForFolding(
+            Collection<UUID> sourceGenerationIds,
+            Instant settledCutoff,
+            Instant windowStart,
+            Instant windowEnd) {
+        if (sourceGenerationIds == null || sourceGenerationIds.isEmpty())
+            return Map.of();
+        String sql = "SELECT ov.observation_id, ov.generation_id, ov.datastream_id, ov.foi_id, " +
+                "ov.phenomenon_time, ov.result_time, ov.result_json::text, ov.updated_at " +
+                "FROM oscar_obs_overlay ov " +
+                "WHERE ov.store_key = ? AND ov.id_scope = ? " +
+                "AND ov.generation_id = ANY (?::uuid[]) " +
+                "AND ov.updated_at <= ? " +
+                "AND ov.phenomenon_time IS NOT NULL " +
+                "AND ov.phenomenon_time >= ? AND ov.phenomenon_time < ? " +
+                "AND NOT EXISTS (SELECT 1 FROM oscar_tombstone tb " +
+                "  WHERE tb.subject_type = 'OBSERVATION' AND tb.store_key = ov.store_key " +
+                "    AND tb.id_scope = ov.id_scope AND tb.subject_id = ov.observation_id::text) " +
+                "ORDER BY ov.observation_id";
+        Map<Long, FoldedOverlayCandidate> out = new HashMap<>();
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            java.sql.Array genArray = connection.createArrayOf("uuid", sourceGenerationIds.toArray(UUID[]::new));
+            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+                stmt.setString(1, storeKey);
+                stmt.setInt(2, idScope);
+                stmt.setArray(3, genArray);
+                UtcJdbcTime.setInstant(stmt, 4, settledCutoff);
+                UtcJdbcTime.setInstant(stmt, 5, windowStart);
+                UtcJdbcTime.setInstant(stmt, 6, windowEnd);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        long obsId = rs.getLong(1);
+                        Long foiId = rs.getObject(4, Long.class);
+                        out.put(obsId, new FoldedOverlayCandidate(
+                                obsId,
+                                rs.getObject(2, UUID.class),
+                                rs.getLong(3),
+                                foiId,
+                                UtcJdbcTime.getInstant(rs, 5),
+                                UtcJdbcTime.getInstant(rs, 6),
+                                rs.getString(7),
+                                UtcJdbcTime.getInstant(rs, 8)));
+                    }
+                }
+            } finally {
+                genArray.free();
+                connection.setReadOnly(oldReadOnly);
+            }
+            return out;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot snapshot settled overlays for compaction", e);
+        }
+    }
+
+    public Set<Long> loadReferencedObservationIdsOnGenerations(Collection<UUID> sourceGenerationIds) {
+        if (sourceGenerationIds == null || sourceGenerationIds.isEmpty())
+            return Set.of();
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            try {
+                return queryReferencedObservationIds(connection, sourceGenerationIds);
+            } finally {
+                connection.setReadOnly(oldReadOnly);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect referenced observation IDs on source generations", e);
+        }
+    }
+
+    private Set<Long> queryReferencedObservationIds(
+            Connection connection, Collection<UUID> sourceGenerationIds) throws SQLException {
+        String sql = "SELECT observation_id FROM oscar_obs_latest " +
+                "WHERE store_key = ? AND id_scope = ? AND generation_id = ANY (?::uuid[]) " +
+                "UNION " +
+                "SELECT observation_id FROM oscar_event_locator " +
+                "WHERE store_key = ? AND id_scope = ? AND generation_id = ANY (?::uuid[]) " +
+                "UNION " +
+                "SELECT observation_id FROM oscar_obs_overlay " +
+                "WHERE store_key = ? AND id_scope = ? AND generation_id = ANY (?::uuid[]) " +
+                "UNION " +
+                "SELECT subject_id::bigint AS observation_id FROM oscar_tombstone " +
+                "WHERE store_key = ? AND id_scope = ? AND subject_type = 'OBSERVATION' " +
+                "  AND subject_id ~ '^[0-9]+$' AND generation_id = ANY (?::uuid[])";
+        Set<Long> ids = new HashSet<>();
+        java.sql.Array genArray = connection.createArrayOf("uuid", sourceGenerationIds.toArray(UUID[]::new));
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            int p = 1;
+            for (int i = 0; i < 4; i++) {
+                stmt.setString(p++, storeKey);
+                stmt.setInt(p++, idScope);
+                stmt.setArray(p++, genArray);
+            }
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    ids.add(rs.getLong(1));
+                }
+            }
+        } finally {
+            genArray.free();
+        }
+        return ids;
+    }
+
+    public boolean activateCompactionSwap(
+            List<UUID> sourceGenerationIds,
+            List<CompactedGenerationActivation> targetActivations,
+            Map<Long, FoldedOverlayCandidate> foldedOverlays,
+            Map<Long, CompactedRowOwner> initialRowOwners,
+            MissingCompactedRowResolver missingRowResolver,
+            String observationTable,
+            Instant now) {
+        if (sourceGenerationIds == null || sourceGenerationIds.isEmpty() ||
+                targetActivations == null || targetActivations.isEmpty()) {
+            return false;
+        }
+        Instant minAgeCutoff = now.minus(2, java.time.temporal.ChronoUnit.HOURS);
+        Map<Long, CompactedRowOwner> rowOwners = new HashMap<>(initialRowOwners);
+
+        // Pre-resolve any referenced IDs before entering the exclusive lock critical section.
+        Set<Long> preRefIds = loadReferencedObservationIdsOnGenerations(sourceGenerationIds);
+        Set<Long> preMissing = new HashSet<>();
+        for (Long id : preRefIds) {
+            if (!rowOwners.containsKey(id))
+                preMissing.add(id);
+        }
+        if (!preMissing.isEmpty() && missingRowResolver != null) {
+            try {
+                rowOwners.putAll(missingRowResolver.resolveMissing(preMissing));
+            } catch (Exception e) {
+                throw new IllegalStateException("Cannot resolve compacted row owners before swap", e);
+            }
+        }
+
+        try (Connection connection = connections.open()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                lockForActivation(connection);
+                Set<Long> allReferencedUnderLock = queryReferencedObservationIds(connection, sourceGenerationIds);
+                Set<Long> lockObsIds = new HashSet<>(allReferencedUnderLock);
+                if (foldedOverlays != null)
+                    lockObsIds.addAll(foldedOverlays.keySet());
+                lockForMutation(connection, lockObsIds);
+                try (Statement holdLock = connection.createStatement()) {
+                    holdLock.execute("LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE");
+                }
+
+                // Resolve any last-millisecond referenced IDs added right before lock acquisition.
+                Set<Long> lateMissing = new HashSet<>();
+                for (Long id : allReferencedUnderLock) {
+                    if (!rowOwners.containsKey(id))
+                        lateMissing.add(id);
+                }
+                if (!lateMissing.isEmpty() && missingRowResolver != null) {
+                    rowOwners.putAll(missingRowResolver.resolveMissing(lateMissing));
+                }
+
+                String safeObs = relationExists(connection, observationTable)
+                        ? safeIdentifier(observationTable)
+                        : null;
+                boolean hasStageOwnerTable = relationExists(connection, "oscar_obs_stage_owner");
+                String blockedExpr = buildSourceBlockedPredicate("g", safeObs, hasStageOwnerTable);
+                java.sql.Array srcArray = connection.createArrayOf("uuid", sourceGenerationIds.toArray(UUID[]::new));
+                try {
+                    String verifySql = "SELECT count(*) FROM oscar_archive_generation g " +
+                            "WHERE g.store_key = ? AND g.id_scope = ? AND g.id = ANY (?::uuid[]) " +
+                            "AND NOT " + blockedExpr;
+                    try (PreparedStatement verify = connection.prepareStatement(verifySql)) {
+                        int p = 1;
+                        verify.setString(p++, storeKey);
+                        verify.setInt(p++, idScope);
+                        verify.setArray(p++, srcArray);
+                        UtcJdbcTime.setInstant(verify, p++, minAgeCutoff);
+                        UtcJdbcTime.setInstant(verify, p, now);
+                        try (ResultSet rs = verify.executeQuery()) {
+                            int eligibleCount = rs.next() ? rs.getInt(1) : 0;
+                            if (eligibleCount != sourceGenerationIds.size()) {
+                                connection.rollback();
+                                return false;
+                            }
+                        }
+                    }
+
+                    // Insert target SEALED jobs, generations, objects, id_blocks, schemas, and PARITY receipts.
+                    for (CompactedGenerationActivation target : targetActivations) {
+                        ArchiveGeneration gen = target.generation();
+                        UUID jobId = UUID.randomUUID();
+                        int revision = allocateNextJobRevision(
+                                connection, gen.profile(), gen.start(), gen.end());
+                        try (PreparedStatement insJob = connection.prepareStatement(
+                                "INSERT INTO oscar_archive_job(" +
+                                        "id, store_key, id_scope, profile, window_start, window_end, revision, state, attempt, created_at, updated_at) " +
+                                        "VALUES (?, ?, ?, ?, ?, ?, ?, 'SEALED', 1, ?, ?)")) {
+                            insJob.setObject(1, jobId);
+                            insJob.setString(2, storeKey);
+                            insJob.setInt(3, idScope);
+                            insJob.setString(4, gen.profile());
+                            UtcJdbcTime.setInstant(insJob, 5, gen.start());
+                            UtcJdbcTime.setInstant(insJob, 6, gen.end());
+                            insJob.setInt(7, revision);
+                            UtcJdbcTime.setInstant(insJob, 8, now);
+                            UtcJdbcTime.setInstant(insJob, 9, now);
+                            insJob.executeUpdate();
+                        }
+
+                        try (PreparedStatement insGen = connection.prepareStatement(
+                                "INSERT INTO oscar_archive_generation(" +
+                                        "id, job_id, store_key, id_scope, profile, window_start, window_end, state, " +
+                                        "object_path, manifest_path, sha256, row_count, min_id, max_id, parity_verified, " +
+                                        "activated_at, sealed_at, max_result_time, min_result_time) " +
+                                        "VALUES (?, ?, ?, ?, ?, ?, ?, 'SEALED', ?, ?, ?, ?, ?, ?, true, ?, ?, ?, ?)")) {
+                            insGen.setObject(1, gen.id());
+                            insGen.setObject(2, jobId);
+                            insGen.setString(3, storeKey);
+                            insGen.setInt(4, idScope);
+                            insGen.setString(5, gen.profile());
+                            UtcJdbcTime.setInstant(insGen, 6, gen.start());
+                            UtcJdbcTime.setInstant(insGen, 7, gen.end());
+                            insGen.setString(8, gen.objectPath().toString());
+                            insGen.setString(9, target.manifestPath().toString());
+                            insGen.setString(10, gen.sha256());
+                            insGen.setLong(11, gen.rowCount());
+                            insGen.setLong(12, gen.minimumId());
+                            insGen.setLong(13, gen.maximumId());
+                            UtcJdbcTime.setInstant(insGen, 14, now);
+                            UtcJdbcTime.setInstant(insGen, 15, now);
+                            if (gen.maxResultTime() == null)
+                                insGen.setNull(16, Types.TIMESTAMP_WITH_TIMEZONE);
+                            else
+                                UtcJdbcTime.setInstant(insGen, 16, gen.maxResultTime());
+                            if (gen.minResultTime() == null)
+                                insGen.setNull(17, Types.TIMESTAMP_WITH_TIMEZONE);
+                            else
+                                UtcJdbcTime.setInstant(insGen, 17, gen.minResultTime());
+                            insGen.executeUpdate();
+                        }
+
+                        try (PreparedStatement insObj = connection.prepareStatement(
+                                "INSERT INTO oscar_archive_object(generation_id, relative_path, kind, sha256, bytes, state) " +
+                                        "VALUES (?, ?, ?, ?, ?, 'ACTIVE')")) {
+                            insObj.setObject(1, gen.id());
+                            insObj.setString(2, gen.objectPath().toString());
+                            insObj.setString(3, "OBSERVATIONS_PARQUET");
+                            insObj.setString(4, gen.sha256());
+                            insObj.setLong(5, target.parquetBytes());
+                            insObj.executeUpdate();
+
+                            insObj.setObject(1, gen.id());
+                            insObj.setString(2, target.manifestPath().toString());
+                            insObj.setString(3, "GENERATION_MANIFEST");
+                            insObj.setString(4, target.manifestSha256());
+                            insObj.setLong(5, target.manifestBytes());
+                            insObj.executeUpdate();
+
+                            insObj.setObject(1, gen.id());
+                            insObj.setString(2, target.schemaPath().toString());
+                            insObj.setString(3, "DATASTREAM_SCHEMAS");
+                            insObj.setString(4, target.schemaSha256());
+                            insObj.setLong(5, target.schemaBytes());
+                            insObj.executeUpdate();
+                        }
+
+                        try (PreparedStatement insBlock = connection.prepareStatement(
+                                "INSERT INTO oscar_archive_id_block(generation_id, min_id, max_id) VALUES (?, ?, ?)")) {
+                            insBlock.setObject(1, gen.id());
+                            insBlock.setLong(2, gen.minimumId());
+                            insBlock.setLong(3, gen.maximumId());
+                            insBlock.executeUpdate();
+                        }
+
+                        insertCompactedGenerationSchemas(connection, gen, target.schemas(), target.streamSummaries());
+
+                        try (PreparedStatement insVerify = connection.prepareStatement(
+                                "INSERT INTO oscar_archive_verification(" +
+                                        "generation_id, verification_type, status, expected_rows, actual_rows, detail, verified_at) " +
+                                        "VALUES (?, 'PARITY', 'PASSED', ?, ?, ?, ?)")) {
+                            insVerify.setObject(1, gen.id());
+                            insVerify.setLong(2, gen.rowCount());
+                            insVerify.setLong(3, gen.rowCount());
+                            insVerify.setString(4, target.parityDetail());
+                            UtcJdbcTime.setInstant(insVerify, 5, now);
+                            insVerify.executeUpdate();
+                        }
+                    }
+
+                    // Collect tombstoned observation IDs on source generations first.
+                    Set<Long> tombstonedIds = new HashSet<>();
+                    Map<Long, String> tombstoneSubjects = new HashMap<>();
+                    try (PreparedStatement tbQuery = connection.prepareStatement(
+                            "SELECT subject_id FROM oscar_tombstone " +
+                                    "WHERE store_key = ? AND id_scope = ? AND subject_type = 'OBSERVATION' " +
+                                    "AND subject_id ~ '^[0-9]+$' AND generation_id = ANY (?::uuid[]) FOR UPDATE")) {
+                        tbQuery.setString(1, storeKey);
+                        tbQuery.setInt(2, idScope);
+                        tbQuery.setArray(3, srcArray);
+                        try (ResultSet rs = tbQuery.executeQuery()) {
+                            while (rs.next()) {
+                                String subj = rs.getString(1);
+                                long obsId = Long.parseLong(subj);
+                                tombstonedIds.add(obsId);
+                                tombstoneSubjects.put(obsId, subj);
+                            }
+                        }
+                    }
+
+                    // Fold unchanged settled overlays; remap concurrently modified or non-settled overlays.
+                    List<Long> overlaysToDelete = new ArrayList<>();
+                    List<Long> overlaysToRemap = new ArrayList<>();
+                    try (PreparedStatement ovQuery = connection.prepareStatement(
+                            "SELECT observation_id, updated_at FROM oscar_obs_overlay " +
+                                    "WHERE store_key = ? AND id_scope = ? AND generation_id = ANY (?::uuid[]) FOR UPDATE")) {
+                        ovQuery.setString(1, storeKey);
+                        ovQuery.setInt(2, idScope);
+                        ovQuery.setArray(3, srcArray);
+                        try (ResultSet rs = ovQuery.executeQuery()) {
+                            while (rs.next()) {
+                                long obsId = rs.getLong(1);
+                                Instant liveUpdatedAt = UtcJdbcTime.getInstant(rs, 2);
+                                FoldedOverlayCandidate folded = foldedOverlays != null ? foldedOverlays.get(obsId) : null;
+                                if (folded != null &&
+                                        java.util.Objects.equals(folded.updatedAt(), liveUpdatedAt) &&
+                                        !tombstonedIds.contains(obsId)) {
+                                    overlaysToDelete.add(obsId);
+                                } else {
+                                    overlaysToRemap.add(obsId);
+                                }
+                            }
+                        }
+                    }
+
+                    if (!overlaysToDelete.isEmpty()) {
+                        try (PreparedStatement delOv = connection.prepareStatement(
+                                "DELETE FROM oscar_obs_overlay WHERE store_key = ? AND id_scope = ? AND observation_id = ?")) {
+                            for (long obsId : overlaysToDelete) {
+                                delOv.setString(1, storeKey);
+                                delOv.setInt(2, idScope);
+                                delOv.setLong(3, obsId);
+                                delOv.addBatch();
+                            }
+                            delOv.executeBatch();
+                        }
+                    }
+
+                    if (!overlaysToRemap.isEmpty()) {
+                        try (PreparedStatement updOv = connection.prepareStatement(
+                                "UPDATE oscar_obs_overlay SET generation_id = ?, base_generation_sha256 = ?, " +
+                                        "base_summary_mask = ?, base_datastream_id = ?, base_foi_id = ? " +
+                                        "WHERE store_key = ? AND id_scope = ? AND observation_id = ?")) {
+                            for (long obsId : overlaysToRemap) {
+                                CompactedRowOwner owner = requireRowOwner(rowOwners, obsId);
+                                updOv.setObject(1, owner.targetGenerationId());
+                                updOv.setString(2, owner.targetSha256());
+                                updOv.setInt(3, owner.summaryMask());
+                                updOv.setLong(4, owner.dataStreamId());
+                                if (owner.foiId() == null)
+                                    updOv.setNull(5, Types.BIGINT);
+                                else
+                                    updOv.setLong(5, owner.foiId());
+                                updOv.setString(6, storeKey);
+                                updOv.setInt(7, idScope);
+                                updOv.setLong(8, obsId);
+                                updOv.addBatch();
+                            }
+                            updOv.executeBatch();
+                        }
+                    }
+
+                    // Remap observation tombstones onto their exact target generation.
+                    if (!tombstoneSubjects.isEmpty()) {
+                        try (PreparedStatement updTb = connection.prepareStatement(
+                                "UPDATE oscar_tombstone SET generation_id = ?, base_generation_sha256 = ?, " +
+                                        "base_summary_mask = ?, datastream_id = COALESCE(datastream_id, ?), base_foi_id = ? " +
+                                        "WHERE subject_type = 'OBSERVATION' AND store_key = ? AND id_scope = ? AND subject_id = ?")) {
+                            for (Map.Entry<Long, String> entry : tombstoneSubjects.entrySet()) {
+                                CompactedRowOwner owner = requireRowOwner(rowOwners, entry.getKey());
+                                updTb.setObject(1, owner.targetGenerationId());
+                                updTb.setString(2, owner.targetSha256());
+                                updTb.setInt(3, owner.summaryMask());
+                                updTb.setLong(4, owner.dataStreamId());
+                                if (owner.foiId() == null)
+                                    updTb.setNull(5, Types.BIGINT);
+                                else
+                                    updTb.setLong(5, owner.foiId());
+                                updTb.setString(6, storeKey);
+                                updTb.setInt(7, idScope);
+                                updTb.setString(8, entry.getValue());
+                                updTb.addBatch();
+                            }
+                            updTb.executeBatch();
+                        }
+                    }
+
+                    // Upsert compacted latest-by-stream and event locators AFTER overlay delete/remap and tombstone scan.
+                    Set<Long> liveOverlayIds = new HashSet<>(overlaysToRemap);
+                    for (CompactedGenerationActivation target : targetActivations) {
+                        upsertCompactedLatestAndLocators(
+                                connection,
+                                target.generation(),
+                                target.schemas(),
+                                target.latestByStream(),
+                                target.eventLocators(),
+                                tombstonedIds,
+                                liveOverlayIds);
+                    }
+
+                    // Remap any remaining oscar_obs_latest rows still referencing superseded source generations.
+                    Map<Long, Long> latestDsToObs = new HashMap<>();
+                    try (PreparedStatement latQuery = connection.prepareStatement(
+                            "SELECT datastream_id, observation_id FROM oscar_obs_latest " +
+                                    "WHERE store_key = ? AND id_scope = ? AND generation_id = ANY (?::uuid[]) FOR UPDATE")) {
+                        latQuery.setString(1, storeKey);
+                        latQuery.setInt(2, idScope);
+                        latQuery.setArray(3, srcArray);
+                        try (ResultSet rs = latQuery.executeQuery()) {
+                            while (rs.next()) {
+                                latestDsToObs.put(rs.getLong(1), rs.getLong(2));
+                            }
+                        }
+                    }
+                    if (!latestDsToObs.isEmpty()) {
+                        try (PreparedStatement updLat = connection.prepareStatement(
+                                "UPDATE oscar_obs_latest SET generation_id = ?, profile = ?, updated_at = now() " +
+                                        "WHERE store_key = ? AND id_scope = ? AND datastream_id = ?")) {
+                            for (Map.Entry<Long, Long> entry : latestDsToObs.entrySet()) {
+                                long dsId = entry.getKey();
+                                long obsId = entry.getValue();
+                                CompactedRowOwner owner = requireRowOwner(rowOwners, obsId);
+                                String nextProfile = liveOverlayIds.contains(obsId)
+                                        ? "OVERLAY"
+                                        : owner.targetProfile();
+                                updLat.setObject(1, owner.targetGenerationId());
+                                updLat.setString(2, nextProfile);
+                                updLat.setString(3, storeKey);
+                                updLat.setInt(4, idScope);
+                                updLat.setLong(5, dsId);
+                                updLat.addBatch();
+                            }
+                            updLat.executeBatch();
+                        }
+                    }
+
+                    // Verify zero oscar_obs_latest rows still point to source generations (ON DELETE CASCADE guard).
+                    try (PreparedStatement verifyLat = connection.prepareStatement(
+                            "SELECT count(*) FROM oscar_obs_latest " +
+                                    "WHERE store_key = ? AND id_scope = ? AND generation_id = ANY (?::uuid[])")) {
+                        verifyLat.setString(1, storeKey);
+                        verifyLat.setInt(2, idScope);
+                        verifyLat.setArray(3, srcArray);
+                        try (ResultSet rs = verifyLat.executeQuery()) {
+                            if (rs.next() && rs.getLong(1) != 0L) {
+                                throw new IllegalStateException("Unremapped oscar_obs_latest row detected during compaction");
+                            }
+                        }
+                    }
+
+                    // Remap any remaining oscar_event_locator rows still referencing source generations.
+                    Map<String, Long> locPublicToObs = new HashMap<>();
+                    try (PreparedStatement locQuery = connection.prepareStatement(
+                            "SELECT public_id, observation_id FROM oscar_event_locator " +
+                                    "WHERE store_key = ? AND id_scope = ? AND generation_id = ANY (?::uuid[]) FOR UPDATE")) {
+                        locQuery.setString(1, storeKey);
+                        locQuery.setInt(2, idScope);
+                        locQuery.setArray(3, srcArray);
+                        try (ResultSet rs = locQuery.executeQuery()) {
+                            while (rs.next()) {
+                                locPublicToObs.put(rs.getString(1), rs.getLong(2));
+                            }
+                        }
+                    }
+                    if (!locPublicToObs.isEmpty()) {
+                        try (PreparedStatement updLoc = connection.prepareStatement(
+                                "UPDATE oscar_event_locator SET generation_id = ?, updated_at = now() " +
+                                        "WHERE store_key = ? AND id_scope = ? AND public_id = ?")) {
+                            for (Map.Entry<String, Long> entry : locPublicToObs.entrySet()) {
+                                CompactedRowOwner owner = requireRowOwner(rowOwners, entry.getValue());
+                                updLoc.setObject(1, owner.targetGenerationId());
+                                updLoc.setString(2, storeKey);
+                                updLoc.setInt(3, idScope);
+                                updLoc.setString(4, entry.getKey());
+                                updLoc.addBatch();
+                            }
+                            updLoc.executeBatch();
+                        }
+                    }
+
+                    // Purge any expired PLANNED deletion_plan_items referencing source generations.
+                    try (PreparedStatement delExpiredPlanItems = connection.prepareStatement(
+                            "DELETE FROM oscar_deletion_plan_item dpi USING oscar_deletion_plan dp " +
+                                    "WHERE dpi.plan_id = dp.id AND dpi.generation_id = ANY (?::uuid[]) " +
+                                    "AND dp.state = 'PLANNED' AND dp.expires_at <= ?")) {
+                        delExpiredPlanItems.setArray(1, srcArray);
+                        UtcJdbcTime.setInstant(delExpiredPlanItems, 2, now);
+                        delExpiredPlanItems.executeUpdate();
+                    }
+
+                    // Transition superseded objects and generations to DELETING (row_count = 0 prevents double-count).
+                    try (PreparedStatement markObjDeleting = connection.prepareStatement(
+                            "UPDATE oscar_archive_object SET state = 'DELETING' WHERE generation_id = ANY (?::uuid[])")) {
+                        markObjDeleting.setArray(1, srcArray);
+                        markObjDeleting.executeUpdate();
+                    }
+                    try (PreparedStatement markGenDeleting = connection.prepareStatement(
+                            "UPDATE oscar_archive_generation SET state = 'DELETING', row_count = 0, sealed_at = ? " +
+                                    "WHERE store_key = ? AND id_scope = ? AND id = ANY (?::uuid[])")) {
+                        UtcJdbcTime.setInstant(markGenDeleting, 1, now);
+                        markGenDeleting.setString(2, storeKey);
+                        markGenDeleting.setInt(3, idScope);
+                        markGenDeleting.setArray(4, srcArray);
+                        markGenDeleting.executeUpdate();
+                    }
+
+                    connection.commit();
+                    return true;
+                } finally {
+                    srcArray.free();
+                }
+            } catch (Exception e) {
+                connection.rollback();
+                throw e;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot atomically swap compacted archive generations", e);
+        }
+    }
+
+    private static CompactedRowOwner requireRowOwner(Map<Long, CompactedRowOwner> rowOwners, long observationId) {
+        CompactedRowOwner owner = rowOwners.get(observationId);
+        if (owner == null) {
+            throw new IllegalStateException(
+                    "Compacted archive target is missing referenced observation ID " + observationId);
+        }
+        return owner;
+    }
+
+    private int allocateNextJobRevision(
+            Connection connection, String profile, Instant windowStart, Instant windowEnd) throws SQLException {
+        String sql = "SELECT COALESCE(MAX(revision), 0) FROM oscar_archive_job " +
+                "WHERE store_key = ? AND id_scope = ? AND profile = ? AND window_start = ? AND window_end = ?";
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            stmt.setString(1, storeKey);
+            stmt.setInt(2, idScope);
+            stmt.setString(3, profile);
+            UtcJdbcTime.setInstant(stmt, 4, windowStart);
+            UtcJdbcTime.setInstant(stmt, 5, windowEnd);
+            try (ResultSet rs = stmt.executeQuery()) {
+                int prev = rs.next() ? rs.getInt(1) : 0;
+                return nextRevision(prev);
+            }
+        }
+    }
+
+    private void insertCompactedGenerationSchemas(
+            Connection connection,
+            ArchiveGeneration generation,
+            List<SchemaSnapshot> schemas,
+            Map<Long, StreamSummaryCounters> summaries) throws SQLException {
+        try (PreparedStatement blobStmt = connection.prepareStatement(
+                "INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
+                        "VALUES (?, ?::jsonb) ON CONFLICT (schema_sha256) DO NOTHING");
+             PreparedStatement schemaStmt = connection.prepareStatement(
+                "INSERT INTO oscar_archive_schema(" +
+                        "generation_id, datastream_id, schema_sha256, summary_populated, row_count, " +
+                        "gamma_alarm_count, neutron_alarm_count, gamma_neutron_alarm_count, non_alarm_occupancy_count, " +
+                        "gamma_true_count, neutron_true_count, any_alarm_count, " +
+                        "unadjudicated_alarm_count, adjudicated_alarm_count, " +
+                        "unadjudicated_gamma_alarm_count, unadjudicated_neutron_alarm_count, unadjudicated_gamma_neutron_alarm_count, " +
+                        "adjudicated_gamma_alarm_count, adjudicated_neutron_alarm_count, adjudicated_gamma_neutron_alarm_count, " +
+                        "gamma_high_fault_count, gamma_low_fault_count, neutron_fault_count, neutron_high_fault_count, extended_occupancy_fault_count, " +
+                        "tamper_true_count, rs350_gamma_alarm_count, rs350_neutron_alarm_count, " +
+                        "alarm_category_gamma_count, alarm_category_neutron_count, " +
+                        "ocr_bloom, ocr_min_norm, ocr_max_norm) " +
+                        "VALUES (?, ?, ?, true, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+            Set<String> insertedBlobs = new HashSet<>();
+            for (SchemaSnapshot schema : schemas) {
+                StreamSummaryCounters stats = summaries.get(schema.dataStreamId());
+                if (stats == null || stats.rowCount() <= 0L)
+                    continue;
+                String schemaHash = sha256Hex(schema.json());
+                if (insertedBlobs.add(schemaHash)) {
+                    blobStmt.setString(1, schemaHash);
+                    blobStmt.setString(2, schema.json());
+                    blobStmt.addBatch();
+                }
+                int p = 1;
+                schemaStmt.setObject(p++, generation.id());
+                schemaStmt.setLong(p++, schema.dataStreamId());
+                schemaStmt.setString(p++, schemaHash);
+                schemaStmt.setLong(p++, stats.rowCount());
+                schemaStmt.setLong(p++, stats.gammaAlarmCount());
+                schemaStmt.setLong(p++, stats.neutronAlarmCount());
+                schemaStmt.setLong(p++, stats.gammaNeutronAlarmCount());
+                schemaStmt.setLong(p++, stats.nonAlarmOccupancyCount());
+                schemaStmt.setLong(p++, stats.gammaTrueCount());
+                schemaStmt.setLong(p++, stats.neutronTrueCount());
+                schemaStmt.setLong(p++, stats.anyAlarmCount());
+                schemaStmt.setLong(p++, stats.unadjudicatedAlarmCount());
+                schemaStmt.setLong(p++, stats.adjudicatedAlarmCount());
+                schemaStmt.setLong(p++, stats.unadjudicatedGammaAlarmCount());
+                schemaStmt.setLong(p++, stats.unadjudicatedNeutronAlarmCount());
+                schemaStmt.setLong(p++, stats.unadjudicatedGammaNeutronAlarmCount());
+                schemaStmt.setLong(p++, stats.adjudicatedGammaAlarmCount());
+                schemaStmt.setLong(p++, stats.adjudicatedNeutronAlarmCount());
+                schemaStmt.setLong(p++, stats.adjudicatedGammaNeutronAlarmCount());
+                schemaStmt.setLong(p++, stats.gammaHighFaultCount());
+                schemaStmt.setLong(p++, stats.gammaLowFaultCount());
+                schemaStmt.setLong(p++, stats.neutronFaultCount());
+                schemaStmt.setLong(p++, stats.neutronHighFaultCount());
+                schemaStmt.setLong(p++, stats.extendedOccupancyFaultCount());
+                schemaStmt.setLong(p++, stats.tamperTrueCount());
+                schemaStmt.setLong(p++, stats.rs350GammaAlarmCount());
+                schemaStmt.setLong(p++, stats.rs350NeutronAlarmCount());
+                schemaStmt.setLong(p++, stats.alarmCategoryGammaCount());
+                schemaStmt.setLong(p++, stats.alarmCategoryNeutronCount());
+                OcrBloomFilter.Snapshot ocr = stats.ocrSnapshot();
+                schemaStmt.setBytes(p++, ocr != null ? ocr.bloomBytes() : OcrBloomFilter.EMPTY_INDEXED_SENTINEL);
+                if (ocr == null || ocr.minNorm() == null)
+                    schemaStmt.setNull(p++, Types.VARCHAR);
+                else
+                    schemaStmt.setString(p++, ocr.minNorm());
+                if (ocr == null || ocr.maxNorm() == null)
+                    schemaStmt.setNull(p, Types.VARCHAR);
+                else
+                    schemaStmt.setString(p, ocr.maxNorm());
+                schemaStmt.addBatch();
+            }
+            blobStmt.executeBatch();
+            schemaStmt.executeBatch();
+        }
+    }
+
+    private void upsertCompactedLatestAndLocators(
+            Connection connection,
+            ArchiveGeneration generation,
+            List<SchemaSnapshot> schemas,
+            List<StreamLatestCandidate> latestCandidates,
+            List<EventLocatorCandidate> eventLocators,
+            Set<Long> tombstonedIds,
+            Set<Long> liveOverlayIds) throws SQLException {
+        if (eventLocators != null && !eventLocators.isEmpty()) {
+            try (PreparedStatement locStmt = connection.prepareStatement(
+                    "INSERT INTO oscar_event_locator(" +
+                            "store_key, id_scope, public_id, observation_id, generation_id, state, updated_at) " +
+                            "VALUES (?, ?, ?, ?, ?, 'ACTIVE', now()) " +
+                            "ON CONFLICT (store_key, id_scope, public_id) DO UPDATE SET " +
+                            "observation_id = EXCLUDED.observation_id, " +
+                            "generation_id = EXCLUDED.generation_id, " +
+                            "state = 'ACTIVE', " +
+                            "updated_at = now() " +
+                            "WHERE EXCLUDED.observation_id >= oscar_event_locator.observation_id")) {
+                for (EventLocatorCandidate loc : eventLocators) {
+                    if (tombstonedIds != null && tombstonedIds.contains(loc.observationId()))
+                        continue;
+                    locStmt.setString(1, storeKey);
+                    locStmt.setInt(2, idScope);
+                    locStmt.setString(3, loc.eventId());
+                    locStmt.setLong(4, loc.observationId());
+                    locStmt.setObject(5, generation.id());
+                    locStmt.addBatch();
+                }
+                locStmt.executeBatch();
+            }
+        }
+
+        if (latestCandidates != null && !latestCandidates.isEmpty()) {
+            Map<Long, String> schemaByDs = new HashMap<>(schemas.size() * 2);
+            for (SchemaSnapshot s : schemas) {
+                schemaByDs.put(s.dataStreamId(), s.json());
+            }
+            try (PreparedStatement latStmt = connection.prepareStatement(
+                    "INSERT INTO oscar_obs_latest(" +
+                            "store_key, id_scope, datastream_id, generation_id, observation_id, " +
+                            "foi_id, phenomenon_time, result_time, result_json, schema_json, profile, updated_at) " +
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, now()) " +
+                            "ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET " +
+                            "generation_id = EXCLUDED.generation_id, " +
+                            "observation_id = EXCLUDED.observation_id, " +
+                            "foi_id = EXCLUDED.foi_id, " +
+                            "phenomenon_time = EXCLUDED.phenomenon_time, " +
+                            "result_time = EXCLUDED.result_time, " +
+                            "result_json = EXCLUDED.result_json, " +
+                            "schema_json = EXCLUDED.schema_json, " +
+                            "profile = EXCLUDED.profile, " +
+                            "updated_at = now() " +
+                            "WHERE oscar_obs_latest.profile <> 'OVERLAY' " +
+                            "AND NOT EXISTS (SELECT 1 FROM oscar_obs_overlay ov " +
+                            "  WHERE ov.store_key = oscar_obs_latest.store_key " +
+                            "    AND ov.id_scope = oscar_obs_latest.id_scope " +
+                            "    AND ov.observation_id = oscar_obs_latest.observation_id) " +
+                            "AND (oscar_obs_latest.phenomenon_time IS NULL " +
+                            "OR (EXCLUDED.phenomenon_time IS NOT NULL AND (" +
+                            "EXCLUDED.phenomenon_time > oscar_obs_latest.phenomenon_time " +
+                            "OR (EXCLUDED.phenomenon_time = oscar_obs_latest.phenomenon_time " +
+                            "AND EXCLUDED.observation_id >= oscar_obs_latest.observation_id))))")) {
+                for (StreamLatestCandidate lat : latestCandidates) {
+                    if ((tombstonedIds != null && tombstonedIds.contains(lat.observationId())) ||
+                            (liveOverlayIds != null && liveOverlayIds.contains(lat.observationId())))
+                        continue;
+                    String schemaJson = schemaByDs.get(lat.dataStreamId());
+                    if (schemaJson == null)
+                        continue;
+                    latStmt.setString(1, storeKey);
+                    latStmt.setInt(2, idScope);
+                    latStmt.setLong(3, lat.dataStreamId());
+                    latStmt.setObject(4, generation.id());
+                    latStmt.setLong(5, lat.observationId());
+                    if (lat.foiId() == null)
+                        latStmt.setNull(6, Types.BIGINT);
+                    else
+                        latStmt.setLong(6, lat.foiId());
+                    if (lat.phenomenonTime() == null)
+                        latStmt.setNull(7, Types.TIMESTAMP_WITH_TIMEZONE);
+                    else
+                        UtcJdbcTime.setInstant(latStmt, 7, lat.phenomenonTime());
+                    if (lat.resultTime() == null)
+                        latStmt.setNull(8, Types.TIMESTAMP_WITH_TIMEZONE);
+                    else
+                        UtcJdbcTime.setInstant(latStmt, 8, lat.resultTime());
+                    latStmt.setString(9, lat.resultJson());
+                    latStmt.setString(10, schemaJson);
+                    latStmt.setString(11, generation.profile());
+                    latStmt.addBatch();
+                }
+                latStmt.executeBatch();
+            }
+        }
+    }
+
+    public List<DeletingGenerationRecord> listDrainableDeletingGenerations(Instant unlinkCutoff) {
+        String sql = "SELECT g.id, g.job_id, g.sha256, o.relative_path " +
+                "FROM oscar_archive_generation g " +
+                "LEFT JOIN oscar_archive_object o ON o.generation_id = g.id " +
+                "WHERE g.store_key = ? AND g.id_scope = ? AND g.state = 'DELETING' " +
+                "AND (g.sealed_at IS NULL OR g.sealed_at <= ?) " +
+                "ORDER BY g.sealed_at ASC NULLS FIRST, g.id ASC, o.relative_path ASC";
+        Map<UUID, DeletingGenerationRecord> byId = new java.util.LinkedHashMap<>();
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+                stmt.setString(1, storeKey);
+                stmt.setInt(2, idScope);
+                UtcJdbcTime.setInstant(stmt, 3, unlinkCutoff);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        UUID genId = rs.getObject(1, UUID.class);
+                        UUID jobId = rs.getObject(2, UUID.class);
+                        String sha256 = rs.getString(3);
+                        String relPath = rs.getString(4);
+                        DeletingGenerationRecord rec = byId.computeIfAbsent(
+                                genId, ignored -> new DeletingGenerationRecord(genId, jobId, sha256, new ArrayList<>()));
+                        if (relPath != null && !relPath.isBlank()) {
+                            rec.objectRelativePaths().add(Path.of(relPath));
+                        }
+                    }
+                }
+            } finally {
+                connection.setReadOnly(oldReadOnly);
+            }
+            return List.copyOf(byId.values());
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect DELETING archive generations", e);
+        }
+    }
+
+    public boolean finalizeDeletedGeneration(UUID generationId, UUID jobId, Instant now) {
+        try (Connection connection = connections.open()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                try (PreparedStatement delExpiredPlanItems = connection.prepareStatement(
+                        "DELETE FROM oscar_deletion_plan_item dpi USING oscar_deletion_plan dp " +
+                                "WHERE dpi.plan_id = dp.id AND dpi.generation_id = ? " +
+                                "AND dp.state = 'PLANNED' AND dp.expires_at <= ?")) {
+                    delExpiredPlanItems.setObject(1, generationId);
+                    UtcJdbcTime.setInstant(delExpiredPlanItems, 2, now);
+                    delExpiredPlanItems.executeUpdate();
+                }
+
+                boolean hasStageOwnerTable = relationExists(connection, "oscar_obs_stage_owner");
+                String refGuardSql = "SELECT (" +
+                        "EXISTS (SELECT 1 FROM oscar_obs_latest WHERE generation_id = ?) OR " +
+                        "EXISTS (SELECT 1 FROM oscar_event_locator WHERE generation_id = ?) OR " +
+                        "EXISTS (SELECT 1 FROM oscar_obs_overlay WHERE generation_id = ?) OR " +
+                        "EXISTS (SELECT 1 FROM oscar_tombstone WHERE generation_id = ?) OR " +
+                        (hasStageOwnerTable ? "EXISTS (SELECT 1 FROM oscar_obs_stage_owner WHERE generation_id = ?) OR " : "") +
+                        "EXISTS (SELECT 1 FROM oscar_deletion_plan_item WHERE generation_id = ?))";
+                int bindCount = hasStageOwnerTable ? 6 : 5;
+                try (PreparedStatement guard = connection.prepareStatement(refGuardSql)) {
+                    for (int i = 1; i <= bindCount; i++)
+                        guard.setObject(i, generationId);
+                    try (ResultSet rs = guard.executeQuery()) {
+                        if (rs.next() && rs.getBoolean(1)) {
+                            connection.rollback();
+                            return false;
+                        }
+                    }
+                }
+
+                int deleted;
+                try (PreparedStatement delGen = connection.prepareStatement(
+                        "DELETE FROM oscar_archive_generation " +
+                                "WHERE id = ? AND store_key = ? AND id_scope = ? AND state = 'DELETING'")) {
+                    delGen.setObject(1, generationId);
+                    delGen.setString(2, storeKey);
+                    delGen.setInt(3, idScope);
+                    deleted = delGen.executeUpdate();
+                }
+                if (jobId != null) {
+                    try (PreparedStatement delJob = connection.prepareStatement(
+                            "DELETE FROM oscar_archive_job j " +
+                                    "WHERE j.id = ? AND j.store_key = ? AND j.id_scope = ? " +
+                                    "AND NOT EXISTS (SELECT 1 FROM oscar_archive_generation g WHERE g.job_id = j.id)")) {
+                        delJob.setObject(1, jobId);
+                        delJob.setString(2, storeKey);
+                        delJob.setInt(3, idScope);
+                        delJob.executeUpdate();
+                    }
+                }
+                connection.commit();
+                return deleted > 0;
+            } catch (Exception e) {
+                connection.rollback();
+                throw e;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot finalize deletion of superseded archive generation " + generationId, e);
+        }
+    }
+
+    public boolean hasActiveExportingJobs() {
+        try (Connection connection = connections.open();
+             PreparedStatement stmt = connection.prepareStatement(
+                     "SELECT 1 FROM oscar_archive_job WHERE store_key = ? AND id_scope = ? AND state = 'EXPORTING' LIMIT 1")) {
+            stmt.setString(1, storeKey);
+            stmt.setInt(2, idScope);
+            try (ResultSet rs = stmt.executeQuery()) {
+                return rs.next();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect active archive export jobs", e);
         }
     }
 }

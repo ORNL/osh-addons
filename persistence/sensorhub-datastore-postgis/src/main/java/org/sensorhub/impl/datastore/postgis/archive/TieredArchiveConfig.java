@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Configuration for OSCAR's immutable Parquet observation tier.
@@ -172,6 +173,73 @@ public class TieredArchiveConfig {
     @DisplayInfo(label = "ZSTD compression level")
     public int zstdCompressionLevel = 6;
 
+    @Min(0)
+    @DisplayInfo(label = "Compaction unlink grace (minutes)",
+            desc = "Safety delay after superseding source generations before unlinking files so online backups stay consistent")
+    public int compactionUnlinkGraceMinutes = 15;
+
+    public static final String PROFILE_RAW_GATED = "RAW_GATED";
+    public static final String PROFILE_RAW_EVENTS = "RAW_EVENTS";
+    public static final String PROFILE_RAW_TELEMETRY = "RAW_TELEMETRY";
+    public static final String PROFILE_DAILY_EVENTS = "DAILY_EVENTS";
+    /** Read-only compatibility profile for pre-split archives; new telemetry is written once as {@link #PROFILE_RAW_TELEMETRY}. */
+    public static final String PROFILE_DAILY_TELEMETRY = "DAILY_TELEMETRY";
+    public static final String PROFILE_MONTHLY_EVENTS = "MONTHLY_EVENTS";
+
+    /**
+     * Searchable operational, evidentiary, and summary streams (~1.3% of total
+     * rows) exported directly to {@link #PROFILE_RAW_EVENTS} and compacted into
+     * {@link #PROFILE_DAILY_EVENTS} and {@link #PROFILE_MONTHLY_EVENTS}.
+     *
+     * <p>High-rate {@code 1 Hz} detector and serial status streams (including
+     * {@code dailyFile}, {@code connectionStatus}, {@code occupancyStatus},
+     * {@code gammaCounts}, {@code gammaThreshold}, and {@code neutronCounts})
+     * are deliberately excluded so they are written once into
+     * {@link #PROFILE_RAW_TELEMETRY} with zero write amplification.</p>
+     *
+     * <p>Read-side catalog planning in {@code OscarTieredObsStore} prunes
+     * pure event-stream queries to {@link #EVENT_QUERY_PROFILES} via
+     * {@code oscar_archive_generation_time_idx} once a stream is confirmed to
+     * have no historical rows in {@link #PROFILE_RAW_TELEMETRY} or
+     * {@link #PROFILE_DAILY_TELEMETRY}.</p>
+     */
+    public static final Set<String> EVENT_OUTPUT_NAMES = Set.of(
+            "occupancy", "alarm", "adjudication", "report", "vehicleOcr",
+            "emlAnalysis", "tamper", "siteStatistics", "nationalSummary");
+
+    /**
+     * Catalog profiles that can contain {@link #EVENT_OUTPUT_NAMES} streams
+     * (including legacy pre-split {@link #PROFILE_RAW_GATED} generations).
+     * Pruning pure event queries to this set avoids scanning up to
+     * {@code 175,200+} {@link #PROFILE_RAW_TELEMETRY} rows over a 10-year
+     * retention window.
+     */
+    public static final Set<String> EVENT_QUERY_PROFILES = Set.of(
+            PROFILE_RAW_GATED,
+            PROFILE_RAW_EVENTS,
+            PROFILE_DAILY_EVENTS,
+            PROFILE_MONTHLY_EVENTS);
+
+    public static final int DEFAULT_COMPACTION_PART_MAX_ROWS = 1_000_000;
+
+    public static boolean isEventOutputName(String outputName) {
+        return outputName != null && EVENT_OUTPUT_NAMES.contains(outputName);
+    }
+
+    public static boolean isProjectedEventProfile(String profile) {
+        return PROFILE_RAW_EVENTS.equals(profile)
+                || PROFILE_DAILY_EVENTS.equals(profile)
+                || PROFILE_MONTHLY_EVENTS.equals(profile);
+    }
+
+    public static boolean isV2ArchiveProfile(String profile) {
+        return PROFILE_RAW_EVENTS.equals(profile)
+                || PROFILE_RAW_TELEMETRY.equals(profile)
+                || PROFILE_DAILY_EVENTS.equals(profile)
+                || PROFILE_DAILY_TELEMETRY.equals(profile)
+                || PROFILE_MONTHLY_EVENTS.equals(profile);
+    }
+
     private static final List<String> LEGACY_DEFAULT_OUTPUT_NAMES = List.of(
             "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron");
 
@@ -187,13 +255,23 @@ public class TieredArchiveConfig {
             "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
             "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary");
 
-    private static final List<String> DEFAULT_OUTPUT_NAMES = List.of(
+    private static final List<String> PREVIOUS_22_DEFAULT_OUTPUT_NAMES = List.of(
             "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
             "speed", "backgroundReport", "foregroundReport", "status",
             "emlContextual", "emlScanContextual", "emlAnalysis",
             "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
             "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary",
             "vehicleOcr");
+
+    private static final List<String> DEFAULT_OUTPUT_NAMES = List.of(
+            "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron",
+            "speed", "backgroundReport", "foregroundReport", "status",
+            "emlContextual", "emlScanContextual", "emlAnalysis",
+            "dailyFile", "connectionStatus", "occupancyStatus", "tamper",
+            "occupancy", "adjudication", "report", "siteStatistics", "nationalSummary",
+            "vehicleOcr",
+            "location", "alarm",
+            "KromekDetectorRadiometricsV1Report", "KromekSerialRadiometricStatusReport");
 
     @DisplayInfo(label = "Archive output names", desc = "Only high-volume raw/rollup streams are cold-tiered by default")
     public List<String> outputNames = new ArrayList<>(DEFAULT_OUTPUT_NAMES);
@@ -213,6 +291,49 @@ public class TieredArchiveConfig {
         long memorySafePayloadBytes = Math.max(1L,
                 duckDbMemoryBytes / EXPORT_MEMORY_SAFETY_DIVISOR);
         return Math.min(maximumUncompressedBytesPerGeneration, memorySafePayloadBytes);
+    }
+
+    /**
+     * Source-payload rollover limit for direct {@link #PROFILE_RAW_TELEMETRY}
+     * exports written via file-backed DuckDB + {@code DuckDBAppender}.
+     *
+     * <p>With a 256 MiB DuckDB memory cap this allows up to 128 MiB of
+     * uncompressed JSON (~8-10 MiB ZSTD Parquet) per generation, keeping a full
+     * 30-minute 50-lane telemetry window (~48 MiB uncompressed / ~3.6 MiB
+     * compressed) in one single Parquet V2 file while still honoring smaller
+     * operator or test caps.</p>
+     */
+    public long effectiveTelemetryExportUncompressedBytes() {
+        long duckDbMemoryBytes = Math.multiplyExact(
+                (long) duckDbMemoryLimitMegabytes, BYTES_PER_MEBIBYTE);
+        long spillSafePayloadBytes = Math.max(1L, duckDbMemoryBytes / 2L);
+        return Math.min(maximumUncompressedBytesPerGeneration, spillSafePayloadBytes);
+    }
+
+    /**
+     * Source-payload rollover limit for chunk-spilled {@link #PROFILE_DAILY_EVENTS}
+     * and {@link #PROFILE_MONTHLY_EVENTS} compaction parts.
+     *
+     * <p>With a 256 MiB DuckDB memory cap this caps each compacted event part
+     * at 192 MiB uncompressed (~16-32 MiB ZSTD Parquet) and
+     * {@link #effectiveCompactionPartMaxRows()} rows so high-volume days or
+     * months automatically roll into two or more right-sized, independently
+     * defragmentable Parquet V2 files with disjoint time windows.</p>
+     */
+    public long effectiveCompactionPartUncompressedBytes() {
+        long duckDbMemoryBytes = Math.multiplyExact(
+                (long) duckDbMemoryLimitMegabytes, BYTES_PER_MEBIBYTE);
+        long spillSafePayloadBytes = Math.max(1L, (duckDbMemoryBytes * 3L) / 4L);
+        return Math.min(maximumUncompressedBytesPerGeneration, spillSafePayloadBytes);
+    }
+
+    /**
+     * Maximum row count admitted into one compacted {@link #PROFILE_DAILY_EVENTS}
+     * or {@link #PROFILE_MONTHLY_EVENTS} part before rolling over at the next
+     * phenomenon-time boundary.
+     */
+    public long effectiveCompactionPartMaxRows() {
+        return Math.min((long) maximumRowsPerGeneration, (long) DEFAULT_COMPACTION_PART_MAX_ROWS);
     }
 
     public boolean isParquetPrimary() {
@@ -290,7 +411,8 @@ public class TieredArchiveConfig {
                             "maximumGenerationsPerCycle so parity backlog cannot grow by configuration");
         if (outputNames != null && (outputNames.equals(LEGACY_DEFAULT_OUTPUT_NAMES) ||
                 outputNames.equals(PREVIOUS_DEFAULT_OUTPUT_NAMES) ||
-                outputNames.equals(PREVIOUS_21_DEFAULT_OUTPUT_NAMES)))
+                outputNames.equals(PREVIOUS_21_DEFAULT_OUTPUT_NAMES) ||
+                outputNames.equals(PREVIOUS_22_DEFAULT_OUTPUT_NAMES)))
             outputNames = new ArrayList<>(DEFAULT_OUTPUT_NAMES);
         if (isParquetPrimary() && (outputNames == null || outputNames.isEmpty()))
             throw new IllegalArgumentException("At least one immutable archive output name is required");
@@ -301,6 +423,8 @@ public class TieredArchiveConfig {
         if (!requireParityReceipt)
             throw new IllegalArgumentException(
                     "requireParityReceipt is a mandatory safety invariant and cannot be disabled");
+        if (compactionUnlinkGraceMinutes < 0)
+            throw new IllegalArgumentException("compactionUnlinkGraceMinutes must not be negative");
         if (maximumRowsPerGeneration < 1)
             throw new IllegalArgumentException("maximumRowsPerGeneration must be positive");
         if (maximumUncompressedBytesPerGeneration < 1)

@@ -1,6 +1,9 @@
 package org.sensorhub.impl.datastore.postgis.archive;
 
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.BoundType;
+import org.geotools.api.filter.Filter;
 import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.datastore.TemporalFilter;
 import org.sensorhub.api.datastore.obs.ObsFilter;
@@ -24,6 +27,7 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HexFormat;
@@ -78,13 +82,50 @@ public final class ParquetArchiveReader {
             "filename, id_scope, id_value, datastream_scope, datastream_id, " +
                     "foi_scope, foi_id, phenomenon_time, result_time, result_json, profile";
 
+    /**
+     * Per-generation base row and alarm summary counters used to prune
+     * zero-match generations in memory before opening a DuckDB session.
+     */
+    public record GenerationSummary(
+            boolean populated,
+            long rowCount,
+            long gammaAlarmCount,
+            long neutronAlarmCount,
+            long gammaNeutronAlarmCount,
+            long gammaTrueCount,
+            long neutronTrueCount) {
+
+        public GenerationSummary(long rowCount, long gammaAlarmCount, long neutronAlarmCount) {
+            this(true, rowCount, gammaAlarmCount, neutronAlarmCount, 0L,
+                    Math.max(0L, gammaAlarmCount), Math.max(0L, neutronAlarmCount));
+        }
+
+        public GenerationSummary(
+                long rowCount,
+                long gammaAlarmCount,
+                long neutronAlarmCount,
+                long gammaNeutronAlarmCount) {
+            this(true, rowCount, gammaAlarmCount, neutronAlarmCount, gammaNeutronAlarmCount,
+                    saturateNonNegativeAdd(gammaAlarmCount, gammaNeutronAlarmCount),
+                    saturateNonNegativeAdd(neutronAlarmCount, gammaNeutronAlarmCount));
+        }
+
+        private static long saturateNonNegativeAdd(long a, long b) {
+            long x = Math.max(0L, a);
+            long y = Math.max(0L, b);
+            long sum = x + y;
+            return sum < 0L ? Long.MAX_VALUE : sum;
+        }
+    }
+
     private record CqlGenerationCountKey(
             String sha256,
             String streamsKey,
             String foisKey,
             String cqlKey,
             boolean nonNullPhenomenonRequired,
-            boolean nonNullResultTimeRequired) {}
+            boolean nonNullResultTimeRequired,
+            String excludedIdsDigest) {}
 
     static final long MIN_LOCAL_9P_CACHE_MAX_BYTES = 2_147_483_648L;
     static final long MAX_LOCAL_9P_CACHE_MAX_BYTES = 8_589_934_592L;
@@ -107,13 +148,156 @@ public final class ParquetArchiveReader {
     private final Map<Path, VerificationStamp> verifiedObjects = new ConcurrentHashMap<>();
     private final Object[] verificationLocks = createVerificationLocks();
     private final Map<String, java.util.Optional<Instant>> maxResultTimeBySha256 = new ConcurrentHashMap<>();
-    private final Map<CqlGenerationCountKey, Long> unmutatedCqlCounts = new ConcurrentHashMap<>();
+    private final Cache<CqlGenerationCountKey, Long> cqlGenerationCounts = CacheBuilder.newBuilder()
+            .maximumSize(MAX_CQL_COUNT_CACHE_ENTRIES)
+            .build();
+    private final AtomicLong cqlCountDuckDbSessionOpens = new AtomicLong();
+    private final AtomicLong cqlCountCacheHits = new AtomicLong();
+    private final AtomicLong cqlCountZeroMatchPrunedGenerations = new AtomicLong();
+    private final AtomicLong cqlCountScannedGenerations = new AtomicLong();
+    private final AtomicLong authorizeColdStatCount = new AtomicLong();
+    private final AtomicInteger maxBatchFileCountSeen = new AtomicInteger();
     private final AtomicInteger openCursors = new AtomicInteger();
+    private final ConcurrentHashMap<UUID, AtomicInteger> activeGenerationPins = new ConcurrentHashMap<>();
     private volatile DirectReadFaultInjector directReadFaultInjector;
     private volatile Boolean archiveMountIs9p;
     private volatile Boolean forceProactiveLocalStagingForTesting;
     private volatile Local9pParquetCache localStageCacheForTesting;
     private volatile java.util.Optional<Local9pParquetCache> resolvedSharedLocal9pCache;
+
+    public static final class PinnedGenerations implements AutoCloseable {
+        private final ParquetArchiveReader owner;
+        private final List<UUID> pinnedIds;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        private PinnedGenerations(ParquetArchiveReader owner, List<UUID> pinnedIds) {
+            this.owner = owner;
+            this.pinnedIds = pinnedIds;
+        }
+
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true) && !pinnedIds.isEmpty()) {
+                owner.unpinGenerations(pinnedIds);
+            }
+        }
+    }
+
+    public PinnedGenerations pinGenerations(Collection<UUID> generationIds) {
+        if (generationIds == null || generationIds.isEmpty())
+            return new PinnedGenerations(this, List.of());
+        List<UUID> unique = generationIds.stream()
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+        for (UUID id : unique) {
+            activeGenerationPins.compute(id, (k, count) -> {
+                if (count == null)
+                    return new AtomicInteger(1);
+                count.incrementAndGet();
+                return count;
+            });
+        }
+        return new PinnedGenerations(this, unique);
+    }
+
+    private PinnedGenerations pinGenerationsFor(Collection<ArchiveGeneration> generations) {
+        if (generations == null || generations.isEmpty())
+            return new PinnedGenerations(this, List.of());
+        List<UUID> ids = new ArrayList<>(generations.size());
+        for (ArchiveGeneration gen : generations) {
+            if (gen != null && gen.id() != null)
+                ids.add(gen.id());
+        }
+        return pinGenerations(ids);
+    }
+
+    public void unpinGenerations(Collection<UUID> generationIds) {
+        if (generationIds == null || generationIds.isEmpty())
+            return;
+        Set<UUID> unique = new LinkedHashSet<>(generationIds);
+        for (UUID id : unique) {
+            if (id == null)
+                continue;
+            activeGenerationPins.computeIfPresent(id, (k, count) ->
+                    count.decrementAndGet() <= 0 ? null : count);
+        }
+    }
+
+    public int activePinCount(UUID generationId) {
+        if (generationId == null)
+            return 0;
+        AtomicInteger counter = activeGenerationPins.get(generationId);
+        return counter == null ? 0 : Math.max(0, counter.get());
+    }
+
+    public boolean hasActivePins(Collection<UUID> generationIds) {
+        if (generationIds == null || generationIds.isEmpty())
+            return false;
+        for (UUID id : generationIds) {
+            if (activePinCount(id) > 0)
+                return true;
+        }
+        return false;
+    }
+
+    public void invalidateGenerations(Collection<Path> relativeObjectPaths, Collection<String> sha256s) {
+        if (relativeObjectPaths != null && !relativeObjectPaths.isEmpty()) {
+            Path realRoot = null;
+            try {
+                realRoot = resolveRealRoot();
+            } catch (Exception ignored) {
+            }
+            for (Path rel : relativeObjectPaths) {
+                if (rel == null)
+                    continue;
+                verifiedObjects.remove(root.resolve(rel.normalize()).normalize());
+                if (realRoot != null)
+                    verifiedObjects.remove(realRoot.resolve(rel.normalize()).normalize());
+            }
+        }
+        if (sha256s != null && !sha256s.isEmpty()) {
+            for (String sha : sha256s) {
+                if (sha != null)
+                    maxResultTimeBySha256.remove(sha);
+            }
+            Local9pParquetCache testCache = localStageCacheForTesting;
+            if (testCache != null)
+                testCache.evictCachedObjects(sha256s);
+            java.util.Optional<Local9pParquetCache> shared = resolvedSharedLocal9pCache;
+            if (shared != null && shared.isPresent())
+                shared.get().evictCachedObjects(sha256s);
+        }
+    }
+
+    public long authorizeColdStatCountForTesting() {
+        return authorizeColdStatCount.get();
+    }
+
+    public void resetAuthorizeColdStatCountForTesting() {
+        authorizeColdStatCount.set(0L);
+    }
+
+    public int maxBatchFileCountSeenForTesting() {
+        return maxBatchFileCountSeen.get();
+    }
+
+    public void resetMaxBatchFileCountSeenForTesting() {
+        maxBatchFileCountSeen.set(0);
+    }
+
+    private void recordBatchFileCount(int fileCount) {
+        if (fileCount <= 0)
+            return;
+        maxBatchFileCountSeen.accumulateAndGet(fileCount, Math::max);
+    }
+
+    public void setLocalStageCacheForTestingPublic(Path cacheDir, long maxBytes, boolean resetOnOpen)
+            throws IOException {
+        this.localStageCacheForTesting = cacheDir == null
+                ? null
+                : Local9pParquetCache.open(cacheDir, maxBytes, resetOnOpen);
+    }
 
     @FunctionalInterface
     interface DirectReadFaultInjector {
@@ -124,7 +308,7 @@ public final class ParquetArchiveReader {
         this.directReadFaultInjector = injector;
     }
 
-    void setForceProactiveLocalStagingForTesting(Boolean force) {
+    public void setForceProactiveLocalStagingForTesting(Boolean force) {
         this.forceProactiveLocalStagingForTesting = force;
     }
 
@@ -147,6 +331,22 @@ public final class ParquetArchiveReader {
     long localStageCacheTrackedBytesForTesting() {
         Local9pParquetCache cache = localStageCacheForTesting;
         return cache == null ? 0L : cache.trackedBytes();
+    }
+
+    public long cqlCountDuckDbSessionOpensForTesting() {
+        return cqlCountDuckDbSessionOpens.get();
+    }
+
+    public long cqlCountCacheHitsForTesting() {
+        return cqlCountCacheHits.get();
+    }
+
+    public long cqlCountZeroMatchPrunedGenerationsForTesting() {
+        return cqlCountZeroMatchPrunedGenerations.get();
+    }
+
+    public long cqlCountScannedGenerationsForTesting() {
+        return cqlCountScannedGenerations.get();
     }
 
     static boolean is9pFileSystemType(String fsType) {
@@ -321,7 +521,7 @@ public final class ParquetArchiveReader {
         return detected;
     }
 
-    private static boolean isPathOn9pMount(Path path) {
+    static boolean isPathOn9pMount(Path path) {
         try {
             return is9pFileSystemType(Files.getFileStore(path).type());
         } catch (Exception ignored) {
@@ -412,14 +612,29 @@ public final class ParquetArchiveReader {
                 rows = rows.filter(row -> cqlMatcher.test(row.observation().resultJson()));
             }
         } else {
-            AuthorizedObjects objects = authorize(generations);
-            if (objects.byFilename().isEmpty())
-                return Stream.empty();
-            rows = openRowStream(objects, auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
-                    true, !javaCql, javaCql ? Long.MAX_VALUE : limit), generations.size(),
-                    queryOperationName(filter));
-            if (cqlMatcher != null) {
-                rows = rows.filter(row -> cqlMatcher.test(row.observation().resultJson()));
+            PinnedGenerations pinned = pinGenerationsFor(generations);
+            try {
+                AuthorizedObjects objects = authorize(generations);
+                if (objects.byFilename().isEmpty()) {
+                    pinned.close();
+                    return Stream.empty();
+                }
+                JsonCqlEvaluator.ProjectedColumnMode singleMode = resolveProjectedColumnMode(generations);
+                JsonCqlEvaluator.ExactDuckDbPredicate singleExact = (!javaLatest && javaCql)
+                        ? JsonCqlEvaluator.tryBuildExactDuckDbPredicate(
+                                filter.getCQLFilter(), "result_json", singleMode).orElse(null)
+                        : null;
+                boolean applySqlLimit = !javaCql || singleExact != null;
+                rows = openRowStreamWithPins(objects, auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
+                        Set.of(), true, !javaCql, applySqlLimit ? limit : Long.MAX_VALUE, true,
+                        singleExact, null, null, false), generations.size(),
+                        queryOperationName(filter), pinned);
+                if (cqlMatcher != null && singleExact == null) {
+                    rows = rows.filter(row -> cqlMatcher.test(row.observation().resultJson()));
+                }
+            } catch (RuntimeException | Error error) {
+                pinned.close();
+                throw error;
             }
         }
 
@@ -454,29 +669,223 @@ public final class ParquetArchiveReader {
         return streamWindowClusters(generations, filter, allowedDataStreams, allowedFois, limit, limit, null);
     }
 
+    private static final int MAX_CLUSTER_STEP_FILES = 16;
+
+    private record ClusterStep(
+            List<ArchiveGeneration> generations,
+            Instant sliceStartInclusive,
+            Instant sliceEndExclusive,
+            boolean includeNullPhenomenon) {}
+
+    static JsonCqlEvaluator.ProjectedColumnMode resolveProjectedColumnMode(
+            Collection<ArchiveGeneration> generations) {
+        if (generations == null || generations.isEmpty())
+            return JsonCqlEvaluator.ProjectedColumnMode.NONE;
+        boolean anyProjected = false;
+        boolean allProjected = true;
+        for (ArchiveGeneration gen : generations) {
+            if (TieredArchiveConfig.isProjectedEventProfile(gen.profile())) {
+                anyProjected = true;
+            } else {
+                allProjected = false;
+            }
+        }
+        if (allProjected && anyProjected)
+            return JsonCqlEvaluator.ProjectedColumnMode.PURE_V2_EVENTS;
+        if (anyProjected)
+            return JsonCqlEvaluator.ProjectedColumnMode.MIXED_UNION_BY_NAME;
+        return JsonCqlEvaluator.ProjectedColumnMode.NONE;
+    }
+
+    private static List<ArchiveGeneration> overlappingGenerations(
+            List<ArchiveGeneration> cluster, Instant sliceStart, Instant sliceEnd) {
+        List<ArchiveGeneration> matches = new ArrayList<>();
+        for (ArchiveGeneration gen : cluster) {
+            if (gen.start().isBefore(sliceEnd) && gen.end().isAfter(sliceStart))
+                matches.add(gen);
+        }
+        return matches;
+    }
+
+    private static boolean sliceOverlapsTemporalFilter(
+            Instant sliceStart, Instant sliceEnd, TemporalFilter filter) {
+        if (filter == null || filter.isLatestTime())
+            return true;
+        Instant min = filter.getMin();
+        if (min != null && !Instant.MIN.equals(min)) {
+            if (!sliceEnd.isAfter(min))
+                return false;
+        }
+        Instant max = filter.getMax();
+        if (max != null && !Instant.MAX.equals(max)) {
+            boolean upperClosed = filter.getRange().upperBoundType() == BoundType.CLOSED;
+            if (upperClosed ? sliceStart.isAfter(max) : !sliceStart.isBefore(max))
+                return false;
+        }
+        return true;
+    }
+
+    private static List<ClusterStep> sliceWideCluster(
+            List<ArchiveGeneration> cluster,
+            ObsFilter filter,
+            boolean descending,
+            long callerHintLimit) {
+        TreeSet<Instant> cutSet = new TreeSet<>();
+        for (ArchiveGeneration gen : cluster) {
+            if (gen.start() != null)
+                cutSet.add(gen.start());
+            if (gen.end() != null)
+                cutSet.add(gen.end());
+        }
+        if (cutSet.size() < 2) {
+            return List.of(new ClusterStep(cluster, null, null, false));
+        }
+
+        List<Instant> initialCuts = new ArrayList<>(cutSet);
+        boolean sqlBoundedTopN = callerHintLimit > 0L && callerHintLimit <= 1_024L &&
+                (filter.getCQLFilter() == null ||
+                 JsonCqlEvaluator.tryBuildExactDuckDbPredicate(
+                         filter.getCQLFilter(), "result_json", resolveProjectedColumnMode(cluster)).isPresent());
+        // Subdivide a wide homogeneous overlapping span into daily steps only
+        // when DuckDB cannot execute a bounded SQL Top-N heap (e.g. unbounded
+        // scans or Java-only CQL filters). For bounded SQL LIMIT queries over
+        // identical-window generations, artificial daily slicing cannot reduce
+        // file count and would multiply empty-day DuckDB opens by up to 31x.
+        if (!sqlBoundedTopN) {
+            for (int i = 0; i < initialCuts.size() - 1; i++) {
+                Instant a = initialCuts.get(i);
+                Instant b = initialCuts.get(i + 1);
+                if (java.time.Duration.between(a, b).toHours() >= 2 &&
+                        overlappingGenerations(cluster, a, b).size() > MAX_CLUSTER_STEP_FILES) {
+                    Instant day = a.truncatedTo(java.time.temporal.ChronoUnit.DAYS)
+                            .plus(1, java.time.temporal.ChronoUnit.DAYS);
+                    while (day.isBefore(b)) {
+                        cutSet.add(day);
+                        day = day.plus(1, java.time.temporal.ChronoUnit.DAYS);
+                    }
+                }
+            }
+        }
+
+        List<Instant> cuts = new ArrayList<>(cutSet);
+        record Interval(Instant start, Instant end) {}
+        List<Interval> elementary = new ArrayList<>(cuts.size() - 1);
+        for (int i = 0; i < cuts.size() - 1; i++) {
+            Instant s = cuts.get(i);
+            Instant e = cuts.get(i + 1);
+            if (s.isBefore(e) && sliceOverlapsTemporalFilter(s, e, filter.getPhenomenonTime())) {
+                elementary.add(new Interval(s, e));
+            }
+        }
+        if (elementary.isEmpty())
+            return List.of();
+        if (elementary.size() == 1 &&
+                overlappingGenerations(cluster, elementary.get(0).start(), elementary.get(0).end()).size() == cluster.size() &&
+                !elementary.get(0).start().isAfter(cuts.get(0)) &&
+                !elementary.get(0).end().isBefore(cuts.get(cuts.size() - 1))) {
+            return List.of(new ClusterStep(cluster, null, null, false));
+        }
+        if (descending)
+            Collections.reverse(elementary);
+
+        int leadUnmerged = callerHintLimit <= 64 ? 2 : 0;
+        List<ClusterStep> steps = new ArrayList<>();
+        Instant accStart = null;
+        Instant accEnd = null;
+        List<ArchiveGeneration> accGens = null;
+        boolean allowNullPhenomenonOnFirst = filter.getPhenomenonTime() == null;
+
+        for (Interval interval : elementary) {
+            List<ArchiveGeneration> intervalGens = overlappingGenerations(cluster, interval.start(), interval.end());
+            if (intervalGens.isEmpty())
+                continue;
+            if (accGens == null) {
+                accStart = interval.start();
+                accEnd = interval.end();
+                accGens = intervalGens;
+                continue;
+            }
+            boolean contiguous = descending
+                    ? interval.end().equals(accStart)
+                    : interval.start().equals(accEnd);
+            if (contiguous && steps.size() >= leadUnmerged) {
+                Instant mergedStart = descending ? interval.start() : accStart;
+                Instant mergedEnd = descending ? accEnd : interval.end();
+                List<ArchiveGeneration> mergedGens = overlappingGenerations(cluster, mergedStart, mergedEnd);
+                if (mergedGens.size() <= MAX_CLUSTER_STEP_FILES) {
+                    accStart = mergedStart;
+                    accEnd = mergedEnd;
+                    accGens = mergedGens;
+                    continue;
+                }
+            }
+            boolean includeNull = allowNullPhenomenonOnFirst && steps.isEmpty();
+            steps.add(new ClusterStep(accGens, accStart, accEnd, includeNull));
+            accStart = interval.start();
+            accEnd = interval.end();
+            accGens = intervalGens;
+        }
+        if (accGens != null) {
+            boolean includeNull = allowNullPhenomenonOnFirst && steps.isEmpty();
+            steps.add(new ClusterStep(accGens, accStart, accEnd, includeNull));
+        }
+        return steps;
+    }
+
     private Stream<ArchivedRow> streamWindowClusters(
             List<ArchiveGeneration> generations, ObsFilter filter,
             Set<Long> allowedDataStreams, Set<Long> allowedFois,
             long cursorLimit, long callerHintLimit, Predicate<String> cqlMatcher) {
         List<List<ArchiveGeneration>> clusters = windowClusters(generations);
-        if (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().descendingOrder())
+        boolean descending = filter.getPhenomenonTime() != null && filter.getPhenomenonTime().descendingOrder();
+        if (descending)
             java.util.Collections.reverse(clusters);
-        boolean explicitIdLookup = filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty();
-        boolean selectiveColdScan = explicitIdLookup || (filter.getCQLFilter() != null &&
-                JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(filter.getCQLFilter()));
-        if (selectiveColdScan && clusters.size() > 1) {
-            int leadSingleClusters = callerHintLimit <= 64 ? 2 : 0;
-            clusters = batchOrderedClustersWithLeadProbe(clusters, leadSingleClusters, MAX_CQL_PAYLOAD_BATCH);
-        } else if (filter.getCQLFilter() == null && clusters.size() > 4 &&
-                ((cursorLimit >= 2 && cursorLimit <= 64) ||
-                 (cursorLimit == Long.MAX_VALUE && allowedDataStreams != null && allowedDataStreams.size() <= 256))) {
-            clusters = batchOrderedClusters(clusters, 32);
+
+        boolean hasWideCluster = false;
+        for (List<ArchiveGeneration> c : clusters) {
+            if (c.size() > MAX_CLUSTER_STEP_FILES) {
+                hasWideCluster = true;
+                break;
+            }
         }
-        WindowClusterCursor cursor = new WindowClusterCursor(
-                clusters.iterator(), filter, allowedDataStreams, allowedFois, cursorLimit, cqlMatcher);
-        return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
-                        Spliterator.ORDERED | Spliterator.NONNULL), false)
-                .onClose(cursor::close);
+
+        List<ClusterStep> steps = new ArrayList<>();
+        if (hasWideCluster) {
+            for (List<ArchiveGeneration> cluster : clusters) {
+                if (cluster.size() > MAX_CLUSTER_STEP_FILES) {
+                    steps.addAll(sliceWideCluster(cluster, filter, descending, callerHintLimit));
+                } else {
+                    steps.add(new ClusterStep(cluster, null, null, false));
+                }
+            }
+        } else {
+            boolean explicitIdLookup = filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty();
+            boolean selectiveColdScan = explicitIdLookup || (filter.getCQLFilter() != null &&
+                    JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(filter.getCQLFilter()));
+            if (selectiveColdScan && clusters.size() > 1) {
+                int leadSingleClusters = callerHintLimit <= 64 ? 2 : 0;
+                clusters = batchOrderedClustersWithLeadProbe(clusters, leadSingleClusters, MAX_CQL_PAYLOAD_BATCH);
+            } else if (filter.getCQLFilter() == null && clusters.size() > 4 &&
+                    ((cursorLimit >= 2 && cursorLimit <= 64) ||
+                     (cursorLimit == Long.MAX_VALUE && allowedDataStreams != null && allowedDataStreams.size() <= 256))) {
+                clusters = batchOrderedClusters(clusters, MAX_CLUSTER_STEP_FILES);
+            }
+            for (List<ArchiveGeneration> cluster : clusters) {
+                steps.add(new ClusterStep(cluster, null, null, false));
+            }
+        }
+
+        PinnedGenerations pinned = pinGenerationsFor(generations);
+        try {
+            WindowClusterCursor cursor = new WindowClusterCursor(
+                    steps.iterator(), filter, allowedDataStreams, allowedFois, cursorLimit, cqlMatcher, pinned);
+            return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
+                            Spliterator.ORDERED | Spliterator.NONNULL), false)
+                    .onClose(cursor::close);
+        } catch (RuntimeException | Error error) {
+            pinned.close();
+            throw error;
+        }
     }
 
     /**
@@ -499,94 +908,110 @@ public final class ParquetArchiveReader {
             Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit,
             Function<Collection<UUID>, Set<Long>> mutatedIdsByClusterLookup) {
         List<List<ArchiveGeneration>> clusters = windowClusters(generations);
-        if (clusters.size() <= 1) {
+        if (clusters.size() <= 1 && generations.size() <= MAX_CLUSTER_STEP_FILES) {
             Set<Long> singleClusterMutated = resolveClusterMutatedIds(generations, mutatedIdsByClusterLookup);
             if (singleClusterMutated.size() <= MAX_INLINE_MUTATION_EXCLUSIONS) {
-                AuthorizedObjects objects = authorize(generations);
-                if (objects.byFilename().isEmpty())
-                    return Stream.empty();
-                return openRowStream(objects, auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
-                        singleClusterMutated, true, true, limit, true), generations.size());
+                PinnedGenerations pinned = pinGenerationsFor(generations);
+                try {
+                    AuthorizedObjects objects = authorize(generations);
+                    if (objects.byFilename().isEmpty()) {
+                        pinned.close();
+                        return Stream.empty();
+                    }
+                    return openRowStreamWithPins(objects, auth -> queryPlan(auth, filter, allowedDataStreams, allowedFois,
+                            singleClusterMutated, true, true, limit, true), generations.size(), "cold-query", pinned);
+                } catch (RuntimeException | Error error) {
+                    pinned.close();
+                    throw error;
+                }
             }
         }
 
-        boolean latestResult = filter.getResultTime() != null && filter.getResultTime().isLatestTime();
-        Map<Long, ArchivedRow> bestByStream = new HashMap<>();
-        Set<Long> remainingNonNullPhenomenonStreams = allowedDataStreams != null
-                ? new java.util.HashSet<>(allowedDataStreams)
-                : null;
+        try (PinnedGenerations ignored = pinGenerationsFor(generations)) {
+            boolean latestResult = filter.getResultTime() != null && filter.getResultTime().isLatestTime();
+            Map<Long, ArchivedRow> bestByStream = new HashMap<>();
+            Set<Long> remainingNonNullPhenomenonStreams = allowedDataStreams != null
+                    ? new java.util.HashSet<>(allowedDataStreams)
+                    : null;
 
-        for (int index = clusters.size() - 1; index >= 0; index--) {
-            List<ArchiveGeneration> cluster = clusters.get(index);
-            Set<Long> clusterStreams;
-            List<ArchiveGeneration> clusterGenerations;
-            if (allowedDataStreams == null) {
-                clusterStreams = null;
-                clusterGenerations = cluster;
-            } else if (!latestResult) {
-                if (remainingNonNullPhenomenonStreams.isEmpty())
-                    break;
-                clusterStreams = new java.util.HashSet<>(remainingNonNullPhenomenonStreams);
-                clusterGenerations = cluster;
-            } else {
-                clusterStreams = new java.util.HashSet<>();
-                Set<UUID> neededGenerationIds = new java.util.HashSet<>();
-                for (Long dataStreamId : allowedDataStreams) {
-                    ArchivedRow best = bestByStream.get(dataStreamId);
-                    if (best == null || best.observation().resultTime() == null) {
-                        clusterStreams.add(dataStreamId);
-                        for (ArchiveGeneration generation : cluster)
-                            neededGenerationIds.add(generation.id());
-                    } else {
-                        List<ArchiveGeneration> newer = generationsPotentiallyNewerThanResultTime(
-                                cluster, best.observation().resultTime());
-                        if (!newer.isEmpty()) {
+            for (int index = clusters.size() - 1; index >= 0; index--) {
+                List<ArchiveGeneration> cluster = clusters.get(index);
+                Set<Long> clusterStreams;
+                List<ArchiveGeneration> clusterGenerations;
+                if (allowedDataStreams == null) {
+                    clusterStreams = null;
+                    clusterGenerations = cluster;
+                } else if (!latestResult) {
+                    if (remainingNonNullPhenomenonStreams.isEmpty())
+                        break;
+                    clusterStreams = new java.util.HashSet<>(remainingNonNullPhenomenonStreams);
+                    clusterGenerations = cluster;
+                } else {
+                    clusterStreams = new java.util.HashSet<>();
+                    Set<UUID> neededGenerationIds = new java.util.HashSet<>();
+                    for (Long dataStreamId : allowedDataStreams) {
+                        ArchivedRow best = bestByStream.get(dataStreamId);
+                        if (best == null || best.observation().resultTime() == null) {
                             clusterStreams.add(dataStreamId);
-                            for (ArchiveGeneration generation : newer)
+                            for (ArchiveGeneration generation : cluster)
                                 neededGenerationIds.add(generation.id());
+                        } else {
+                            List<ArchiveGeneration> newer = generationsPotentiallyNewerThanResultTime(
+                                    cluster, best.observation().resultTime());
+                            if (!newer.isEmpty()) {
+                                clusterStreams.add(dataStreamId);
+                                for (ArchiveGeneration generation : newer)
+                                    neededGenerationIds.add(generation.id());
+                            }
                         }
                     }
+                    if (clusterStreams.isEmpty() || neededGenerationIds.isEmpty())
+                        continue;
+                    clusterGenerations = cluster.stream()
+                            .filter(generation -> neededGenerationIds.contains(generation.id()))
+                            .toList();
                 }
-                if (clusterStreams.isEmpty() || neededGenerationIds.isEmpty())
-                    continue;
-                clusterGenerations = cluster.stream()
-                        .filter(generation -> neededGenerationIds.contains(generation.id()))
-                        .toList();
+
+                for (int subStart = 0; subStart < clusterGenerations.size(); subStart += MAX_CLUSTER_STEP_FILES) {
+                    List<ArchiveGeneration> subCluster = clusterGenerations.subList(
+                            subStart, Math.min(clusterGenerations.size(), subStart + MAX_CLUSTER_STEP_FILES));
+                    AuthorizedObjects objects = authorize(subCluster);
+                    if (objects.byFilename().isEmpty())
+                        continue;
+                    final Set<Long> effectiveClusterStreams = clusterStreams;
+                    final Set<Long> clusterMutatedIds = resolveClusterMutatedIds(
+                            subCluster, mutatedIdsByClusterLookup);
+                    final boolean pushDownMutated = clusterMutatedIds.size() <= MAX_INLINE_MUTATION_EXCLUSIONS;
+                    try (Stream<ArchivedRow> clusterRows = openRowStream(objects,
+                            auth -> queryPlan(auth, filter, effectiveClusterStreams, allowedFois,
+                                    pushDownMutated ? clusterMutatedIds : Set.of(),
+                                    true, pushDownMutated, Long.MAX_VALUE, pushDownMutated),
+                            subCluster.size())) {
+                        clusterRows.forEach(row -> {
+                            if (!pushDownMutated && clusterMutatedIds.contains(row.observation().id()))
+                                return;
+                            long streamId = row.observation().dataStreamId();
+                            bestByStream.merge(streamId, row,
+                                    (previous, candidate) -> later(candidate, previous, latestResult)
+                                            ? candidate : previous);
+                            if (!latestResult && remainingNonNullPhenomenonStreams != null &&
+                                    row.observation().phenomenonTime() != null)
+                                remainingNonNullPhenomenonStreams.remove(streamId);
+                        });
+                    }
+                }
             }
 
-            AuthorizedObjects objects = authorize(clusterGenerations);
-            if (objects.byFilename().isEmpty())
-                continue;
-            final Set<Long> effectiveClusterStreams = clusterStreams;
-            final Set<Long> clusterMutatedIds = resolveClusterMutatedIds(
-                    clusterGenerations, mutatedIdsByClusterLookup);
-            final boolean pushDownMutated = clusterMutatedIds.size() <= MAX_INLINE_MUTATION_EXCLUSIONS;
-            try (Stream<ArchivedRow> clusterRows = openRowStream(objects,
-                    auth -> queryPlan(auth, filter, effectiveClusterStreams, allowedFois,
-                            pushDownMutated ? clusterMutatedIds : Set.of(),
-                            true, pushDownMutated, Long.MAX_VALUE, pushDownMutated),
-                    clusterGenerations.size())) {
-                clusterRows.forEach(row -> {
-                    if (!pushDownMutated && clusterMutatedIds.contains(row.observation().id()))
-                        return;
-                    long streamId = row.observation().dataStreamId();
-                    bestByStream.merge(streamId, row,
-                            (previous, candidate) -> later(candidate, previous, latestResult)
-                                    ? candidate : previous);
-                    if (!latestResult && remainingNonNullPhenomenonStreams != null &&
-                            row.observation().phenomenonTime() != null)
-                        remainingNonNullPhenomenonStreams.remove(streamId);
-                });
-            }
+            Stream<ArchivedRow> ordered = bestByStream.values().stream().sorted(rowComparator(filter));
+            return limit == Long.MAX_VALUE ? ordered : ordered.limit(limit);
         }
-
-        Stream<ArchivedRow> ordered = bestByStream.values().stream().sorted(rowComparator(filter));
-        return limit == Long.MAX_VALUE ? ordered : ordered.limit(limit);
     }
 
     private static final int MAX_INLINE_MUTATION_EXCLUSIONS = 4_096;
+    private static final int MAX_INLINE_CQL_AGGREGATE_EXCLUSIONS = 64;
     private static final int MAX_RESULT_TIME_METADATA_BATCH = 64;
-    private static final int MAX_CQL_PAYLOAD_BATCH = 128;
+    private static final int MAX_CQL_PAYLOAD_BATCH = 16;
+    private static final int MAX_CQL_AGGREGATE_BATCH = 16;
     private static final int LOCAL_STAGE_COPY_RETRIES = 3;
 
     /**
@@ -635,6 +1060,7 @@ public final class ParquetArchiveReader {
     }
 
     private void populateMaxResultTimes(List<ArchiveGeneration> uncached) {
+        try (PinnedGenerations ignored = pinGenerationsFor(uncached)) {
         AuthorizedObjects objects = authorize(uncached);
         if (objects.byFilename().isEmpty())
             return;
@@ -671,6 +1097,7 @@ public final class ParquetArchiveReader {
                     generation.sha256(),
                     discovered.getOrDefault(generation.sha256(), java.util.Optional.empty()));
         }
+        }
     }
 
     private void executeMaxResultTimesQuery(DuckDbResourcePolicy.Session duckSession,
@@ -679,11 +1106,12 @@ public final class ParquetArchiveReader {
                                             Map<String, java.util.Optional<Instant>> discovered) throws Exception {
         if (directRead)
             maybeInjectDirectReadFault(objects);
+        recordBatchFileCount(objects.byFilename().size());
         String fileList = objects.byFilename().keySet().stream()
                 .map(path -> "'" + sqlLiteral(path) + "'")
                 .collect(Collectors.joining(","));
         String sql = "SELECT filename, max(COALESCE(result_time, phenomenon_time)) FROM read_parquet([" + fileList +
-                "], filename=true) GROUP BY filename";
+                "], filename=true, union_by_name=true) GROUP BY filename";
         try (PreparedStatement statement = ConnectionManager.trackCancellableStatement(
                      duckSession.connection().prepareStatement(sql), "DuckDB max result time metadata query");
              ResultSet result = statement.executeQuery()) {
@@ -734,11 +1162,21 @@ public final class ParquetArchiveReader {
                                               Function<AuthorizedObjects, QueryPlan> planFactory,
                                               int generationCount,
                                               String operationName) {
+        PinnedGenerations pinned = pinGenerationsFor(objects.byFilename().values());
+        return openRowStreamWithPins(objects, planFactory, generationCount, operationName, pinned);
+    }
+
+    private Stream<ArchivedRow> openRowStreamWithPins(AuthorizedObjects objects,
+                                                      Function<AuthorizedObjects, QueryPlan> planFactory,
+                                                      int generationCount,
+                                                      String operationName,
+                                                      PinnedGenerations pinned) {
         DuckDbResourcePolicy.Session duckSession = null;
         PreparedStatement statement = null;
         ResultSet result = null;
         AuthorizedObjects stagedObjects = null;
         try {
+            recordBatchFileCount(objects.byFilename().size());
             duckSession = DuckDbResourcePolicy.open(config, operationName);
             AuthorizedObjects activeObjects = objects;
             if (shouldProactivelyStage(objects, duckSession.operationDirectory())) {
@@ -773,7 +1211,7 @@ public final class ParquetArchiveReader {
                     result = statement.executeQuery();
                 }
             }
-            RowCursor cursor = new RowCursor(duckSession, statement, result, activeObjects, stagedObjects);
+            RowCursor cursor = new RowCursor(duckSession, statement, result, activeObjects, stagedObjects, pinned);
             openCursors.incrementAndGet();
             return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
                             Spliterator.ORDERED | Spliterator.NONNULL), false)
@@ -784,6 +1222,7 @@ public final class ParquetArchiveReader {
             if (stagedObjects != null)
                 cleanupStagedBatchObjects(stagedObjects);
             closeAndSuppress(duckSession, error);
+            closeAndSuppress(pinned, error);
             if (error instanceof Error fatal)
                 throw fatal;
             throw new IllegalStateException("Cannot query " + generationCount + " archive generation(s)", error);
@@ -806,14 +1245,16 @@ public final class ParquetArchiveReader {
         if (filter.getCQLFilter() != null || filter.getValuePredicate() != null ||
                 filter.getPhenomenonLocation() != null)
             throw new IllegalArgumentException("Payload and spatial predicates require full observation decoding");
-        boolean latestSelection = (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
-                (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
-        if (!latestSelection && limit == Long.MAX_VALUE && generations.size() > MAX_RESULT_TIME_METADATA_BATCH) {
-            for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_RESULT_TIME_METADATA_BATCH))
-                forEachMetadataSingleBatch(batch, filter, allowedDataStreams, allowedFois, Long.MAX_VALUE, consumer);
-            return;
+        try (PinnedGenerations ignored = pinGenerationsFor(generations)) {
+            boolean latestSelection = (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
+                    (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
+            if (!latestSelection && limit == Long.MAX_VALUE && generations.size() > MAX_RESULT_TIME_METADATA_BATCH) {
+                for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_RESULT_TIME_METADATA_BATCH))
+                    forEachMetadataSingleBatch(batch, filter, allowedDataStreams, allowedFois, Long.MAX_VALUE, consumer);
+                return;
+            }
+            forEachMetadataSingleBatch(generations, filter, allowedDataStreams, allowedFois, limit, consumer);
         }
-        forEachMetadataSingleBatch(generations, filter, allowedDataStreams, allowedFois, limit, consumer);
     }
 
     private void forEachMetadataSingleBatch(List<ArchiveGeneration> generations, ObsFilter filter,
@@ -895,18 +1336,20 @@ public final class ParquetArchiveReader {
                 (allowedDataStreams != null && allowedDataStreams.isEmpty()) ||
                 (allowedFois != null && allowedFois.isEmpty()))
             return 0;
-        boolean latestSelection = (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
-                (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
-        if (!latestSelection && generations.size() > MAX_RESULT_TIME_METADATA_BATCH) {
-            long total = 0;
-            for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_RESULT_TIME_METADATA_BATCH)) {
-                total += countSingleBatch(batch, filter, allowedDataStreams, allowedFois);
-                if (filter.getLimit() != Long.MAX_VALUE && total >= filter.getLimit())
-                    return filter.getLimit();
+        try (PinnedGenerations ignored = pinGenerationsFor(generations)) {
+            boolean latestSelection = (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
+                    (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
+            if (!latestSelection && generations.size() > MAX_RESULT_TIME_METADATA_BATCH) {
+                long total = 0;
+                for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_RESULT_TIME_METADATA_BATCH)) {
+                    total += countSingleBatch(batch, filter, allowedDataStreams, allowedFois);
+                    if (filter.getLimit() != Long.MAX_VALUE && total >= filter.getLimit())
+                        return filter.getLimit();
+                }
+                return total;
             }
-            return total;
+            return countSingleBatch(generations, filter, allowedDataStreams, allowedFois);
         }
-        return countSingleBatch(generations, filter, allowedDataStreams, allowedFois);
     }
 
     /**
@@ -957,6 +1400,22 @@ public final class ParquetArchiveReader {
     public long countCql(List<ArchiveGeneration> generations, ObsFilter filter,
                          Set<Long> allowedDataStreams, Set<Long> allowedFois,
                          Set<Long> excludedIds) {
+        return countCql(generations, filter, allowedDataStreams, allowedFois, excludedIds, null, null);
+    }
+
+    public long countCql(List<ArchiveGeneration> generations, ObsFilter filter,
+                         Set<Long> allowedDataStreams, Set<Long> allowedFois,
+                         Set<Long> excludedIds,
+                         Map<UUID, GenerationSummary> summariesByGeneration) {
+        return countCql(generations, filter, allowedDataStreams, allowedFois,
+                excludedIds, null, summariesByGeneration);
+    }
+
+    public long countCql(List<ArchiveGeneration> generations, ObsFilter filter,
+                         Set<Long> allowedDataStreams, Set<Long> allowedFois,
+                         Set<Long> excludedIds,
+                         Map<UUID, Set<Long>> excludedIdsByGeneration,
+                         Map<UUID, GenerationSummary> summariesByGeneration) {
         if (filter.getValuePredicate() != null || filter.getPhenomenonLocation() != null)
             throw new IllegalArgumentException("Value and spatial predicates require full observation decoding");
         if ((filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
@@ -967,48 +1426,123 @@ public final class ParquetArchiveReader {
                 (allowedFois != null && allowedFois.isEmpty()))
             return 0;
 
-        long total = 0;
-        Set<Long> exclusions = excludedIds == null ? Set.of() : excludedIds;
-        if (filter.getLimit() == Long.MAX_VALUE) {
-            return countCqlUnboundedWithCache(generations, filter, allowedDataStreams, allowedFois, exclusions);
-        }
-        DuckDbResourcePolicy.Session duckSession = null;
-        try {
-            for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_CQL_PAYLOAD_BATCH)) {
-                throwIfInterruptedOrCancelled();
-                AuthorizedObjects objects = authorize(batch);
-                if (objects.byFilename().isEmpty())
-                    continue;
-                if (duckSession == null)
-                    duckSession = DuckDbResourcePolicy.open(config, "cold-cql-count");
-                total = Math.addExact(total, countCqlAuthorizedBatch(
-                        duckSession, objects, batch.size(), filter, allowedDataStreams, allowedFois, exclusions, null));
-                if (total >= filter.getLimit()) {
+        try (PinnedGenerations ignored = pinGenerationsFor(generations)) {
+            Set<Long> exclusions;
+            if (excludedIds != null && !excludedIds.isEmpty()) {
+                exclusions = excludedIds;
+            } else if (excludedIdsByGeneration != null && !excludedIdsByGeneration.isEmpty()) {
+                exclusions = generations.stream()
+                        .flatMap(g -> excludedIdsByGeneration.getOrDefault(g.id(), Set.of()).stream())
+                        .collect(Collectors.toSet());
+            } else {
+                exclusions = Set.of();
+            }
+            if (filter.getLimit() == Long.MAX_VALUE) {
+                return countCqlUnboundedWithCache(
+                        generations, filter, allowedDataStreams, allowedFois,
+                        exclusions, excludedIdsByGeneration, summariesByGeneration);
+            }
+
+            NavigableSet<Long> allSortedExclusions = exclusions.isEmpty()
+                    ? Collections.emptyNavigableSet()
+                    : new TreeSet<>(exclusions);
+
+            long total = 0;
+            DuckDbResourcePolicy.Session duckSession = null;
+            try {
+                for (List<ArchiveGeneration> batch : partitionAndBatchForCountCql(generations, filter)) {
+                    throwIfInterruptedOrCancelled();
+                    AuthorizedObjects objects = authorize(batch);
+                    if (objects.byFilename().isEmpty())
+                        continue;
+                    Map<String, ArchiveGeneration> unprunedMap = new LinkedHashMap<>(objects.byFilename().size() * 2);
+                    for (Map.Entry<String, ArchiveGeneration> entry : objects.byFilename().entrySet()) {
+                        ArchiveGeneration gen = entry.getValue();
+                        if (isGuaranteedZeroMatch(gen, filter.getCQLFilter(), summariesByGeneration)) {
+                            cqlCountZeroMatchPrunedGenerations.incrementAndGet();
+                            continue;
+                        }
+                        unprunedMap.put(entry.getKey(), gen);
+                    }
+                    if (unprunedMap.isEmpty())
+                        continue;
+                    AuthorizedObjects activeBatch = unprunedMap.size() == objects.byFilename().size()
+                            ? objects
+                            : new AuthorizedObjects(unprunedMap, objects.stampsByGenId());
+                    JsonCqlEvaluator.ProjectedColumnMode batchMode =
+                            resolveProjectedColumnMode(unprunedMap.values());
+                    JsonCqlEvaluator.ExactDuckDbPredicate exactPredicate = filter.getCQLFilter() != null
+                            ? JsonCqlEvaluator.tryBuildExactDuckDbPredicate(
+                                    filter.getCQLFilter(), "result_json", batchMode).orElse(null)
+                            : null;
+                    if (duckSession == null) {
+                        duckSession = DuckDbResourcePolicy.open(config, "cold-cql-count");
+                        cqlCountDuckDbSessionOpens.incrementAndGet();
+                    }
+                    cqlCountScannedGenerations.addAndGet(unprunedMap.size());
+                    List<Long> batchSortedExclusions = resolveBatchSortedExclusions(
+                            unprunedMap.values(), allSortedExclusions, excludedIdsByGeneration);
+                    total = Math.addExact(total, countCqlAuthorizedBatch(
+                            duckSession, activeBatch, unprunedMap.size(), filter,
+                            allowedDataStreams, allowedFois, exclusions, batchSortedExclusions,
+                            exactPredicate, null));
+                    if (total >= filter.getLimit()) {
+                        duckSession.close();
+                        duckSession = null;
+                        return filter.getLimit();
+                    }
+                    if (duckSession.shouldYield()) {
+                        duckSession.close();
+                        duckSession = null;
+                    }
+                }
+                if (duckSession != null) {
                     duckSession.close();
                     duckSession = null;
-                    return filter.getLimit();
                 }
-                if (duckSession.shouldYield()) {
-                    duckSession.close();
-                    duckSession = null;
-                }
+                return total;
+            } catch (IllegalStateException | IllegalArgumentException e) {
+                closeAndSuppress(duckSession, e);
+                throw e;
+            } catch (Exception e) {
+                closeAndSuppress(duckSession, e);
+                throw new IllegalStateException("Cannot count CQL matches from " + generations.size() +
+                        " archive generation(s)", e);
+            } catch (Error err) {
+                closeAndSuppress(duckSession, err);
+                throw err;
             }
-            if (duckSession != null) {
-                duckSession.close();
-                duckSession = null;
-            }
-            return total;
-        } catch (IllegalStateException | IllegalArgumentException e) {
-            closeAndSuppress(duckSession, e);
-            throw e;
-        } catch (Exception e) {
-            closeAndSuppress(duckSession, e);
-            throw new IllegalStateException("Cannot count CQL matches from " + generations.size() +
-                    " archive generation(s)", e);
-        } catch (Error err) {
-            closeAndSuppress(duckSession, err);
-            throw err;
         }
+    }
+
+    private static List<List<ArchiveGeneration>> partitionAndBatchForCountCql(
+            List<ArchiveGeneration> generations, ObsFilter filter) {
+        List<ArchiveGeneration> projectedEventGens = new ArrayList<>();
+        List<ArchiveGeneration> otherGens = new ArrayList<>();
+        for (ArchiveGeneration gen : generations) {
+            if (TieredArchiveConfig.isProjectedEventProfile(gen.profile()))
+                projectedEventGens.add(gen);
+            else
+                otherGens.add(gen);
+        }
+        List<List<ArchiveGeneration>> batches = new ArrayList<>();
+        if (!projectedEventGens.isEmpty()) {
+            boolean exactV2 = filter.getCQLFilter() != null &&
+                    JsonCqlEvaluator.tryBuildExactDuckDbPredicate(
+                            filter.getCQLFilter(), "result_json",
+                            JsonCqlEvaluator.ProjectedColumnMode.PURE_V2_EVENTS).isPresent();
+            int v2BatchSize = exactV2 ? MAX_CQL_AGGREGATE_BATCH : MAX_CQL_PAYLOAD_BATCH;
+            batches.addAll(batchWindowClusters(projectedEventGens, v2BatchSize));
+        }
+        if (!otherGens.isEmpty()) {
+            boolean exactV1 = filter.getCQLFilter() != null &&
+                    JsonCqlEvaluator.tryBuildExactDuckDbPredicate(
+                            filter.getCQLFilter(), "result_json",
+                            JsonCqlEvaluator.ProjectedColumnMode.NONE).isPresent();
+            int v1BatchSize = exactV1 ? MAX_CQL_AGGREGATE_BATCH : MAX_CQL_PAYLOAD_BATCH;
+            batches.addAll(batchWindowClusters(otherGens, v1BatchSize));
+        }
+        return batches;
     }
 
     private long countCqlUnboundedWithCache(
@@ -1016,7 +1550,9 @@ public final class ParquetArchiveReader {
             ObsFilter filter,
             Set<Long> allowedDataStreams,
             Set<Long> allowedFois,
-            Set<Long> exclusions) {
+            Set<Long> exclusions,
+            Map<UUID, Set<Long>> excludedIdsByGeneration,
+            Map<UUID, GenerationSummary> summariesByGeneration) {
         throwIfInterruptedOrCancelled();
         AuthorizedObjects allAuthorized = authorize(generations);
         if (allAuthorized.byFilename().isEmpty())
@@ -1034,7 +1570,7 @@ public final class ParquetArchiveReader {
         String foisKey = cacheAllowed ? canonicalIdSetKey(allowedFois) : null;
         boolean nonNullPhenomenonRequired = filter.getPhenomenonTime() != null;
         boolean nonNullResultTimeRequired = filter.getResultTime() != null;
-        NavigableSet<Long> excludedNav = cacheAllowed && !exclusions.isEmpty()
+        NavigableSet<Long> excludedNav = cacheAllowed && excludedIdsByGeneration == null && !exclusions.isEmpty()
                 ? new TreeSet<>(exclusions)
                 : null;
 
@@ -1050,16 +1586,30 @@ public final class ParquetArchiveReader {
         for (ArchiveGeneration generation : generations) {
             if (!filenameByGenId.containsKey(generation.id()))
                 continue;
-            if (cacheAllowed && isEligibleForUnmutatedCqlCache(generation, filter, excludedNav)) {
+            if (cacheAllowed && isEligibleForCqlCountCache(generation, filter)) {
+                String excludedIdsDigest = resolveGenerationExcludedIdsDigest(
+                        generation, excludedIdsByGeneration, excludedNav);
                 CqlGenerationCountKey key = new CqlGenerationCountKey(
                         generation.sha256(), streamsKey, foisKey, cqlKey,
-                        nonNullPhenomenonRequired, nonNullResultTimeRequired);
-                Long cached = unmutatedCqlCounts.get(key);
+                        nonNullPhenomenonRequired, nonNullResultTimeRequired, excludedIdsDigest);
+                Long cached = cqlGenerationCounts.getIfPresent(key);
                 if (cached != null) {
+                    cqlCountCacheHits.incrementAndGet();
                     total = Math.addExact(total, cached);
                     continue;
                 }
+                if (isGuaranteedZeroMatch(generation, filter.getCQLFilter(), summariesByGeneration)) {
+                    cqlCountZeroMatchPrunedGenerations.incrementAndGet();
+                    cqlGenerationCounts.put(key, 0L);
+                    continue;
+                }
                 cacheKeyByGenId.put(generation.id(), key);
+                uncached.add(generation);
+                continue;
+            }
+            if (isGuaranteedZeroMatch(generation, filter.getCQLFilter(), summariesByGeneration)) {
+                cqlCountZeroMatchPrunedGenerations.incrementAndGet();
+                continue;
             }
             uncached.add(generation);
         }
@@ -1067,33 +1617,72 @@ public final class ParquetArchiveReader {
         if (uncached.isEmpty())
             return total;
 
+        NavigableSet<Long> allSortedExclusions = excludedNav != null
+                ? excludedNav
+                : (exclusions.isEmpty() ? Collections.emptyNavigableSet() : new TreeSet<>(exclusions));
+
         DuckDbResourcePolicy.Session duckSession = null;
         try {
-            for (List<ArchiveGeneration> batch : batchWindowClusters(uncached, MAX_CQL_PAYLOAD_BATCH)) {
+            for (List<ArchiveGeneration> batch : partitionAndBatchForCountCql(uncached, filter)) {
                 throwIfInterruptedOrCancelled();
                 Map<String, ArchiveGeneration> batchMap = new LinkedHashMap<>(batch.size() * 2);
                 for (ArchiveGeneration generation : batch) {
+                    CqlGenerationCountKey key = cacheKeyByGenId.get(generation.id());
+                    if (key != null) {
+                        Long concurrentHit = cqlGenerationCounts.getIfPresent(key);
+                        if (concurrentHit != null) {
+                            cqlCountCacheHits.incrementAndGet();
+                            total = Math.addExact(total, concurrentHit);
+                            continue;
+                        }
+                    }
                     String filename = filenameByGenId.get(generation.id());
                     if (filename != null)
                         batchMap.put(filename, generation);
                 }
                 if (batchMap.isEmpty())
                     continue;
-                if (duckSession == null)
+                if (duckSession == null) {
                     duckSession = DuckDbResourcePolicy.open(config, "cold-cql-count");
-                Map<UUID, Long> perGenCounts = cacheKeyByGenId.isEmpty() ? null : new HashMap<>(batch.size() * 2);
+                    cqlCountDuckDbSessionOpens.incrementAndGet();
+                    if (!cacheKeyByGenId.isEmpty()) {
+                        Iterator<Map.Entry<String, ArchiveGeneration>> recheck = batchMap.entrySet().iterator();
+                        while (recheck.hasNext()) {
+                            ArchiveGeneration gen = recheck.next().getValue();
+                            CqlGenerationCountKey key = cacheKeyByGenId.get(gen.id());
+                            if (key != null) {
+                                Long afterAcquireHit = cqlGenerationCounts.getIfPresent(key);
+                                if (afterAcquireHit != null) {
+                                    cqlCountCacheHits.incrementAndGet();
+                                    total = Math.addExact(total, afterAcquireHit);
+                                    recheck.remove();
+                                }
+                            }
+                        }
+                        if (batchMap.isEmpty())
+                            continue;
+                    }
+                }
+                JsonCqlEvaluator.ProjectedColumnMode batchMode =
+                        resolveProjectedColumnMode(batchMap.values());
+                JsonCqlEvaluator.ExactDuckDbPredicate exactPredicate = filter.getCQLFilter() != null
+                        ? JsonCqlEvaluator.tryBuildExactDuckDbPredicate(
+                                filter.getCQLFilter(), "result_json", batchMode).orElse(null)
+                        : null;
+                cqlCountScannedGenerations.addAndGet(batchMap.size());
+                Map<UUID, Long> perGenCounts = cacheKeyByGenId.isEmpty() ? null : new HashMap<>(batchMap.size() * 2);
                 AuthorizedObjects batchObjects = new AuthorizedObjects(batchMap, allAuthorized.stampsByGenId());
+                List<Long> batchSortedExclusions = resolveBatchSortedExclusions(
+                        batchMap.values(), allSortedExclusions, excludedIdsByGeneration);
                 long batchTotal = countCqlAuthorizedBatch(
-                        duckSession, batchObjects, batch.size(), filter, allowedDataStreams, allowedFois,
-                        exclusions, perGenCounts);
+                        duckSession, batchObjects, batchMap.size(), filter, allowedDataStreams, allowedFois,
+                        exclusions, batchSortedExclusions, exactPredicate, perGenCounts);
                 total = Math.addExact(total, batchTotal);
                 if (perGenCounts != null) {
-                    if (unmutatedCqlCounts.size() >= MAX_CQL_COUNT_CACHE_ENTRIES)
-                        unmutatedCqlCounts.clear();
-                    for (ArchiveGeneration generation : batch) {
+                    for (ArchiveGeneration generation : batchMap.values()) {
                         CqlGenerationCountKey key = cacheKeyByGenId.get(generation.id());
                         if (key != null) {
-                            unmutatedCqlCounts.put(key, perGenCounts.getOrDefault(generation.id(), 0L));
+                            cqlGenerationCounts.put(key, perGenCounts.getOrDefault(generation.id(), 0L));
                         }
                     }
                 }
@@ -1120,6 +1709,66 @@ public final class ParquetArchiveReader {
         }
     }
 
+    private static boolean isGuaranteedZeroMatch(
+            ArchiveGeneration generation,
+            Filter cqlFilter,
+            Map<UUID, GenerationSummary> summariesByGeneration) {
+        if (generation.rowCount() <= 0L || cqlFilter == Filter.EXCLUDE)
+            return true;
+        if (cqlFilter == null || summariesByGeneration == null)
+            return false;
+        GenerationSummary summary = summariesByGeneration.get(generation.id());
+        return summary != null && JsonCqlEvaluator.isGuaranteedZeroMatchBySummary(cqlFilter, summary);
+    }
+
+    private static String resolveGenerationExcludedIdsDigest(
+            ArchiveGeneration generation,
+            Map<UUID, Set<Long>> excludedIdsByGeneration,
+            NavigableSet<Long> excludedNav) {
+        if (excludedIdsByGeneration != null) {
+            Set<Long> genIds = excludedIdsByGeneration.get(generation.id());
+            return computeExcludedIdsDigest(genIds);
+        }
+        if (excludedNav == null || generation.rowCount() <= 0L ||
+                generation.minimumId() > generation.maximumId()) {
+            return "";
+        }
+        NavigableSet<Long> slice = excludedNav.subSet(
+                generation.minimumId(), true, generation.maximumId(), true);
+        return computeSortedExcludedIdsDigest(slice);
+    }
+
+    public static String computeExcludedIdsDigest(Collection<Long> excludedIds) {
+        if (excludedIds == null || excludedIds.isEmpty())
+            return "";
+        if (excludedIds instanceof NavigableSet<Long> sorted && sorted.comparator() == null)
+            return computeSortedExcludedIdsDigest(sorted);
+        return computeSortedExcludedIdsDigest(new TreeSet<>(excludedIds));
+    }
+
+    static String computeSortedExcludedIdsDigest(NavigableSet<Long> sortedExcludedIds) {
+        if (sortedExcludedIds == null || sortedExcludedIds.isEmpty())
+            return "";
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] buf = new byte[8];
+            for (long id : sortedExcludedIds) {
+                buf[0] = (byte) (id >>> 56);
+                buf[1] = (byte) (id >>> 48);
+                buf[2] = (byte) (id >>> 40);
+                buf[3] = (byte) (id >>> 32);
+                buf[4] = (byte) (id >>> 24);
+                buf[5] = (byte) (id >>> 16);
+                buf[6] = (byte) (id >>> 8);
+                buf[7] = (byte) id;
+                digest.update(buf);
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 unavailable", impossible);
+        }
+    }
+
     private static String canonicalIdSetKey(Set<Long> ids) {
         if (ids == null)
             return "*";
@@ -1128,14 +1777,10 @@ public final class ParquetArchiveReader {
         return ids.stream().sorted().map(String::valueOf).collect(Collectors.joining(","));
     }
 
-    private static boolean isEligibleForUnmutatedCqlCache(
-            ArchiveGeneration generation, ObsFilter filter, NavigableSet<Long> excludedNav) {
+    private static boolean isEligibleForCqlCountCache(
+            ArchiveGeneration generation, ObsFilter filter) {
         if (!generation.parityVerified() || generation.start() == null || generation.end() == null)
             return false;
-        if (excludedNav != null &&
-                !excludedNav.subSet(generation.minimumId(), true, generation.maximumId(), true).isEmpty()) {
-            return false;
-        }
         TemporalFilter phenFilter = filter.getPhenomenonTime();
         if (phenFilter != null) {
             if (phenFilter.isLatestTime() || phenFilter.isCurrentTime())
@@ -1194,22 +1839,24 @@ public final class ParquetArchiveReader {
                 (allowedFois != null && allowedFois.isEmpty()))
             return Map.of();
 
-        Map<UUID, Long> countsByGen = new HashMap<>();
-        for (ArchiveGeneration generation : generations) {
-            countsByGen.put(generation.id(), 0L);
+        try (PinnedGenerations ignored = pinGenerationsFor(generations)) {
+            Map<UUID, Long> countsByGen = new HashMap<>();
+            for (ArchiveGeneration generation : generations) {
+                countsByGen.put(generation.id(), 0L);
+            }
+            for (List<ArchiveGeneration> batch : partitionAndBatchForCountCql(generations, filter)) {
+                throwIfInterruptedOrCancelled();
+                List<Long> sortedIds = batch.stream()
+                        .flatMap(gen -> targetIdsByGeneration.getOrDefault(gen.id(), Set.of()).stream())
+                        .distinct()
+                        .sorted()
+                        .toList();
+                if (sortedIds.isEmpty())
+                    continue;
+                accumulateMatchingIdsCqlBatch(batch, sortedIds, filter, allowedDataStreams, allowedFois, countsByGen);
+            }
+            return countsByGen;
         }
-        for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_CQL_PAYLOAD_BATCH)) {
-            throwIfInterruptedOrCancelled();
-            List<Long> sortedIds = batch.stream()
-                    .flatMap(gen -> targetIdsByGeneration.getOrDefault(gen.id(), Set.of()).stream())
-                    .distinct()
-                    .sorted()
-                    .toList();
-            if (sortedIds.isEmpty())
-                continue;
-            accumulateMatchingIdsCqlBatch(batch, sortedIds, filter, allowedDataStreams, allowedFois, countsByGen);
-        }
-        return countsByGen;
     }
 
     private void accumulateMatchingIdsCqlBatch(
@@ -1303,13 +1950,16 @@ public final class ParquetArchiveReader {
             ObsFilter filter,
             Set<Long> allowedDataStreams,
             Set<Long> allowedFois) {
+        recordBatchFileCount(objects.byFilename().size());
         String fileList = objects.byFilename().keySet().stream()
                 .map(path -> "'" + sqlLiteral(path) + "'")
                 .collect(Collectors.joining(","));
         boolean hasCql = filter.getCQLFilter() != null;
+        JsonCqlEvaluator.ProjectedColumnMode mode = resolveProjectedColumnMode(objects.byFilename().values());
         String selectCols = hasCql ? "filename, result_json" : "filename";
         StringBuilder sql = new StringBuilder("SELECT ").append(selectCols)
-                .append(" FROM read_parquet([").append(fileList).append("], filename=true) WHERE id_value >= ? AND id_value <= ?");
+                .append(" FROM read_parquet([").append(fileList)
+                .append("], filename=true, union_by_name=true) WHERE id_value >= ? AND id_value <= ?");
         List<Object> parameters = new ArrayList<>();
         parameters.add(sortedChunkIds.get(0));
         parameters.add(sortedChunkIds.get(sortedChunkIds.size() - 1));
@@ -1332,8 +1982,41 @@ public final class ParquetArchiveReader {
             }
         }
         if (hasCql)
-            JsonCqlEvaluator.appendDuckDbPrefilter(filter.getCQLFilter(), "result_json", sql, parameters);
+            JsonCqlEvaluator.appendDuckDbPrefilter(filter.getCQLFilter(), "result_json", mode, sql, parameters);
         return new QueryPlan(sql.toString(), parameters);
+    }
+
+    private static List<Long> resolveBatchSortedExclusions(
+            Collection<ArchiveGeneration> batchGenerations,
+            NavigableSet<Long> allSortedExclusions,
+            Map<UUID, Set<Long>> excludedIdsByGeneration) {
+        if (excludedIdsByGeneration != null) {
+            NavigableSet<Long> scoped = new TreeSet<>();
+            for (ArchiveGeneration gen : batchGenerations) {
+                Set<Long> genIds = excludedIdsByGeneration.get(gen.id());
+                if (genIds != null && !genIds.isEmpty())
+                    scoped.addAll(genIds);
+            }
+            return scoped.isEmpty() ? List.of() : List.copyOf(scoped);
+        }
+        if (allSortedExclusions == null || allSortedExclusions.isEmpty())
+            return List.of();
+        long minId = Long.MAX_VALUE;
+        long maxId = Long.MIN_VALUE;
+        for (ArchiveGeneration gen : batchGenerations) {
+            if (gen.rowCount() <= 0L)
+                continue;
+            if (gen.minimumId() > gen.maximumId())
+                return List.copyOf(allSortedExclusions);
+            if (gen.minimumId() < minId)
+                minId = gen.minimumId();
+            if (gen.maximumId() > maxId)
+                maxId = gen.maximumId();
+        }
+        if (minId > maxId)
+            return List.of();
+        NavigableSet<Long> slice = allSortedExclusions.subSet(minId, true, maxId, true);
+        return slice.isEmpty() ? List.of() : List.copyOf(slice);
     }
 
     private long countCqlAuthorizedBatch(
@@ -1344,22 +2027,39 @@ public final class ParquetArchiveReader {
             Set<Long> allowedDataStreams,
             Set<Long> allowedFois,
             Set<Long> excludedIds,
+            List<Long> batchSortedExclusions,
+            JsonCqlEvaluator.ExactDuckDbPredicate exactPredicate,
             Map<UUID, Long> perGenCounts) {
+        boolean useExactAggregate = exactPredicate != null;
         try {
             if (shouldProactivelyStage(objects, duckSession.operationDirectory())) {
                 AuthorizedObjects staged = stageAuthorizedObjectsLocally(objects, duckSession.operationDirectory());
                 try {
-                    return executeCountCqlPlan(
-                            duckSession, cqlCountPlan(staged, filter, allowedDataStreams, allowedFois),
-                            staged, filter, excludedIds, false, perGenCounts);
+                    return useExactAggregate
+                            ? executeExactAggregateCountCqlPlan(
+                                    duckSession,
+                                    cqlExactAggregateCountPlan(
+                                            staged, filter, allowedDataStreams, allowedFois,
+                                            batchSortedExclusions, exactPredicate),
+                                    staged, filter, batchSortedExclusions, false, perGenCounts)
+                            : executeCountCqlPlan(
+                                    duckSession, cqlCountPlan(staged, filter, allowedDataStreams, allowedFois),
+                                    staged, filter, excludedIds, false, perGenCounts);
                 } finally {
                     cleanupStagedBatchObjects(staged);
                 }
             }
             try {
-                return executeCountCqlPlan(
-                        duckSession, cqlCountPlan(objects, filter, allowedDataStreams, allowedFois),
-                        objects, filter, excludedIds, true, perGenCounts);
+                return useExactAggregate
+                        ? executeExactAggregateCountCqlPlan(
+                                duckSession,
+                                cqlExactAggregateCountPlan(
+                                        objects, filter, allowedDataStreams, allowedFois,
+                                        batchSortedExclusions, exactPredicate),
+                                objects, filter, batchSortedExclusions, true, perGenCounts)
+                        : executeCountCqlPlan(
+                                duckSession, cqlCountPlan(objects, filter, allowedDataStreams, allowedFois),
+                                objects, filter, excludedIds, true, perGenCounts);
             } catch (Exception directError) {
                 if (!isTransientReadMemoryError(directError))
                     throw directError;
@@ -1367,14 +2067,51 @@ public final class ParquetArchiveReader {
                     perGenCounts.clear();
                 AuthorizedObjects staged = stageAuthorizedObjectsLocally(objects, duckSession.operationDirectory());
                 try {
-                    return executeCountCqlPlan(
-                            duckSession, cqlCountPlan(staged, filter, allowedDataStreams, allowedFois),
-                            staged, filter, excludedIds, false, perGenCounts);
+                    return useExactAggregate
+                            ? executeExactAggregateCountCqlPlan(
+                                    duckSession,
+                                    cqlExactAggregateCountPlan(
+                                            staged, filter, allowedDataStreams, allowedFois,
+                                            batchSortedExclusions, exactPredicate),
+                                    staged, filter, batchSortedExclusions, false, perGenCounts)
+                            : executeCountCqlPlan(
+                                    duckSession, cqlCountPlan(staged, filter, allowedDataStreams, allowedFois),
+                                    staged, filter, excludedIds, false, perGenCounts);
                 } finally {
                     cleanupStagedBatchObjects(staged);
                 }
             }
         } catch (Exception e) {
+            if (objects.byFilename().size() > 1 && isDuckDbOutOfMemoryError(e)) {
+                throwIfInterruptedOrCancelled();
+                List<Map.Entry<String, ArchiveGeneration>> entries = new ArrayList<>(objects.byFilename().entrySet());
+                int mid = entries.size() / 2;
+                Map<String, ArchiveGeneration> leftMap = new LinkedHashMap<>(mid * 2);
+                Map<String, ArchiveGeneration> rightMap = new LinkedHashMap<>((entries.size() - mid) * 2);
+                for (int i = 0; i < entries.size(); i++) {
+                    Map.Entry<String, ArchiveGeneration> entry = entries.get(i);
+                    if (i < mid)
+                        leftMap.put(entry.getKey(), entry.getValue());
+                    else
+                        rightMap.put(entry.getKey(), entry.getValue());
+                }
+                Map<UUID, Long> leftCounts = perGenCounts != null ? new HashMap<>(mid * 2) : null;
+                Map<UUID, Long> rightCounts = perGenCounts != null ? new HashMap<>((entries.size() - mid) * 2) : null;
+                long leftTotal = countCqlAuthorizedBatch(
+                        duckSession, new AuthorizedObjects(leftMap, objects.stampsByGenId()), leftMap.size(),
+                        filter, allowedDataStreams, allowedFois, excludedIds, batchSortedExclusions,
+                        exactPredicate, leftCounts);
+                long rightTotal = countCqlAuthorizedBatch(
+                        duckSession, new AuthorizedObjects(rightMap, objects.stampsByGenId()), rightMap.size(),
+                        filter, allowedDataStreams, allowedFois, excludedIds, batchSortedExclusions,
+                        exactPredicate, rightCounts);
+                if (perGenCounts != null) {
+                    perGenCounts.clear();
+                    perGenCounts.putAll(leftCounts);
+                    perGenCounts.putAll(rightCounts);
+                }
+                return Math.addExact(leftTotal, rightTotal);
+            }
             throw new IllegalStateException("Cannot count CQL matches from " + generationCount +
                     " archive generation(s)", e);
         }
@@ -1398,13 +2135,144 @@ public final class ParquetArchiveReader {
         }
     }
 
-    private QueryPlan cqlCountPlan(AuthorizedObjects objects, ObsFilter filter,
-                                   Set<Long> allowedDataStreams, Set<Long> allowedFois) {
+    private QueryPlan cqlExactAggregateCountPlan(
+            AuthorizedObjects objects,
+            ObsFilter filter,
+            Set<Long> allowedDataStreams,
+            Set<Long> allowedFois,
+            List<Long> batchSortedExclusions,
+            JsonCqlEvaluator.ExactDuckDbPredicate exactPredicate) {
+        recordBatchFileCount(objects.byFilename().size());
         String fileList = objects.byFilename().keySet().stream()
                 .map(path -> "'" + sqlLiteral(path) + "'")
                 .collect(Collectors.joining(","));
+        boolean useTempExclusions = batchSortedExclusions.size() > MAX_INLINE_MUTATION_EXCLUSIONS;
+        StringBuilder sql = new StringBuilder(useTempExclusions
+                ? "SELECT sub.filename, COUNT(*) FROM (SELECT filename, id_value FROM read_parquet(["
+                : "SELECT filename, COUNT(*) FROM read_parquet([")
+                .append(fileList).append("], filename=true, union_by_name=true) WHERE true");
+        List<Object> parameters = new ArrayList<>();
+        if (filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty())
+            appendIn(sql, "id_value", filter.getInternalIDs().stream().map(BigId::getIdAsLong).toList(), parameters);
+        if (!useTempExclusions && !batchSortedExclusions.isEmpty()) {
+            appendNotIn(sql, "id_value", batchSortedExclusions, parameters);
+        }
+        if (allowedDataStreams != null)
+            appendIn(sql, "datastream_id", allowedDataStreams, parameters);
+        if (allowedFois != null) {
+            Set<Long> explicitFois = allowedFois.stream().filter(id -> id != 0L).collect(Collectors.toSet());
+            if (allowedFois.contains(0L)) {
+                sql.append(" AND (foi_id IS NULL");
+                if (!explicitFois.isEmpty()) {
+                    sql.append(" OR foi_id IN (");
+                    appendPlaceholders(sql, explicitFois.size());
+                    sql.append(')');
+                    parameters.addAll(explicitFois);
+                }
+                sql.append(')');
+            } else {
+                appendIn(sql, "foi_id", explicitFois, parameters);
+            }
+        }
+        appendTime(sql, "phenomenon_time", filter.getPhenomenonTime(), parameters);
+        appendTime(sql, "result_time", filter.getResultTime(), parameters);
+        if ("FALSE".equals(exactPredicate.sql())) {
+            sql.append(" AND FALSE");
+        } else if (!"TRUE".equals(exactPredicate.sql())) {
+            sql.append(" AND (").append(exactPredicate.sql()).append(')');
+            parameters.addAll(exactPredicate.parameters());
+        }
+        if (useTempExclusions) {
+            sql.append(") sub WHERE sub.id_value NOT IN (SELECT id_value FROM oscar_cql_excluded_ids) GROUP BY sub.filename");
+        } else {
+            sql.append(" GROUP BY filename");
+        }
+        return new QueryPlan(sql.toString(), parameters);
+    }
+
+    private static void populateTempExcludedIds(java.sql.Connection duckConn, List<Long> sortedExcludedIds) throws SQLException {
+        try (java.sql.Statement ddl = duckConn.createStatement()) {
+            ddl.execute("CREATE TEMP TABLE IF NOT EXISTS oscar_cql_excluded_ids (id_value BIGINT NOT NULL)");
+            ddl.execute("DELETE FROM oscar_cql_excluded_ids");
+        }
+        final int chunkSize = 1_024;
+        for (int offset = 0; offset < sortedExcludedIds.size(); offset += chunkSize) {
+            int end = Math.min(sortedExcludedIds.size(), offset + chunkSize);
+            int count = end - offset;
+            StringBuilder insertSql = new StringBuilder("INSERT INTO oscar_cql_excluded_ids VALUES ");
+            for (int idx = 0; idx < count; idx++) {
+                if (idx > 0)
+                    insertSql.append(',');
+                insertSql.append("(?)");
+            }
+            try (PreparedStatement insert = duckConn.prepareStatement(insertSql.toString())) {
+                for (int idx = 0; idx < count; idx++) {
+                    insert.setLong(idx + 1, sortedExcludedIds.get(offset + idx));
+                }
+                insert.executeUpdate();
+            }
+        }
+    }
+
+    private static void dropTempExcludedIds(java.sql.Connection duckConn) {
+        try (java.sql.Statement cleanup = duckConn.createStatement()) {
+            cleanup.execute("DROP TABLE IF EXISTS oscar_cql_excluded_ids");
+        } catch (Exception ignored) {
+        }
+    }
+
+    private long executeExactAggregateCountCqlPlan(
+            DuckDbResourcePolicy.Session duckSession,
+            QueryPlan plan,
+            AuthorizedObjects objects,
+            ObsFilter filter,
+            List<Long> batchSortedExclusions,
+            boolean directRead,
+            Map<UUID, Long> perGenCounts) throws Exception {
+        if (directRead)
+            maybeInjectDirectReadFault(objects);
+        boolean usedTempExclusions = batchSortedExclusions.size() > MAX_INLINE_MUTATION_EXCLUSIONS;
+        if (usedTempExclusions) {
+            populateTempExcludedIds(duckSession.connection(), batchSortedExclusions);
+        }
+        try {
+            long matched = 0;
+            try (PreparedStatement statement = ConnectionManager.trackCancellableStatement(
+                         duckSession.connection().prepareStatement(plan.sql()), "DuckDB cold CQL aggregate count")) {
+                bind(statement, plan.parameters());
+                try (ResultSet result = statement.executeQuery()) {
+                    while (nextCancellable(result)) {
+                        String filename = result.getString(1);
+                        long fileCount = result.getLong(2);
+                        if (fileCount <= 0L)
+                            continue;
+                        if (perGenCounts != null) {
+                            ArchiveGeneration generation = generationForFilename(objects, filename);
+                            perGenCounts.merge(generation.id(), fileCount, Math::addExact);
+                        }
+                        matched = Math.addExact(matched, fileCount);
+                        if (filter.getLimit() != Long.MAX_VALUE && matched >= filter.getLimit())
+                            return filter.getLimit();
+                    }
+                }
+                return matched;
+            }
+        } finally {
+            if (usedTempExclusions) {
+                dropTempExcludedIds(duckSession.connection());
+            }
+        }
+    }
+
+    private QueryPlan cqlCountPlan(AuthorizedObjects objects, ObsFilter filter,
+                                   Set<Long> allowedDataStreams, Set<Long> allowedFois) {
+        recordBatchFileCount(objects.byFilename().size());
+        String fileList = objects.byFilename().keySet().stream()
+                .map(path -> "'" + sqlLiteral(path) + "'")
+                .collect(Collectors.joining(","));
+        JsonCqlEvaluator.ProjectedColumnMode mode = resolveProjectedColumnMode(objects.byFilename().values());
         StringBuilder sql = new StringBuilder("SELECT filename, id_value, result_json FROM read_parquet([")
-                .append(fileList).append("], filename=true) WHERE true");
+                .append(fileList).append("], filename=true, union_by_name=true) WHERE true");
         List<Object> parameters = new ArrayList<>();
         if (filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty())
             appendIn(sql, "id_value", filter.getInternalIDs().stream().map(BigId::getIdAsLong).toList(), parameters);
@@ -1428,7 +2296,7 @@ public final class ParquetArchiveReader {
         appendTime(sql, "phenomenon_time", filter.getPhenomenonTime(), parameters);
         appendTime(sql, "result_time", filter.getResultTime(), parameters);
         if (filter.getCQLFilter() != null)
-            JsonCqlEvaluator.appendDuckDbPrefilter(filter.getCQLFilter(), "result_json", sql, parameters);
+            JsonCqlEvaluator.appendDuckDbPrefilter(filter.getCQLFilter(), "result_json", mode, sql, parameters);
         return new QueryPlan(sql.toString(), parameters);
     }
 
@@ -1524,6 +2392,20 @@ public final class ParquetArchiveReader {
         DirectReadFaultInjector injector = directReadFaultInjector;
         if (injector != null)
             injector.beforeDirectRead(objects.byFilename().keySet());
+    }
+
+    static boolean isDuckDbOutOfMemoryError(Throwable error) {
+        int depth = 0;
+        for (Throwable current = error; current != null && depth < 16; current = current.getCause(), depth++) {
+            String message = current.getMessage();
+            if (message == null)
+                continue;
+            String normalized = message.toLowerCase(Locale.ROOT);
+            if (normalized.contains("out of memory error") || normalized.contains("failed to allocate data")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static boolean isTransientReadMemoryError(Throwable error) {
@@ -1894,10 +2776,27 @@ public final class ParquetArchiveReader {
         if (n == 0)
             return new AuthorizedObjects(Map.of());
 
-        Path realRoot = resolveRealRoot();
+        Local9pParquetCache localCache = activeLocalStageCache();
         if (n == 1) {
             ArchiveGeneration generation = generations.get(0);
             Path normalizedRelative = validateNormalizedRelativePath(generation.objectPath());
+            if (localCache != null && generation.parityVerified() && generation.sha256() != null) {
+                Long cachedSize = localCache.verifyOrRecallCachedSize(generation.sha256());
+                if (cachedSize != null) {
+                    Path logicalCandidate = root.resolve(normalizedRelative).normalize();
+                    VerificationStamp stamp = new VerificationStamp(
+                            generation.sha256(),
+                            cachedSize,
+                            java.nio.file.attribute.FileTime.fromMillis(0L),
+                            null,
+                            System.nanoTime());
+                    verifiedObjects.put(logicalCandidate, stamp);
+                    return new AuthorizedObjects(
+                            Map.of(canonicalFilename(logicalCandidate), generation),
+                            Map.of(generation.id(), stamp));
+                }
+            }
+            Path realRoot = resolveRealRoot();
             verifyRelativeDirectories(realRoot, normalizedRelative);
             Path object = verifyLeafObject(realRoot, normalizedRelative, generation.sha256());
             VerificationStamp stamp = verifiedObjects.get(object);
@@ -1907,10 +2806,32 @@ public final class ParquetArchiveReader {
         }
 
         Path[] normalizedRelatives = new Path[n];
+        String[] filenames = new String[n];
+        VerificationStamp[] stamps = new VerificationStamp[n];
+        List<Integer> coldVerifyIndices = new ArrayList<>();
         Set<Path> uniqueRelativeDirs = new LinkedHashSet<>();
+
         for (int i = 0; i < n; i++) {
-            Path normalizedRelative = validateNormalizedRelativePath(generations.get(i).objectPath());
+            ArchiveGeneration generation = generations.get(i);
+            Path normalizedRelative = validateNormalizedRelativePath(generation.objectPath());
             normalizedRelatives[i] = normalizedRelative;
+            if (localCache != null && generation.parityVerified() && generation.sha256() != null) {
+                Long cachedSize = localCache.verifyOrRecallCachedSize(generation.sha256());
+                if (cachedSize != null) {
+                    Path logicalCandidate = root.resolve(normalizedRelative).normalize();
+                    VerificationStamp stamp = new VerificationStamp(
+                            generation.sha256(),
+                            cachedSize,
+                            java.nio.file.attribute.FileTime.fromMillis(0L),
+                            null,
+                            System.nanoTime());
+                    verifiedObjects.put(logicalCandidate, stamp);
+                    filenames[i] = canonicalFilename(logicalCandidate);
+                    stamps[i] = stamp;
+                    continue;
+                }
+            }
+            coldVerifyIndices.add(i);
             Path parent = normalizedRelative.getParent();
             if (parent != null) {
                 Path prefix = null;
@@ -1921,31 +2842,33 @@ public final class ParquetArchiveReader {
             }
         }
 
-        Runnable cancellationCheck = ConnectionManager.captureCancellableOperationCheck();
-        if (!uniqueRelativeDirs.isEmpty()) {
-            List<Path> dirList = new ArrayList<>(uniqueRelativeDirs);
-            runParallelSlices(dirList.size(), (start, end) -> {
-                for (int i = start; i < end; i++) {
+        if (!coldVerifyIndices.isEmpty()) {
+            Path realRoot = resolveRealRoot();
+            Runnable cancellationCheck = ConnectionManager.captureCancellableOperationCheck();
+            if (!uniqueRelativeDirs.isEmpty()) {
+                List<Path> dirList = new ArrayList<>(uniqueRelativeDirs);
+                runParallelSlices(dirList.size(), (start, end) -> {
+                    for (int i = start; i < end; i++) {
+                        cancellationCheck.run();
+                        Path relDir = dirList.get(i);
+                        if (Files.isSymbolicLink(realRoot.resolve(relDir)))
+                            throw new IllegalStateException(
+                                    "Archive object path contains a symbolic link: " + root.resolve(relDir));
+                    }
+                });
+            }
+
+            runParallelSlices(coldVerifyIndices.size(), (start, end) -> {
+                for (int m = start; m < end; m++) {
                     cancellationCheck.run();
-                    Path relDir = dirList.get(i);
-                    if (Files.isSymbolicLink(realRoot.resolve(relDir)))
-                        throw new IllegalStateException(
-                                "Archive object path contains a symbolic link: " + root.resolve(relDir));
+                    int idx = coldVerifyIndices.get(m);
+                    Path object = verifyLeafObject(
+                            realRoot, normalizedRelatives[idx], generations.get(idx).sha256());
+                    filenames[idx] = canonicalFilename(object);
+                    stamps[idx] = verifiedObjects.get(object);
                 }
             });
         }
-
-        String[] filenames = new String[n];
-        VerificationStamp[] stamps = new VerificationStamp[n];
-        runParallelSlices(n, (start, end) -> {
-            for (int i = start; i < end; i++) {
-                cancellationCheck.run();
-                Path object = verifyLeafObject(
-                        realRoot, normalizedRelatives[i], generations.get(i).sha256());
-                filenames[i] = canonicalFilename(object);
-                stamps[i] = verifiedObjects.get(object);
-            }
-        });
 
         Map<String, ArchiveGeneration> objects = new LinkedHashMap<>(n * 2);
         Map<UUID, VerificationStamp> stampsByGenId = new HashMap<>(n * 2);
@@ -2031,11 +2954,36 @@ public final class ParquetArchiveReader {
                                 Set<Long> excludedObservationIds,
                                 boolean includeResult, boolean applyLatest, long limit,
                                 boolean ordered) {
+        return queryPlan(objects, filter, allowedDataStreams, allowedFois, excludedObservationIds,
+                includeResult, applyLatest, limit, ordered, null);
+    }
+
+    private QueryPlan queryPlan(AuthorizedObjects objects, ObsFilter filter,
+                                Set<Long> allowedDataStreams, Set<Long> allowedFois,
+                                Set<Long> excludedObservationIds,
+                                boolean includeResult, boolean applyLatest, long limit,
+                                boolean ordered,
+                                JsonCqlEvaluator.ExactDuckDbPredicate exactCqlPredicate) {
+        return queryPlan(objects, filter, allowedDataStreams, allowedFois, excludedObservationIds,
+                includeResult, applyLatest, limit, ordered, exactCqlPredicate, null, null, false);
+    }
+
+    private QueryPlan queryPlan(AuthorizedObjects objects, ObsFilter filter,
+                                Set<Long> allowedDataStreams, Set<Long> allowedFois,
+                                Set<Long> excludedObservationIds,
+                                boolean includeResult, boolean applyLatest, long limit,
+                                boolean ordered,
+                                JsonCqlEvaluator.ExactDuckDbPredicate exactCqlPredicate,
+                                Instant sliceStartInclusive,
+                                Instant sliceEndExclusive,
+                                boolean includeNullPhenomenon) {
         String columns = includeResult ? FULL_COLUMNS : METADATA_COLUMNS;
         String fileList = objects.byFilename().keySet().stream().map(path -> "'" + sqlLiteral(path) + "'")
                 .collect(Collectors.joining(","));
+        JsonCqlEvaluator.ProjectedColumnMode mode = resolveProjectedColumnMode(objects.byFilename().values());
         StringBuilder source = new StringBuilder("SELECT ").append(columns)
-                .append(" FROM read_parquet([").append(fileList).append("], filename=true) WHERE true");
+                .append(" FROM read_parquet([").append(fileList)
+                .append("], filename=true, union_by_name=true) WHERE true");
         List<Object> parameters = new ArrayList<>();
 
         if (filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty())
@@ -2060,9 +3008,29 @@ public final class ParquetArchiveReader {
             }
         }
         appendTime(source, "phenomenon_time", filter.getPhenomenonTime(), parameters);
+        if (sliceStartInclusive != null && sliceEndExclusive != null) {
+            if (includeNullPhenomenon) {
+                source.append(" AND (phenomenon_time IS NULL OR (phenomenon_time >= ? AND phenomenon_time < ?))");
+            } else {
+                source.append(" AND phenomenon_time >= ? AND phenomenon_time < ?");
+            }
+            parameters.add(sliceStartInclusive);
+            parameters.add(sliceEndExclusive);
+        }
         appendTime(source, "result_time", filter.getResultTime(), parameters);
-        if (includeResult && filter.getCQLFilter() != null)
-            JsonCqlEvaluator.appendDuckDbPrefilter(filter.getCQLFilter(), "result_json", source, parameters);
+        if (includeResult && filter.getCQLFilter() != null) {
+            if (exactCqlPredicate != null) {
+                if ("FALSE".equals(exactCqlPredicate.sql())) {
+                    source.append(" AND FALSE");
+                } else if (!"TRUE".equals(exactCqlPredicate.sql())) {
+                    source.append(" AND (").append(exactCqlPredicate.sql()).append(')');
+                    parameters.addAll(exactCqlPredicate.parameters());
+                }
+            } else {
+                JsonCqlEvaluator.appendDuckDbPrefilter(
+                        filter.getCQLFilter(), "result_json", mode, source, parameters);
+            }
+        }
 
         boolean latestPhenomenon = applyLatest && filter.getPhenomenonTime() != null &&
                 filter.getPhenomenonTime().isLatestTime();
@@ -2187,6 +3155,7 @@ public final class ParquetArchiveReader {
         Path logicalPath = root.resolve(normalizedRelative);
         BasicFileAttributes before;
         try {
+            authorizeColdStatCount.incrementAndGet();
             before = Files.readAttributes(candidate, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
         } catch (Exception e) {
             verifiedObjects.remove(candidate);
@@ -2225,12 +3194,39 @@ public final class ParquetArchiveReader {
         return candidate;
     }
 
+    private boolean allHaveFreshInMemoryStamps(List<ArchiveGeneration> generations) {
+        if (generations == null || generations.isEmpty())
+            return true;
+        Path realRoot;
+        try {
+            realRoot = resolveRealRoot();
+        } catch (Exception ignored) {
+            return false;
+        }
+        long now = System.nanoTime();
+        for (ArchiveGeneration generation : generations) {
+            Path rel = generation.objectPath();
+            if (rel == null)
+                return false;
+            Path candidate = realRoot.resolve(rel.normalize()).normalize();
+            VerificationStamp stamp = verifiedObjects.get(candidate);
+            if (stamp == null || !stamp.expectedSha256().equals(generation.sha256()))
+                return false;
+            long age = now - stamp.verifiedAtNanos();
+            if (age < 0 || age > VERIFICATION_TTL_NANOS)
+                return false;
+        }
+        return true;
+    }
+
     public void verifyGenerationObject(ArchiveGeneration generation) {
         Objects.requireNonNull(generation, "generation");
-        Path realRoot = resolveRealRoot();
-        Path normalizedRelative = validateNormalizedRelativePath(generation.objectPath());
-        verifyRelativeDirectories(realRoot, normalizedRelative);
-        verifyLeafObject(realRoot, normalizedRelative, generation.sha256(), false);
+        try (PinnedGenerations ignored = pinGenerations(List.of(generation.id()))) {
+            Path realRoot = resolveRealRoot();
+            Path normalizedRelative = validateNormalizedRelativePath(generation.objectPath());
+            verifyRelativeDirectories(realRoot, normalizedRelative);
+            verifyLeafObject(realRoot, normalizedRelative, generation.sha256(), false);
+        }
     }
 
     private void verifyOnceWithAttributes(
@@ -2408,6 +3404,89 @@ public final class ParquetArchiveReader {
                 Files.createDirectory(pinDir);
             }
             return pinDir;
+        }
+
+        Long verifyOrRecallCachedSize(String sha256) {
+            if (sha256 == null || !SHA256_HEX_PATTERN.matcher(sha256).matches())
+                return null;
+            Path verifyPin = null;
+            try {
+                long recordedSize;
+                synchronized (lock) {
+                    Long tracked = lruSizes.get(sha256);
+                    if (tracked == null || tracked < 0 || tracked > maxBytes)
+                        return null;
+                    recordedSize = tracked;
+                    Path cachedFile = objectPath(sha256);
+                    BasicFileAttributes attrs;
+                    try {
+                        attrs = Files.readAttributes(cachedFile, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                    } catch (IOException missing) {
+                        trackedBytes = Math.max(0L, trackedBytes - recordedSize);
+                        lruSizes.remove(sha256);
+                        digestVerifiedInProcess.remove(sha256);
+                        return null;
+                    }
+                    if (!attrs.isRegularFile() || attrs.isSymbolicLink() || attrs.size() != recordedSize) {
+                        Files.deleteIfExists(cachedFile);
+                        trackedBytes = Math.max(0L, trackedBytes - recordedSize);
+                        lruSizes.remove(sha256);
+                        digestVerifiedInProcess.remove(sha256);
+                        return null;
+                    }
+                    if (digestVerifiedInProcess.contains(sha256))
+                        return recordedSize;
+                    verifyPin = newTempFile();
+                    linkOrCopy(cachedFile, verifyPin);
+                }
+                String actual = ArchiveExporter.sha256(verifyPin);
+                if (!sha256.equals(actual)) {
+                    synchronized (lock) {
+                        Long removed = lruSizes.remove(sha256);
+                        if (removed != null)
+                            trackedBytes = Math.max(0L, trackedBytes - removed);
+                        digestVerifiedInProcess.remove(sha256);
+                        Files.deleteIfExists(objectPath(sha256));
+                    }
+                    return null;
+                }
+                synchronized (lock) {
+                    Long currentSize = lruSizes.get(sha256);
+                    if (currentSize != null && currentSize == recordedSize) {
+                        digestVerifiedInProcess.add(sha256);
+                        return recordedSize;
+                    }
+                    return null;
+                }
+            } catch (Exception ignored) {
+                return null;
+            } finally {
+                if (verifyPin != null) {
+                    try {
+                        Files.deleteIfExists(verifyPin);
+                    } catch (IOException ignored) {
+                    }
+                }
+            }
+        }
+
+        void evictCachedObjects(Collection<String> sha256s) {
+            if (sha256s == null || sha256s.isEmpty())
+                return;
+            synchronized (lock) {
+                for (String sha : sha256s) {
+                    if (sha == null || !SHA256_HEX_PATTERN.matcher(sha).matches())
+                        continue;
+                    Long removed = lruSizes.remove(sha);
+                    if (removed != null)
+                        trackedBytes = Math.max(0L, trackedBytes - removed);
+                    digestVerifiedInProcess.remove(sha);
+                    try {
+                        Files.deleteIfExists(objectPath(sha));
+                    } catch (IOException ignored) {
+                    }
+                }
+            }
         }
 
         boolean verifyCachedObjectOnLocalDisk(String sha256, long expectedSize) {
@@ -2791,17 +3870,19 @@ public final class ParquetArchiveReader {
     }
 
     private final class WindowClusterCursor implements Iterator<ArchivedRow>, AutoCloseable {
-        private final Iterator<List<ArchiveGeneration>> clusters;
+        private final Iterator<ClusterStep> steps;
         private final ObsFilter filter;
         private final Set<Long> allowedDataStreams;
         private final Set<Long> allowedFois;
-        private final Predicate<String> cqlMatcher;
+        private final Predicate<String> fallbackCqlMatcher;
+        private final boolean canAttemptExactCql;
         private final boolean zeroCacheAllowed;
         private final String cqlCacheKey;
         private final String streamsCacheKey;
         private final String foisCacheKey;
         private final boolean nonNullPhenomenonRequired;
         private final boolean nonNullResultTimeRequired;
+        private final PinnedGenerations pinnedGenerations;
         private final AtomicBoolean closed = new AtomicBoolean();
 
         private DuckDbResourcePolicy.Session sharedSession;
@@ -2811,20 +3892,28 @@ public final class ParquetArchiveReader {
         private AuthorizedObjects currentActiveObjects;
         private AuthorizedObjects currentStagedObjects;
         private List<ArchiveGeneration> currentBatchGenerations;
+        private ClusterStep currentStep;
+        private Predicate<String> currentBatchJavaMatcher;
         private Set<UUID> currentBatchMatchedGenIds;
+        private long currentBatchLimit = Long.MAX_VALUE;
+        private long currentBatchEmitted;
         private ArchivedRow prefetchedNext;
         private boolean hasPrefetched;
         private long remaining;
 
-        WindowClusterCursor(Iterator<List<ArchiveGeneration>> clusters, ObsFilter filter,
+        WindowClusterCursor(Iterator<ClusterStep> steps, ObsFilter filter,
                             Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit,
-                            Predicate<String> cqlMatcher) {
-            this.clusters = clusters;
+                            Predicate<String> cqlMatcher, PinnedGenerations pinnedGenerations) {
+            this.steps = steps;
             this.filter = filter;
             this.allowedDataStreams = allowedDataStreams;
             this.allowedFois = allowedFois;
             this.remaining = limit;
-            this.cqlMatcher = cqlMatcher;
+            this.pinnedGenerations = pinnedGenerations;
+            boolean hasLatest = (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
+                    (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
+            this.fallbackCqlMatcher = cqlMatcher;
+            this.canAttemptExactCql = !hasLatest && cqlMatcher != null && filter.getCQLFilter() != null;
             boolean allowCache = cqlMatcher != null &&
                     directReadFaultInjector == null &&
                     (filter.getInternalIDs() == null || filter.getInternalIDs().isEmpty());
@@ -2846,7 +3935,8 @@ public final class ParquetArchiveReader {
                     foisCacheKey,
                     cqlCacheKey,
                     nonNullPhenomenonRequired,
-                    nonNullResultTimeRequired);
+                    nonNullResultTimeRequired,
+                    "");
         }
 
         @Override
@@ -2860,9 +3950,10 @@ public final class ParquetArchiveReader {
                     if (currentResult != null) {
                         while (nextCancellable(currentResult)) {
                             String resultJson = currentResult.getString(10);
-                            if (cqlMatcher != null && !cqlMatcher.test(resultJson)) {
+                            if (currentBatchJavaMatcher != null && !currentBatchJavaMatcher.test(resultJson)) {
                                 continue;
                             }
+                            currentBatchEmitted++;
                             ArchiveGeneration generation = generationForFilename(
                                     currentActiveObjects, currentResult.getString(1));
                             if (currentBatchMatchedGenIds != null) {
@@ -2880,14 +3971,37 @@ public final class ParquetArchiveReader {
                             hasPrefetched = true;
                             return true;
                         }
-                        recordBatchZeroMatches();
+                        if (currentBatchLimit == Long.MAX_VALUE || currentBatchEmitted < currentBatchLimit) {
+                            recordBatchZeroMatches();
+                        }
                         closeCurrentBatch();
+                        if (sharedSession != null && sharedSession.hasWaitingRequests()) {
+                            releaseSharedSession();
+                        }
                     }
-                    if (!clusters.hasNext()) {
+                    if (!steps.hasNext()) {
                         close();
                         return false;
                     }
-                    List<ArchiveGeneration> cluster = clusters.next();
+                    ClusterStep step = steps.next();
+                    List<ArchiveGeneration> cluster = step.generations();
+                    if (zeroCacheAllowed) {
+                        List<ArchiveGeneration> uncachedPreAuth = new ArrayList<>(cluster.size());
+                        for (ArchiveGeneration gen : cluster) {
+                            if (gen.parityVerified() &&
+                                    Long.valueOf(0L).equals(cqlGenerationCounts.getIfPresent(cacheKeyFor(gen)))) {
+                                continue;
+                            }
+                            uncachedPreAuth.add(gen);
+                        }
+                        if (uncachedPreAuth.isEmpty())
+                            continue;
+                        cluster = uncachedPreAuth;
+                    }
+                    if (sharedSession != null &&
+                            (sharedSession.hasWaitingRequests() || !allHaveFreshInMemoryStamps(cluster))) {
+                        releaseSharedSession();
+                    }
                     AuthorizedObjects objects = authorize(cluster);
                     if (objects.byFilename().isEmpty())
                         continue;
@@ -2897,8 +4011,8 @@ public final class ParquetArchiveReader {
                         List<ArchiveGeneration> uncachedGens = new ArrayList<>(cluster.size());
                         for (Map.Entry<String, ArchiveGeneration> entry : objects.byFilename().entrySet()) {
                             ArchiveGeneration gen = entry.getValue();
-                            if (gen.parityVerified() &&
-                                    Long.valueOf(0L).equals(unmutatedCqlCounts.get(cacheKeyFor(gen)))) {
+                            if (gen.rowCount() <= 0L || (gen.parityVerified() &&
+                                    Long.valueOf(0L).equals(cqlGenerationCounts.getIfPresent(cacheKeyFor(gen))))) {
                                 continue;
                             }
                             uncachedMap.put(entry.getKey(), gen);
@@ -2911,7 +4025,7 @@ public final class ParquetArchiveReader {
                             activeGenerations = uncachedGens;
                         }
                     }
-                    openNextBatch(objects, activeGenerations);
+                    openNextBatch(objects, activeGenerations, step);
                 }
             } catch (RuntimeException | Error error) {
                 closeAndSuppress(this, error);
@@ -2922,12 +4036,23 @@ public final class ParquetArchiveReader {
             }
         }
 
-        private void openNextBatch(AuthorizedObjects objects, List<ArchiveGeneration> activeGenerations) {
+        private void openNextBatch(
+                AuthorizedObjects objects,
+                List<ArchiveGeneration> activeGenerations,
+                ClusterStep step) {
             throwIfInterruptedOrCancelled();
-            boolean javaCql = filter.getCQLFilter() != null;
-            final long clusterLimit = javaCql ? Long.MAX_VALUE : remaining;
+            recordBatchFileCount(objects.byFilename().size());
+            boolean hasCql = filter.getCQLFilter() != null;
+            JsonCqlEvaluator.ProjectedColumnMode batchMode = resolveProjectedColumnMode(activeGenerations);
+            JsonCqlEvaluator.ExactDuckDbPredicate batchExactCql = canAttemptExactCql
+                    ? JsonCqlEvaluator.tryBuildExactDuckDbPredicate(
+                            filter.getCQLFilter(), "result_json", batchMode).orElse(null)
+                    : null;
+            final long clusterLimit = (hasCql && batchExactCql == null) ? Long.MAX_VALUE : remaining;
             Function<AuthorizedObjects, QueryPlan> planFactory = auth -> queryPlan(
-                    auth, filter, allowedDataStreams, allowedFois, true, !javaCql, clusterLimit);
+                    auth, filter, allowedDataStreams, allowedFois, Set.of(),
+                    true, !hasCql, clusterLimit, true, batchExactCql,
+                    step.sliceStartInclusive(), step.sliceEndExclusive(), step.includeNullPhenomenon());
             PreparedStatement statement = null;
             ResultSet result = null;
             AuthorizedObjects stagedObjects = null;
@@ -2975,7 +4100,11 @@ public final class ParquetArchiveReader {
                 currentActiveObjects = activeObjects;
                 currentStagedObjects = stagedObjects;
                 currentBatchGenerations = zeroCacheAllowed ? activeGenerations : null;
+                currentStep = step;
+                currentBatchJavaMatcher = batchExactCql != null ? null : fallbackCqlMatcher;
                 currentBatchMatchedGenIds = zeroCacheAllowed ? new java.util.HashSet<>() : null;
+                currentBatchLimit = clusterLimit;
+                currentBatchEmitted = 0;
             } catch (Exception | Error error) {
                 closeAndSuppress(result, error);
                 closeAndSuppress(statement, error);
@@ -2991,12 +4120,16 @@ public final class ParquetArchiveReader {
         private void recordBatchZeroMatches() {
             if (!zeroCacheAllowed || currentBatchGenerations == null || currentBatchMatchedGenIds == null)
                 return;
-            if (unmutatedCqlCounts.size() >= MAX_CQL_COUNT_CACHE_ENTRIES)
-                unmutatedCqlCounts.clear();
+            Instant sliceStart = currentStep != null ? currentStep.sliceStartInclusive() : null;
+            Instant sliceEnd = currentStep != null ? currentStep.sliceEndExclusive() : null;
             for (ArchiveGeneration generation : currentBatchGenerations) {
+                if (sliceStart != null && sliceEnd != null &&
+                        (generation.start().isBefore(sliceStart) || generation.end().isAfter(sliceEnd))) {
+                    continue;
+                }
                 if (!currentBatchMatchedGenIds.contains(generation.id()) &&
-                        isEligibleForUnmutatedCqlCache(generation, filter, null)) {
-                    unmutatedCqlCounts.putIfAbsent(cacheKeyFor(generation), 0L);
+                        isEligibleForCqlCountCache(generation, filter)) {
+                    cqlGenerationCounts.put(cacheKeyFor(generation), 0L);
                 }
             }
         }
@@ -3024,6 +4157,7 @@ public final class ParquetArchiveReader {
             try {
                 failure = closeCurrentBatchAndCollect(failure);
                 failure = closeAndCollect(sharedSession, failure);
+                failure = closeAndCollect(pinnedGenerations, failure);
             } finally {
                 if (sessionCountedInOpenCursors) {
                     openCursors.decrementAndGet();
@@ -3035,6 +4169,18 @@ public final class ParquetArchiveReader {
             }
             if (failure != null)
                 throw new IllegalStateException("Cannot close archive query resources", failure);
+        }
+
+        private void releaseSharedSession() {
+            if (sharedSession == null)
+                return;
+            DuckDbResourcePolicy.Session toClose = sharedSession;
+            sharedSession = null;
+            if (sessionCountedInOpenCursors) {
+                openCursors.decrementAndGet();
+                sessionCountedInOpenCursors = false;
+            }
+            toClose.close();
         }
 
         private void closeCurrentBatch() {
@@ -3053,6 +4199,8 @@ public final class ParquetArchiveReader {
             currentActiveObjects = null;
             currentStagedObjects = null;
             currentBatchGenerations = null;
+            currentStep = null;
+            currentBatchJavaMatcher = null;
             currentBatchMatchedGenIds = null;
             return failure;
         }
@@ -3064,17 +4212,20 @@ public final class ParquetArchiveReader {
         private final ResultSet result;
         private final AuthorizedObjects objects;
         private final AuthorizedObjects stagedObjects;
+        private final PinnedGenerations pinnedGenerations;
         private final AtomicBoolean closed = new AtomicBoolean();
         private ArchivedRow next;
         private boolean prefetched;
 
         RowCursor(DuckDbResourcePolicy.Session duckSession, PreparedStatement statement, ResultSet result,
-                  AuthorizedObjects objects, AuthorizedObjects stagedObjects) {
+                  AuthorizedObjects objects, AuthorizedObjects stagedObjects,
+                  PinnedGenerations pinnedGenerations) {
             this.duckSession = duckSession;
             this.statement = statement;
             this.result = result;
             this.objects = objects;
             this.stagedObjects = stagedObjects;
+            this.pinnedGenerations = pinnedGenerations;
         }
 
         @Override
@@ -3124,6 +4275,7 @@ public final class ParquetArchiveReader {
                 if (stagedObjects != null)
                     cleanupStagedBatchObjects(stagedObjects);
                 failure = closeAndCollect(duckSession, failure);
+                failure = closeAndCollect(pinnedGenerations, failure);
             } finally {
                 openCursors.decrementAndGet();
                 next = null;
