@@ -58,6 +58,10 @@ public final class ArchiveCatalog {
             "sha256:7aa2b6dd22cbed4499eb9fb16966323bbf90d14bff4d35e03a1670868fb2f8e8";
     static final long MAX_BACKUP_ARCHIVE_GENERATIONS = 1_000_000L;
     static final long MAX_BACKUP_ARCHIVE_GENERATION_INVENTORY_BYTES = 37_000_000L;
+    static final int SUMMARY_GENERATION_BATCH_SIZE = 2_048;
+    static final long SCHEMA_REINDEX_SMALL_TABLE_BYTES = 256L * 1024L * 1024L;
+    static final long SCHEMA_REINDEX_MIN_DEAD_TUPLES = 50_000L;
+    static final double SCHEMA_REINDEX_MIN_DEAD_RATIO = 0.10d;
     private static final long MIGRATION_LOCK = 0x4f5343415253544fL;
 
     private final SqlConnectionProvider connections;
@@ -1634,11 +1638,21 @@ public final class ArchiveCatalog {
                                               Long minObservationId, Long maxObservationId,
                                               Set<Long> dataStreams, Instant minResultTime,
                                               Instant maxResultTime) {
-        if (dataStreams != null && dataStreams.isEmpty())
+        return candidates(start, end, observationId, minObservationId, maxObservationId,
+                dataStreams, minResultTime, maxResultTime, null);
+    }
+
+    public List<ArchiveGeneration> candidates(Instant start, Instant end, Long observationId,
+                                              Long minObservationId, Long maxObservationId,
+                                              Set<Long> dataStreams, Instant minResultTime,
+                                              Instant maxResultTime, Set<String> allowedProfiles) {
+        if ((dataStreams != null && dataStreams.isEmpty()) ||
+                (allowedProfiles != null && allowedProfiles.isEmpty()))
             return List.of();
         try (Connection connection = connections.open()) {
             return candidates(connection, start, end, observationId,
-                    minObservationId, maxObservationId, dataStreams, minResultTime, maxResultTime);
+                    minObservationId, maxObservationId, dataStreams, minResultTime, maxResultTime,
+                    allowedProfiles);
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot plan archive query", e);
         }
@@ -1652,7 +1666,7 @@ public final class ArchiveCatalog {
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
                                                Instant end, Long observationId)
             throws SQLException {
-        return candidates(connection, start, end, observationId, null, null, null, null, null);
+        return candidates(connection, start, end, observationId, null, null, null, null, null, null);
     }
 
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
@@ -1661,7 +1675,7 @@ public final class ArchiveCatalog {
                                                Set<Long> dataStreams)
             throws SQLException {
         return candidates(connection, start, end, observationId,
-                minObservationId, maxObservationId, dataStreams, null, null);
+                minObservationId, maxObservationId, dataStreams, null, null, null);
     }
 
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
@@ -1670,7 +1684,7 @@ public final class ArchiveCatalog {
                                                Set<Long> dataStreams, Instant minResultTime)
             throws SQLException {
         return candidates(connection, start, end, observationId,
-                minObservationId, maxObservationId, dataStreams, minResultTime, null);
+                minObservationId, maxObservationId, dataStreams, minResultTime, null, null);
     }
 
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
@@ -1679,19 +1693,33 @@ public final class ArchiveCatalog {
                                                Set<Long> dataStreams, Instant minResultTime,
                                                Instant maxResultTime)
             throws SQLException {
-        if (dataStreams != null && dataStreams.isEmpty())
+        return candidates(connection, start, end, observationId,
+                minObservationId, maxObservationId, dataStreams, minResultTime, maxResultTime, null);
+    }
+
+    public List<ArchiveGeneration> candidates(Connection connection, Instant start,
+                                               Instant end, Long observationId,
+                                               Long minObservationId, Long maxObservationId,
+                                               Set<Long> dataStreams, Instant minResultTime,
+                                               Instant maxResultTime, Set<String> allowedProfiles)
+            throws SQLException {
+        if ((dataStreams != null && dataStreams.isEmpty()) ||
+                (allowedProfiles != null && allowedProfiles.isEmpty()))
             return List.of();
         boolean filterIdRange = observationId == null &&
                 minObservationId != null && maxObservationId != null;
         boolean filterDataStreams = dataStreams != null;
+        boolean filterProfiles = allowedProfiles != null;
         String sql = (observationId != null ? "SELECT DISTINCT " : "SELECT ") +
                 "g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
                 "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
                 "FROM oscar_archive_generation g ";
         if (observationId != null)
             sql += "JOIN oscar_archive_id_block b ON b.generation_id=g.id ";
-        sql += "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
-                "AND g.window_start < ? AND g.window_end > ? ";
+        sql += "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') ";
+        if (filterProfiles)
+            sql += "AND g.profile=ANY (?::text[]) ";
+        sql += "AND g.window_start < ? AND g.window_end > ? ";
         if (minResultTime != null)
             sql += "AND (g.max_result_time IS NULL OR g.max_result_time >= ?) ";
         if (maxResultTime != null)
@@ -1706,6 +1734,9 @@ public final class ArchiveCatalog {
         sql += "ORDER BY g.window_start, g.id";
 
         List<ArchiveGeneration> generations = new ArrayList<>();
+        java.sql.Array profileArray = filterProfiles
+                ? connection.createArrayOf("text", allowedProfiles.toArray(String[]::new))
+                : null;
         java.sql.Array streamArray = filterDataStreams
                 ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                 : null;
@@ -1724,6 +1755,8 @@ public final class ArchiveCatalog {
                 int parameter = 1;
                 statement.setString(parameter++, storeKey);
                 statement.setInt(parameter++, idScope);
+                if (profileArray != null)
+                    statement.setArray(parameter++, profileArray);
                 UtcJdbcTime.setInstant(statement, parameter++, end);
                 UtcJdbcTime.setInstant(statement, parameter++, start);
                 if (minResultTime != null)
@@ -1745,6 +1778,8 @@ public final class ArchiveCatalog {
                 }
             }
         } finally {
+            if (profileArray != null)
+                profileArray.free();
             if (streamArray != null)
                 streamArray.free();
         }
@@ -1903,7 +1938,13 @@ public final class ArchiveCatalog {
      */
     public List<ArchiveGeneration> candidatesPotentiallyNewerThanResultTime(
             Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime) {
-        return candidates(start, end, null, null, null, dataStreams, minResultTime, null);
+        return candidates(start, end, null, null, null, dataStreams, minResultTime, null, null);
+    }
+
+    public List<ArchiveGeneration> candidatesPotentiallyNewerThanResultTime(
+            Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime,
+            Set<String> allowedProfiles) {
+        return candidates(start, end, null, null, null, dataStreams, minResultTime, null, allowedProfiles);
     }
 
     /**
@@ -1953,19 +1994,31 @@ public final class ArchiveCatalog {
     public InitialCandidateBatch candidatesInitialClusters(
             Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime,
             Instant maxResultTime, boolean descending, int batchLimit) {
+        return candidatesInitialClusters(
+                start, end, dataStreams, minResultTime, maxResultTime, descending, batchLimit, null);
+    }
+
+    public InitialCandidateBatch candidatesInitialClusters(
+            Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime,
+            Instant maxResultTime, boolean descending, int batchLimit,
+            Set<String> allowedProfiles) {
         if (batchLimit < 2)
             throw new IllegalArgumentException("Candidate batch limit must be at least 2");
-        if (dataStreams != null && dataStreams.isEmpty())
+        if ((dataStreams != null && dataStreams.isEmpty()) ||
+                (allowedProfiles != null && allowedProfiles.isEmpty()))
             return new InitialCandidateBatch(List.of(), true);
         boolean filterDataStreams = dataStreams != null;
+        boolean filterProfiles = allowedProfiles != null;
         String orderBy = descending
                 ? "ORDER BY g.window_end DESC, g.window_start DESC, g.id ASC LIMIT ?"
                 : "ORDER BY g.window_start ASC, g.window_end ASC, g.id ASC LIMIT ?";
         String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
                 "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
                 "FROM oscar_archive_generation g " +
-                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
-                "AND g.window_start < ? AND g.window_end > ? ";
+                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') ";
+        if (filterProfiles)
+            sql += "AND g.profile=ANY (?::text[]) ";
+        sql += "AND g.window_start < ? AND g.window_end > ? ";
         if (minResultTime != null)
             sql += "AND (g.max_result_time IS NULL OR g.max_result_time >= ?) ";
         if (maxResultTime != null)
@@ -1977,6 +2030,9 @@ public final class ArchiveCatalog {
 
         List<ArchiveGeneration> fetched = new ArrayList<>();
         try (Connection connection = connections.open()) {
+            java.sql.Array profileArray = filterProfiles
+                    ? connection.createArrayOf("text", allowedProfiles.toArray(String[]::new))
+                    : null;
             java.sql.Array streamArray = filterDataStreams
                     ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                     : null;
@@ -1995,6 +2051,8 @@ public final class ArchiveCatalog {
                     int parameter = 1;
                     statement.setString(parameter++, storeKey);
                     statement.setInt(parameter++, idScope);
+                    if (profileArray != null)
+                        statement.setArray(parameter++, profileArray);
                     UtcJdbcTime.setInstant(statement, parameter++, end);
                     UtcJdbcTime.setInstant(statement, parameter++, start);
                     if (minResultTime != null)
@@ -2010,6 +2068,8 @@ public final class ArchiveCatalog {
                     }
                 }
             } finally {
+                if (profileArray != null)
+                    profileArray.free();
                 if (streamArray != null)
                     streamArray.free();
             }
@@ -2040,7 +2100,7 @@ public final class ArchiveCatalog {
         }
         if (clusters.size() < 2) {
             List<ArchiveGeneration> all = candidates(
-                    start, end, null, null, null, dataStreams, minResultTime, maxResultTime);
+                    start, end, null, null, null, dataStreams, minResultTime, maxResultTime, allowedProfiles);
             return new InitialCandidateBatch(all, true);
         }
         List<List<ArchiveGeneration>> completeClusters = descending
@@ -2054,10 +2114,23 @@ public final class ArchiveCatalog {
         return new InitialCandidateBatch(completePrefix, false);
     }
 
+    static boolean shouldReindexArchiveSchema(long relationBytes, long deadTuples, long liveTuples) {
+        if (relationBytes < SCHEMA_REINDEX_SMALL_TABLE_BYTES)
+            return true;
+        if (deadTuples >= SCHEMA_REINDEX_MIN_DEAD_TUPLES)
+            return true;
+        return liveTuples > 0L && (double) deadTuples >= liveTuples * SCHEMA_REINDEX_MIN_DEAD_RATIO;
+    }
+
     /**
      * Rebuilds B-tree indexes online on the mutable observation parent table
      * and its companion datastream metadata table so multi-year DELETE/UPDATE
      * churn cannot accumulate unbounded dead index pages.
+     *
+     * <p>Reindexing {@code oscar_archive_schema} is bloat-gated once the table
+     * exceeds {@code 256 MiB} so multi-year append-only {@code RAW_TELEMETRY}
+     * archives do not pay multi-gigabyte nightly B-tree rebuilds while still
+     * reclaiming dead pages after large compactions or purges.</p>
      */
     public void reindexMutableTables(String observationTable, String dataStreamTable) {
         String observations = safeIdentifier(observationTable);
@@ -2072,7 +2145,19 @@ public final class ArchiveCatalog {
                     statement.execute("REINDEX TABLE CONCURRENTLY " + observations);
                     statement.execute("REINDEX TABLE CONCURRENTLY oscar_obs_stage_owner");
                 }
-                statement.execute("REINDEX TABLE CONCURRENTLY oscar_archive_schema");
+                boolean reindexArchiveSchema = true;
+                try (ResultSet stats = statement.executeQuery(
+                        "SELECT COALESCE(pg_relation_size('oscar_archive_schema'::regclass), 0), " +
+                                "COALESCE(s.n_dead_tup, 0), COALESCE(s.n_live_tup, 0) " +
+                                "FROM pg_stat_user_tables s " +
+                                "WHERE s.relid = 'oscar_archive_schema'::regclass")) {
+                    if (stats.next()) {
+                        reindexArchiveSchema = shouldReindexArchiveSchema(
+                                stats.getLong(1), stats.getLong(2), stats.getLong(3));
+                    }
+                }
+                if (reindexArchiveSchema)
+                    statement.execute("REINDEX TABLE CONCURRENTLY oscar_archive_schema");
                 statement.execute("REINDEX TABLE CONCURRENTLY " + dataStreams);
             } finally {
                 if (!oldAutoCommit)
@@ -2526,6 +2611,47 @@ public final class ArchiveCatalog {
             throw new IllegalStateException("Cannot inspect archived datastreams", e);
         }
         return present;
+    }
+
+    /**
+     * Returns the subset of {@code dataStreams} that currently appear in any
+     * active/sealed telemetry-only generation ({@code RAW_TELEMETRY} or
+     * {@code DAILY_TELEMETRY}). Used once per event datastream to confirm
+     * whether pure event queries can safely restrict catalog scans to
+     * {@link TieredArchiveConfig#EVENT_QUERY_PROFILES} without risking
+     * invisibility if a future release promotes a formerly-telemetry output.
+     */
+    public Set<Long> dataStreamsWithTelemetryProfiles(Collection<Long> dataStreams) {
+        if (dataStreams == null || dataStreams.isEmpty())
+            return Set.of();
+        String sql = "SELECT u.ds_id " +
+                "FROM unnest(?::bigint[]) AS u(ds_id) " +
+                "WHERE EXISTS (" +
+                "SELECT 1 FROM oscar_archive_schema s " +
+                "JOIN oscar_archive_generation g ON g.id = s.generation_id " +
+                "WHERE s.datastream_id = u.ds_id " +
+                "AND g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                "AND g.profile IN ('" + TieredArchiveConfig.PROFILE_RAW_TELEMETRY +
+                "','" + TieredArchiveConfig.PROFILE_DAILY_TELEMETRY + "'))";
+        Set<Long> inTelemetry = new HashSet<>();
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            java.sql.Array streamArray = connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new));
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setArray(1, streamArray);
+                statement.setString(2, storeKey);
+                statement.setInt(3, idScope);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next())
+                        inTelemetry.add(result.getLong(1));
+                }
+            } finally {
+                streamArray.free();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect telemetry profile presence for datastreams", e);
+        }
+        return inTelemetry;
     }
 
     private static ArchiveGeneration readGeneration(ResultSet result) throws SQLException {
@@ -3593,35 +3719,37 @@ public final class ArchiveCatalog {
             return List.of();
 
         boolean filterStreams = dataStreams != null;
-        boolean omitGenFilter = filterStreams && working.size() > 64;
         String sql = "SELECT s.generation_id FROM oscar_archive_schema s WHERE " +
-                (omitGenFilter
-                        ? "s.datastream_id=ANY (?::bigint[])"
-                        : "s.generation_id=ANY (?::uuid[])" +
-                          (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "")) +
+                "s.generation_id=ANY (?::uuid[])" +
+                (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "") +
                 " GROUP BY s.generation_id " +
                 "HAVING BOOL_AND(s.summary_populated) AND COALESCE(SUM(" + summaryExpr + "), 0) = 0";
         Set<UUID> prune = new HashSet<>();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
-            java.sql.Array genArray = omitGenFilter ? null : connection.createArrayOf("uuid",
-                    working.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
             java.sql.Array streamArray = filterStreams
                     ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                     : null;
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                int param = 1;
-                if (genArray != null)
-                    statement.setArray(param++, genArray);
-                if (streamArray != null)
-                    statement.setArray(param, streamArray);
-                try (ResultSet result = statement.executeQuery()) {
-                    while (result.next())
-                        prune.add(result.getObject(1, UUID.class));
+                for (int offset = 0; offset < working.size(); offset += SUMMARY_GENERATION_BATCH_SIZE) {
+                    int end = Math.min(offset + SUMMARY_GENERATION_BATCH_SIZE, working.size());
+                    UUID[] batchIds = new UUID[end - offset];
+                    for (int i = offset; i < end; i++)
+                        batchIds[i - offset] = working.get(i).id();
+                    java.sql.Array genArray = connection.createArrayOf("uuid", batchIds);
+                    try {
+                        statement.setArray(1, genArray);
+                        if (streamArray != null)
+                            statement.setArray(2, streamArray);
+                        try (ResultSet result = statement.executeQuery()) {
+                            while (result.next())
+                                prune.add(result.getObject(1, UUID.class));
+                        }
+                    } finally {
+                        genArray.free();
+                    }
                 }
             } finally {
-                if (genArray != null)
-                    genArray.free();
                 if (streamArray != null)
                     streamArray.free();
             }
@@ -3786,7 +3914,6 @@ public final class ArchiveCatalog {
         String tcExactExpr = checkTimeContained ? timeContainedSpec.exactExpr() : "0::bigint";
 
         boolean filterStreams = dataStreams != null;
-        boolean omitGenFilter = filterStreams && working.size() > 64;
         String sql = "SELECT s.generation_id, " +
                 "BOOL_AND(s.summary_populated), " +
                 "COALESCE(SUM(" + upperExpr + "), 0)::bigint, " +
@@ -3797,11 +3924,8 @@ public final class ArchiveCatalog {
                         : "") +
                 " FROM oscar_archive_schema s " +
                 (checkTimeContained ? "LEFT JOIN oscar_archive_schema_blob b ON b.schema_sha256 = s.schema_sha256 " : "") +
-                "WHERE " +
-                (omitGenFilter
-                        ? "s.datastream_id=ANY (?::bigint[])"
-                        : "s.generation_id=ANY (?::uuid[])" +
-                          (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "")) +
+                "WHERE s.generation_id=ANY (?::uuid[])" +
+                (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "") +
                 " GROUP BY s.generation_id";
 
         Map<UUID, Boolean> populatedByGen = new HashMap<>();
@@ -3812,33 +3936,38 @@ public final class ArchiveCatalog {
         Map<UUID, Long> tcExactByGen = checkTimeContained ? new HashMap<>() : Map.of();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
-            java.sql.Array genArray = omitGenFilter ? null : connection.createArrayOf("uuid",
-                    working.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
             java.sql.Array streamArray = filterStreams
                     ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                     : null;
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                int param = 1;
-                if (genArray != null)
-                    statement.setArray(param++, genArray);
-                if (streamArray != null)
-                    statement.setArray(param, streamArray);
-                try (ResultSet result = statement.executeQuery()) {
-                    while (result.next()) {
-                        UUID genId = result.getObject(1, UUID.class);
-                        populatedByGen.put(genId, result.getBoolean(2));
-                        upperByGen.put(genId, result.getLong(3));
-                        exactReadyByGen.put(genId, result.getBoolean(4));
-                        exactByGen.put(genId, result.getLong(5));
-                        if (checkTimeContained) {
-                            tcReadyByGen.put(genId, result.getBoolean(6));
-                            tcExactByGen.put(genId, result.getLong(7));
+                for (int offset = 0; offset < working.size(); offset += SUMMARY_GENERATION_BATCH_SIZE) {
+                    int end = Math.min(offset + SUMMARY_GENERATION_BATCH_SIZE, working.size());
+                    UUID[] batchIds = new UUID[end - offset];
+                    for (int i = offset; i < end; i++)
+                        batchIds[i - offset] = working.get(i).id();
+                    java.sql.Array genArray = connection.createArrayOf("uuid", batchIds);
+                    try {
+                        statement.setArray(1, genArray);
+                        if (streamArray != null)
+                            statement.setArray(2, streamArray);
+                        try (ResultSet result = statement.executeQuery()) {
+                            while (result.next()) {
+                                UUID genId = result.getObject(1, UUID.class);
+                                populatedByGen.put(genId, result.getBoolean(2));
+                                upperByGen.put(genId, result.getLong(3));
+                                exactReadyByGen.put(genId, result.getBoolean(4));
+                                exactByGen.put(genId, result.getLong(5));
+                                if (checkTimeContained) {
+                                    tcReadyByGen.put(genId, result.getBoolean(6));
+                                    tcExactByGen.put(genId, result.getLong(7));
+                                }
+                            }
                         }
+                    } finally {
+                        genArray.free();
                     }
                 }
             } finally {
-                if (genArray != null)
-                    genArray.free();
                 if (streamArray != null)
                     streamArray.free();
             }
@@ -4215,7 +4344,6 @@ public final class ArchiveCatalog {
         String tcExactExpr = checkTimeContained ? timeContainedSpec.exactExpr() : "0::bigint";
 
         boolean filterStreams = dataStreams != null;
-        boolean omitGenFilter = filterStreams && candidates.size() > 64;
         String sql = "SELECT s.generation_id, BOOL_AND(s.summary_populated), " +
                 "COALESCE(SUM(" + upperExpr + "), 0)::bigint, " +
                 "BOOL_AND(" + exactReadyExpr + "), " +
@@ -4224,11 +4352,8 @@ public final class ArchiveCatalog {
                 "COALESCE(SUM(" + tcExactExpr + "), 0)::bigint " +
                 "FROM oscar_archive_schema s " +
                 (checkTimeContained ? "LEFT JOIN oscar_archive_schema_blob b ON b.schema_sha256 = s.schema_sha256 " : "") +
-                "WHERE " +
-                (omitGenFilter
-                        ? "s.datastream_id=ANY (?::bigint[])"
-                        : "s.generation_id=ANY (?::uuid[])" +
-                          (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "")) +
+                "WHERE s.generation_id=ANY (?::uuid[])" +
+                (filterStreams ? " AND s.datastream_id=ANY (?::bigint[])" : "") +
                 " GROUP BY s.generation_id";
         Map<UUID, Boolean> populatedByGen = new HashMap<>();
         Map<UUID, Long> upperByGen = new HashMap<>();
@@ -4238,33 +4363,38 @@ public final class ArchiveCatalog {
         Map<UUID, Long> tcExactByGen = checkTimeContained ? new HashMap<>() : Map.of();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
-            java.sql.Array genArray = omitGenFilter ? null : connection.createArrayOf("uuid",
-                    candidates.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
             java.sql.Array streamArray = filterStreams
                     ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
                     : null;
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                int param = 1;
-                if (genArray != null)
-                    statement.setArray(param++, genArray);
-                if (streamArray != null)
-                    statement.setArray(param, streamArray);
-                try (ResultSet result = statement.executeQuery()) {
-                    while (result.next()) {
-                        UUID genId = result.getObject(1, UUID.class);
-                        populatedByGen.put(genId, result.getBoolean(2));
-                        upperByGen.put(genId, result.getLong(3));
-                        exactReadyByGen.put(genId, result.getBoolean(4));
-                        exactByGen.put(genId, result.getLong(5));
-                        if (checkTimeContained) {
-                            tcReadyByGen.put(genId, result.getBoolean(6));
-                            tcExactByGen.put(genId, result.getLong(7));
+                for (int offset = 0; offset < candidates.size(); offset += SUMMARY_GENERATION_BATCH_SIZE) {
+                    int end = Math.min(offset + SUMMARY_GENERATION_BATCH_SIZE, candidates.size());
+                    UUID[] batchIds = new UUID[end - offset];
+                    for (int i = offset; i < end; i++)
+                        batchIds[i - offset] = candidates.get(i).id();
+                    java.sql.Array genArray = connection.createArrayOf("uuid", batchIds);
+                    try {
+                        statement.setArray(1, genArray);
+                        if (streamArray != null)
+                            statement.setArray(2, streamArray);
+                        try (ResultSet result = statement.executeQuery()) {
+                            while (result.next()) {
+                                UUID genId = result.getObject(1, UUID.class);
+                                populatedByGen.put(genId, result.getBoolean(2));
+                                upperByGen.put(genId, result.getLong(3));
+                                exactReadyByGen.put(genId, result.getBoolean(4));
+                                exactByGen.put(genId, result.getLong(5));
+                                if (checkTimeContained) {
+                                    tcReadyByGen.put(genId, result.getBoolean(6));
+                                    tcExactByGen.put(genId, result.getLong(7));
+                                }
+                            }
                         }
+                    } finally {
+                        genArray.free();
                     }
                 }
             } finally {
-                if (genArray != null)
-                    genArray.free();
                 if (streamArray != null)
                     streamArray.free();
             }
@@ -4588,24 +4718,31 @@ public final class ArchiveCatalog {
                 "AND generation.store_key=tombstone.store_key AND generation.id_scope=tombstone.id_scope " +
                 "AND generation.state IN ('ACTIVE','SEALED')";
         Map<UUID, Set<Long>> byGeneration = new HashMap<>();
+        List<UUID> idList = generationIds instanceof List<UUID> list ? list : new ArrayList<>(generationIds);
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
-            java.sql.Array genArray = connection.createArrayOf("uuid", generationIds.toArray());
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                statement.setArray(1, genArray);
                 statement.setString(2, storeKey);
                 statement.setInt(3, idScope);
                 statement.setString(4, storeKey);
                 statement.setInt(5, idScope);
-                try (ResultSet result = statement.executeQuery()) {
-                    while (result.next()) {
-                        UUID genId = result.getObject(1, UUID.class);
-                        long obsId = result.getLong(2);
-                        byGeneration.computeIfAbsent(genId, ignored -> new HashSet<>()).add(obsId);
+                for (int offset = 0; offset < idList.size(); offset += SUMMARY_GENERATION_BATCH_SIZE) {
+                    int end = Math.min(offset + SUMMARY_GENERATION_BATCH_SIZE, idList.size());
+                    UUID[] batchIds = idList.subList(offset, end).toArray(UUID[]::new);
+                    java.sql.Array genArray = connection.createArrayOf("uuid", batchIds);
+                    try {
+                        statement.setArray(1, genArray);
+                        try (ResultSet result = statement.executeQuery()) {
+                            while (result.next()) {
+                                UUID genId = result.getObject(1, UUID.class);
+                                long obsId = result.getLong(2);
+                                byGeneration.computeIfAbsent(genId, ignored -> new HashSet<>()).add(obsId);
+                            }
+                        }
+                    } finally {
+                        genArray.free();
                     }
                 }
-            } finally {
-                genArray.free();
             }
             return byGeneration;
         } catch (SQLException e) {

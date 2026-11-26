@@ -29,6 +29,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -393,6 +394,10 @@ public final class JsonCqlEvaluator {
             Optional<SummaryCounterSpec> disjointStringOr = disjointStringEqualityOrSummarySpec(or);
             if (disjointStringOr.isPresent()) {
                 return disjointStringOr;
+            }
+            Optional<SummaryCounterSpec> tamperOrFault = tamperOrFaultSummarySpec(or);
+            if (tamperOrFault.isPresent()) {
+                return tamperOrFault;
             }
             if (!or.getChildren().isEmpty()) {
                 List<String> childUpperExprs = new ArrayList<>(or.getChildren().size());
@@ -1095,14 +1100,67 @@ public final class JsonCqlEvaluator {
         }
         if (byValue.isEmpty())
             return Optional.empty();
-        if (byValue.size() == 1)
-            return Optional.of(byValue.values().iterator().next());
+        return Optional.of(combineDisjointSummarySpecs(byValue.values()));
+    }
 
-        List<String> uppers = new ArrayList<>(byValue.size());
-        List<String> exacts = new ArrayList<>(byValue.size());
+    /**
+     * Maps {@code tamperStatus = true OR alarmState = 'Fault - ...' [OR ...]}
+     * (used by the Viewer fault-history {@code StatusTable} {@code 24h}/{@code 7d}/{@code 15d}
+     * counts and pagination) to an exact per-datastream summary expression.
+     *
+     * <p>Across OSCAR lanes, {@code tamperStatus} lives on the {@code tamper}
+     * stream whereas {@code alarmState} lives on detector/occupancy streams.
+     * Requiring {@code (COALESCE(s.tamper_true_count, 0) = 0 OR <faultExact> = 0)}
+     * inside {@code exactReadyExpr} guarantees exactness with zero double-counting:
+     * any single {@code (generation_id, datastream_id)} row containing only one
+     * side sums purely in PostgreSQL, while a hypothetical combined stream
+     * containing both automatically falls back to DuckDB.</p>
+     */
+    private static Optional<SummaryCounterSpec> tamperOrFaultSummarySpec(Or or) {
+        List<Filter> disjuncts = new ArrayList<>();
+        flattenOrChildren(or, disjuncts);
+        if (disjuncts.isEmpty())
+            return Optional.empty();
+        boolean hasTamperTrue = false;
+        Map<String, SummaryCounterSpec> alarmStateSpecs = new LinkedHashMap<>();
+        for (Filter child : disjuncts) {
+            if (!(child instanceof PropertyIsEqualTo eq))
+                return Optional.empty();
+            if (eq.getExpression1() instanceof PropertyName prop &&
+                    "tamperStatus".equals(prop.getPropertyName()) &&
+                    eq.getExpression2() instanceof Literal lit &&
+                    Boolean.TRUE.equals(lit.getValue())) {
+                hasTamperTrue = true;
+                continue;
+            }
+            Optional<DisjointStringTerm> termOpt = singleDisjointStringSummarySpec(eq);
+            if (termOpt.isEmpty() || !"alarmState".equals(termOpt.get().propertyName()))
+                return Optional.empty();
+            alarmStateSpecs.putIfAbsent(termOpt.get().literalValue(), termOpt.get().spec());
+        }
+        if (!hasTamperTrue)
+            return Optional.empty();
+        String tamperExpr = "COALESCE(s.tamper_true_count, 0)";
+        if (alarmStateSpecs.isEmpty()) {
+            return Optional.of(new SummaryCounterSpec(tamperExpr, tamperExpr, "s.summary_populated"));
+        }
+        SummaryCounterSpec faultSpec = combineDisjointSummarySpecs(alarmStateSpecs.values());
+        String upper = "(" + tamperExpr + " + " + faultSpec.upperBoundExpr() + ")";
+        String exact = "(" + tamperExpr + " + " + faultSpec.exactExpr() + ")";
+        String ready = "(" + faultSpec.exactReadyExpr() +
+                " AND (" + tamperExpr + " = 0 OR " + faultSpec.exactExpr() + " = 0))";
+        return Optional.of(new SummaryCounterSpec(upper, exact, ready));
+    }
+
+    private static SummaryCounterSpec combineDisjointSummarySpecs(
+            Collection<SummaryCounterSpec> specs) {
+        if (specs.size() == 1)
+            return specs.iterator().next();
+        List<String> uppers = new ArrayList<>(specs.size());
+        List<String> exacts = new ArrayList<>(specs.size());
         Set<String> readies = new LinkedHashSet<>();
         boolean hasStrictSummaryPopulated = false;
-        for (SummaryCounterSpec spec : byValue.values()) {
+        for (SummaryCounterSpec spec : specs) {
             uppers.add(spec.upperBoundExpr());
             exacts.add(spec.exactExpr());
             String ready = spec.exactReadyExpr();
@@ -1119,10 +1177,10 @@ public final class JsonCqlEvaluator {
                 : (readies.size() == 1
                         ? readies.iterator().next()
                         : "(" + String.join(" AND ", readies) + ")");
-        return Optional.of(new SummaryCounterSpec(
+        return new SummaryCounterSpec(
                 "(" + String.join(" + ", uppers) + ")",
                 "(" + String.join(" + ", exacts) + ")",
-                combinedReady));
+                combinedReady);
     }
 
     /**

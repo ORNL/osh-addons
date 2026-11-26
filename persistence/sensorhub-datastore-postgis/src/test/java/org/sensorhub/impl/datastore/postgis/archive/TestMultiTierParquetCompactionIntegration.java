@@ -1643,6 +1643,195 @@ public class TestMultiTierParquetCompactionIntegration {
         assertTrue(postRsGammaPlan.remainingCandidates().isEmpty());
     }
 
+    @Test
+    public void tenYearScalePushdownsServeStatusFaultOrFromSummariesScopeEventProfilesAndSliceUnfilteredLimit()
+            throws Exception {
+        String table = uniqueTableName("scale10y");
+        Path archiveRoot = temporary.newFolder("archive-scale10y").toPath();
+        Path duckTmp = archiveRoot.resolveSibling("ducktmp-scale10y");
+        TieredArchiveConfig cfg = parquetPrimaryConfig(archiveRoot, duckTmp,
+                List.of("occupancy", "tamper", "alarm", "gammaCounts", "neutronCounts"));
+        OscarTieredObsStore store = openStore(table, cfg);
+
+        BigId occStream = addEventOccupancyStream(store, 201L, "occupancy");
+        BigId tamperStream = addTamperStream(store, 201L);
+        BigId gammaStream = addAlarmStateStream(store, 201L, "gammaCounts",
+                new String[]{"Background", "Alarm", "Fault - Gamma High", "Fault - Gamma Low"});
+        BigId neutronStream = addAlarmStateStream(store, 201L, "neutronCounts",
+                new String[]{"Background", "Alarm", "Fault - Neutron High"});
+        BigId combinedStream = addCombinedTamperAndFaultStream(store, 202L, "alarm");
+
+        // Export 3 separate UTC windows producing multiple RAW_EVENTS and RAW_TELEMETRY generations.
+        Instant w1 = Instant.parse("2026-08-01T00:00:00Z");
+        Instant w2 = Instant.parse("2026-08-01T00:30:00Z");
+        Instant w3 = Instant.parse("2026-08-01T01:00:00Z");
+        Instant w4 = Instant.parse("2026-08-01T01:30:00Z");
+        for (int i = 0; i < 6; i++) {
+            Instant t1 = w1.plusSeconds(300L + i * 10L);
+            Instant t2 = w2.plusSeconds(300L + i * 10L);
+            Instant t3 = w3.plusSeconds(300L + i * 10L);
+            store.add(eventOccupancyObs(occStream, t1, t1, "ev-w1-" + i, true, false, 100, 10, 0, 0));
+            store.add(eventOccupancyObs(occStream, t2, t2, "ev-w2-" + i, false, true, 10, 100, 0, 0));
+            store.add(eventOccupancyObs(occStream, t3, t3, "ev-w3-" + i, false, false, 10, 10, 0, 0));
+        }
+        store.add(tamperObs(tamperStream, w1.plusSeconds(60), true));
+        store.add(tamperObs(tamperStream, w1.plusSeconds(120), false));
+        store.add(tamperObs(tamperStream, w2.plusSeconds(60), true));
+        store.add(alarmStateObs(gammaStream, w1.plusSeconds(90), "Fault - Gamma High"));
+        store.add(alarmStateObs(gammaStream, w1.plusSeconds(150), "Background"));
+        store.add(alarmStateObs(neutronStream, w2.plusSeconds(90), "Fault - Neutron High"));
+        store.add(alarmStateObs(neutronStream, w3.plusSeconds(90), "Background"));
+        // Combined row matching BOTH tamperStatus=true AND Fault - Gamma High in one stream -> must fall back to DuckDB
+        // to avoid double-counting.
+        store.add(combinedTamperFaultObs(combinedStream, w3.plusSeconds(180), true, "Fault - Gamma High"));
+        commitStore(store);
+
+        store.archiveWindow(w1, w2, TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
+        store.archiveWindow(w1, w2, TieredArchiveConfig.PROFILE_RAW_TELEMETRY).orElseThrow();
+        store.archiveWindow(w2, w3, TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
+        store.archiveWindow(w2, w3, TieredArchiveConfig.PROFILE_RAW_TELEMETRY).orElseThrow();
+        store.archiveWindow(w3, w4, TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
+        store.archiveWindow(w3, w4, TieredArchiveConfig.PROFILE_RAW_TELEMETRY).orElseThrow();
+        store.maintainArchiveLifecycle();
+
+        List<ArchiveGeneration> allGens = store.getArchiveCatalog().candidates(
+                Instant.parse("2026-08-01T00:00:00Z"), Instant.parse("2026-08-01T02:00:00Z"), null);
+        long rawEventsCount = allGens.stream().filter(g -> TieredArchiveConfig.PROFILE_RAW_EVENTS.equals(g.profile())).count();
+        long rawTelemetryCount = allGens.stream().filter(g -> TieredArchiveConfig.PROFILE_RAW_TELEMETRY.equals(g.profile())).count();
+        assertEquals(3L, rawEventsCount);
+        assertEquals(3L, rawTelemetryCount);
+
+        // 1) Profile-scoped catalog pruning: event-only streams restrict to EVENT_QUERY_PROFILES; mixed/telemetry return null.
+        assertEquals(TieredArchiveConfig.EVENT_QUERY_PROFILES,
+                store.resolveAllowedProfilesForDataStreams(Set.of(occStream.getIdAsLong(), tamperStream.getIdAsLong())));
+        assertEquals(null, store.resolveAllowedProfilesForDataStreams(Set.of(gammaStream.getIdAsLong())));
+        assertEquals(null, store.resolveAllowedProfilesForDataStreams(
+                Set.of(tamperStream.getIdAsLong(), gammaStream.getIdAsLong())));
+        List<ArchiveGeneration> eventCandidates = store.getArchiveCatalog().candidates(
+                Instant.parse("2026-08-01T00:00:00Z"), Instant.parse("2026-08-01T02:00:00Z"),
+                null, null, null, Set.of(occStream.getIdAsLong()), null, null,
+                TieredArchiveConfig.EVENT_QUERY_PROFILES);
+        assertEquals(3, eventCandidates.size());
+        assertTrue(eventCandidates.stream().allMatch(g -> TieredArchiveConfig.PROFILE_RAW_EVENTS.equals(g.profile())));
+
+        // 2) StatusTable tamperStatus=true OR alarmState='Fault - ...' answers 100% from PostgreSQL summaries
+        //    when tamper and fault live on separate streams (0 DuckDB candidates remaining).
+        String statusCql = "tamperStatus=true OR alarmState='Fault - Neutron High' OR " +
+                "alarmState='Fault - Gamma High' OR alarmState='Fault - Gamma Low' OR " +
+                "alarmState='Fault - Extended Occupancy'";
+        ObsFilter separateStreamsStatusFilter = new ObsFilter.Builder()
+                .withDataStreams(tamperStream, gammaStream, neutronStream)
+                .withCQLFilter(statusCql)
+                .build();
+        assertEquals(4L, store.countMatchingEntries(separateStreamsStatusFilter));
+        var separateSpec = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                .summaryCounterSpec(separateStreamsStatusFilter.getCQLFilter()).orElseThrow();
+        Set<Long> statusStreams = Set.of(
+                tamperStream.getIdAsLong(), gammaStream.getIdAsLong(), neutronStream.getIdAsLong());
+        List<ArchiveGeneration> statusCandidates = store.getArchiveCatalog().candidates(
+                Instant.parse("2026-08-01T00:00:00Z"), Instant.parse("2026-08-01T02:00:00Z"),
+                null, null, null, statusStreams);
+        var separatePlan = store.getArchiveCatalog().summarizeColdCandidates(
+                statusCandidates, null, null, statusStreams, Set.of(), separateSpec);
+        assertEquals(4L, separatePlan.summarizedCount());
+        assertTrue("Separate tamper & detector fault streams must answer purely from PostgreSQL summaries",
+                separatePlan.remainingCandidates().isEmpty());
+
+        // 3) If a single stream contains BOTH tamperStatus=true AND Fault - Gamma High in one row, exactReadyExpr
+        //    falls back to DuckDB instead of double-counting (logical count MUST be 1, not 2!).
+        ObsFilter combinedStatusFilter = new ObsFilter.Builder()
+                .withDataStreams(combinedStream)
+                .withCQLFilter(statusCql)
+                .build();
+        assertEquals(1L, store.countMatchingEntries(combinedStatusFilter));
+        List<ArchiveGeneration> combinedCandidates = store.getArchiveCatalog().candidates(
+                Instant.parse("2026-08-01T00:00:00Z"), Instant.parse("2026-08-01T02:00:00Z"),
+                null, null, null, Set.of(combinedStream.getIdAsLong()));
+        var combinedPlan = store.getArchiveCatalog().summarizeColdCandidates(
+                combinedCandidates, null, null, Set.of(combinedStream.getIdAsLong()),
+                Set.of(), separateSpec);
+        assertEquals(0L, combinedPlan.summarizedCount());
+        assertEquals(1, combinedPlan.remainingCandidates().size());
+
+        // 4) Plain unfiltered bounded query (GET /observations?limit=5) slices primaryCandidates to ONLY the
+        //    first generation (1 Parquet file opened instead of all 3).
+        store.getArchiveReader().resetMaxBatchFileCountSeenForTesting();
+        ObsFilter boundedPlain = new ObsFilter.Builder()
+                .withDataStreams(occStream)
+                .withLimit(5L)
+                .build();
+        long fetchedCount;
+        try (var stream = store.selectEntries(boundedPlain)) {
+            fetchedCount = stream.count();
+        }
+        assertEquals(5L, fetchedCount);
+        assertEquals("Plain ?limit=5 query must open only 1 Parquet file when first generation holds >= 5 rows",
+                1, store.getArchiveReader().maxBatchFileCountSeenForTesting());
+    }
+
+    private static BigId addTamperStream(OscarTieredObsStore store, long sysNum) throws Exception {
+        SWEHelper swe = new SWEHelper();
+        DataRecord rec = swe.createRecord().name("tamper")
+                .addField("tamperStatus", swe.createBoolean().build())
+                .build();
+        DataStreamInfo info = new DataStreamInfo.Builder()
+                .withName("tamper")
+                .withSystem(new FeatureId(BigId.fromLong(ID_SCOPE, sysNum), "urn:oscar:test:sys:" + sysNum))
+                .withRecordDescription(rec)
+                .withRecordEncoding(new TextEncodingImpl())
+                .build();
+        return store.getDataStreams().add(info).getInternalID();
+    }
+
+    private static IObsData tamperObs(BigId stream, Instant time, boolean tampered) {
+        SWEHelper swe = new SWEHelper();
+        DataRecord rec = swe.createRecord().name("tamper")
+                .addField("tamperStatus", swe.createBoolean().build())
+                .build();
+        DataBlock block = rec.createDataBlock();
+        block.setBooleanValue(0, tampered);
+        return new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(time)
+                .withResultTime(time)
+                .withResult(block)
+                .build();
+    }
+
+    private static BigId addCombinedTamperAndFaultStream(
+            OscarTieredObsStore store, long sysNum, String outputName) throws Exception {
+        SWEHelper swe = new SWEHelper();
+        DataRecord rec = swe.createRecord().name(outputName)
+                .addField("tamperStatus", swe.createBoolean().build())
+                .addField("alarmState", swe.createCategory().addAllowedValues("Fault - Gamma High", "Background").build())
+                .build();
+        DataStreamInfo info = new DataStreamInfo.Builder()
+                .withName(outputName)
+                .withSystem(new FeatureId(BigId.fromLong(ID_SCOPE, sysNum), "urn:oscar:test:sys:" + sysNum))
+                .withRecordDescription(rec)
+                .withRecordEncoding(new TextEncodingImpl())
+                .build();
+        return store.getDataStreams().add(info).getInternalID();
+    }
+
+    private static IObsData combinedTamperFaultObs(
+            BigId stream, Instant time, boolean tampered, String alarmState) {
+        SWEHelper swe = new SWEHelper();
+        DataRecord rec = swe.createRecord().name("alarm")
+                .addField("tamperStatus", swe.createBoolean().build())
+                .addField("alarmState", swe.createCategory().build())
+                .build();
+        DataBlock block = rec.createDataBlock();
+        block.setBooleanValue(0, tampered);
+        block.setStringValue(1, alarmState);
+        return new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(time)
+                .withResultTime(time)
+                .withResult(block)
+                .build();
+    }
+
     private static BigId addAlarmStateStream(
             OscarTieredObsStore store, long sysNum, String outputName, String[] allowedStates) throws Exception {
         SWEHelper swe = new SWEHelper();

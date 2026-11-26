@@ -1007,5 +1007,55 @@ public class TestArchiveLifecycleInvariants {
                 org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMask(ghFilter, legacyV1Mask));
         assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.requiresSummaryMaskV2(List.of(faultOrFilter)));
         assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.requiresSummaryMaskV2(List.of(ghFilter)));
+
+        // Viewer StatusTable 24h/7d/15d fault+tamper OR filter MUST map to an exact per-datastream
+        // SummaryCounterSpec guarded on disjointness (tamper_true_count = 0 OR faultSum = 0) AND V2 summary masks.
+        String statusTableCql = "tamperStatus=true OR alarmState='Fault - Neutron High' OR " +
+                "alarmState='Fault - Gamma High' OR alarmState='Fault - Gamma Low' OR " +
+                "alarmState='Fault - Extended Occupancy'";
+        var statusFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter(statusTableCql).build().getCQLFilter();
+        var statusSpec = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                .summaryCounterSpec(statusFilter).orElseThrow();
+        assertTrue(statusSpec.upperBoundExpr().contains("COALESCE(s.tamper_true_count, 0)"));
+        assertTrue(statusSpec.upperBoundExpr().contains("COALESCE(s.neutron_high_fault_count, COALESCE(s.row_count, 0))"));
+        assertTrue(statusSpec.exactExpr().contains("COALESCE(s.tamper_true_count, 0)"));
+        assertTrue(statusSpec.exactExpr().contains("COALESCE(s.neutron_high_fault_count, 0)"));
+        assertTrue(statusSpec.exactReadyExpr().contains("s.neutron_high_fault_count IS NOT NULL"));
+        assertTrue(statusSpec.exactReadyExpr().contains("COALESCE(s.tamper_true_count, 0) = 0 OR "));
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                .supportsSummaryMaskEvaluation(statusFilter));
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                .requiresSummaryMaskV2(List.of(statusFilter)));
+        int tamperMask = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                .computeSummaryMask("{\"tamperStatus\":true}");
+        assertEquals(java.util.Optional.of(Boolean.TRUE),
+                org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                        .tryEvaluateSummaryMask(statusFilter, tamperMask));
+        assertEquals(java.util.Optional.of(Boolean.TRUE),
+                org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator
+                        .tryEvaluateSummaryMask(statusFilter, nhMask));
+    }
+
+    @Test
+    public void tenYearScaleGuardsBloatGateReindexAndScopeEventProfiles() {
+        long smallBytes = ArchiveCatalog.SCHEMA_REINDEX_SMALL_TABLE_BYTES - 1L;
+        long largeBytes = ArchiveCatalog.SCHEMA_REINDEX_SMALL_TABLE_BYTES;
+        assertTrue("Tables under 256 MiB always reindex",
+                ArchiveCatalog.shouldReindexArchiveSchema(smallBytes, 0L, 100_000L));
+        assertFalse("Large append-only tables with low dead tuples skip nightly REINDEX",
+                ArchiveCatalog.shouldReindexArchiveSchema(largeBytes, 49_999L, 10_000_000L));
+        assertTrue("Large tables with >= 50,000 dead tuples trigger REINDEX",
+                ArchiveCatalog.shouldReindexArchiveSchema(largeBytes, 50_000L, 10_000_000L));
+        assertTrue("Large tables with >= 10% dead tuple ratio trigger REINDEX",
+                ArchiveCatalog.shouldReindexArchiveSchema(largeBytes, 10_000L, 100_000L));
+        assertFalse("Large tables below both dead-tuple and 10% ratio thresholds skip REINDEX",
+                ArchiveCatalog.shouldReindexArchiveSchema(largeBytes, 9_999L, 100_000L));
+
+        assertEquals(
+                Set.of("RAW_GATED", "RAW_EVENTS", "DAILY_EVENTS", "MONTHLY_EVENTS"),
+                TieredArchiveConfig.EVENT_QUERY_PROFILES);
+        assertFalse(TieredArchiveConfig.EVENT_QUERY_PROFILES.contains(TieredArchiveConfig.PROFILE_RAW_TELEMETRY));
+        assertFalse(TieredArchiveConfig.EVENT_QUERY_PROFILES.contains(TieredArchiveConfig.PROFILE_DAILY_TELEMETRY));
     }
 }

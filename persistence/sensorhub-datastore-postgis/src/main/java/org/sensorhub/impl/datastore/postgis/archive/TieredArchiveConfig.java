@@ -196,10 +196,29 @@ public class TieredArchiveConfig {
      * {@code gammaCounts}, {@code gammaThreshold}, and {@code neutronCounts})
      * are deliberately excluded so they are written once into
      * {@link #PROFILE_RAW_TELEMETRY} with zero write amplification.</p>
+     *
+     * <p>Read-side catalog planning in {@code OscarTieredObsStore} prunes
+     * pure event-stream queries to {@link #EVENT_QUERY_PROFILES} via
+     * {@code oscar_archive_generation_time_idx} once a stream is confirmed to
+     * have no historical rows in {@link #PROFILE_RAW_TELEMETRY} or
+     * {@link #PROFILE_DAILY_TELEMETRY}.</p>
      */
     public static final Set<String> EVENT_OUTPUT_NAMES = Set.of(
             "occupancy", "alarm", "adjudication", "report", "vehicleOcr",
             "emlAnalysis", "tamper", "siteStatistics", "nationalSummary");
+
+    /**
+     * Catalog profiles that can contain {@link #EVENT_OUTPUT_NAMES} streams
+     * (including legacy pre-split {@link #PROFILE_RAW_GATED} generations).
+     * Pruning pure event queries to this set avoids scanning up to
+     * {@code 175,200+} {@link #PROFILE_RAW_TELEMETRY} rows over a 10-year
+     * retention window.
+     */
+    public static final Set<String> EVENT_QUERY_PROFILES = Set.of(
+            PROFILE_RAW_GATED,
+            PROFILE_RAW_EVENTS,
+            PROFILE_DAILY_EVENTS,
+            PROFILE_MONTHLY_EVENTS);
 
     public static final int DEFAULT_COMPACTION_PART_MAX_ROWS = 1_000_000;
 

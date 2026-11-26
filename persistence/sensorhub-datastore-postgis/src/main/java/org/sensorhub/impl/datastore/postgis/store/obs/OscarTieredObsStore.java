@@ -149,6 +149,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private final ColdPointReadCoalescer coldPointReadCoalescer = new ColdPointReadCoalescer();
     private final OverlayWriteCoalescer overlayWriteCoalescer = new OverlayWriteCoalescer();
     private final Map<Long, Boolean> immutableDataStreamCache = new ConcurrentHashMap<>();
+    private final Map<Long, Boolean> eventOnlyProfileStreamCache = new ConcurrentHashMap<>();
     private final ThreadLocal<Map<Long, IDataStreamInfo>> pinnedDataStreamSchemas =
             new ThreadLocal<>();
     private final java.util.concurrent.atomic.AtomicLong lastMutableReindexEpochMillis =
@@ -1183,10 +1184,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             return new ColdOffsetStream(Stream.empty(), 0L);
         Instant minResultTime = minResultTimeBound(resolvedFilter);
         Instant maxResultTime = maxResultTimeBound(resolvedFilter);
+        Set<String> allowedProfiles = resolveAllowedProfilesForDataStreams(dataStreams);
         List<ArchiveGeneration> allCandidates = pruneAndBackfillLegacyResultTimeCandidates(
                 archiveCatalog.candidates(
                         bounds.start(), bounds.end(), null, null, null, dataStreams,
-                        minResultTime, maxResultTime),
+                        minResultTime, maxResultTime, allowedProfiles),
                 minResultTime);
         if (!allCandidates.isEmpty() && resolvedFilter.getCQLFilter() != null) {
             allCandidates = archiveCatalog.pruneOcrCandidates(
@@ -1512,7 +1514,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 Set<Long> archivedHotStreams = unresolvedHotStreams;
                 if (latestResult && minHotTime != null) {
                     hotCandidates = archiveCatalog.candidatesPotentiallyNewerThanResultTime(
-                            bounds.start(), bounds.end(), unresolvedHotStreams, minHotTime);
+                            bounds.start(), bounds.end(), unresolvedHotStreams, minHotTime,
+                            resolveAllowedProfilesForDataStreams(unresolvedHotStreams));
                     if (!hotCandidates.isEmpty() && unresolvedHotStreams.size() > 1) {
                         archivedHotStreams = archiveCatalog.filterPresentDataStreams(
                                 bounds.start(), bounds.end(), unresolvedHotStreams);
@@ -1523,14 +1526,16 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     Instant effectiveStart = minHotTime.isAfter(bounds.start()) ? minHotTime : bounds.start();
                     hotCandidates = !archivedHotStreams.isEmpty() && effectiveStart.isBefore(bounds.end())
                             ? archiveCatalog.candidates(
-                                    effectiveStart, bounds.end(), null, null, null, archivedHotStreams, minResultTime)
+                                    effectiveStart, bounds.end(), null, null, null, archivedHotStreams,
+                                    minResultTime, null, resolveAllowedProfilesForDataStreams(archivedHotStreams))
                             : List.of();
                 } else {
                     archivedHotStreams = archiveCatalog.filterPresentDataStreams(
                             bounds.start(), bounds.end(), unresolvedHotStreams);
                     hotCandidates = !archivedHotStreams.isEmpty()
                             ? archiveCatalog.candidates(
-                                    bounds.start(), bounds.end(), null, null, null, archivedHotStreams, minResultTime)
+                                    bounds.start(), bounds.end(), null, null, null, archivedHotStreams,
+                                    minResultTime, null, resolveAllowedProfilesForDataStreams(archivedHotStreams))
                             : List.of();
                 }
                 for (ArchiveGeneration generation : hotCandidates)
@@ -1598,7 +1603,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                             filter.getPhenomenonLocation() == null &&
                             (filter.getInternalIDs() == null || filter.getInternalIDs().isEmpty());
                     List<ArchiveGeneration> missingCandidates = archiveCatalog.candidates(
-                            bounds.start(), bounds.end(), null, null, null, archivedUnresolvedStreams, minResultTime);
+                            bounds.start(), bounds.end(), null, null, null, archivedUnresolvedStreams,
+                            minResultTime, null, resolveAllowedProfilesForDataStreams(archivedUnresolvedStreams));
                     if (!missingCandidates.isEmpty()) {
                         if (canCacheLegacyLatest && missingCandidates.size() <= 16 && archivedUnresolvedStreams.size() <= 16) {
                             List<String> genShas = missingCandidates.stream().map(ArchiveGeneration::sha256).toList();
@@ -1694,6 +1700,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             return Stream.empty();
         Instant minResultTime = minResultTimeBound(filter);
         Instant maxResultTime = maxResultTimeBound(filter);
+        Set<String> allowedProfiles = resolveAllowedProfilesForDataStreams(dataStreams);
         Long oneId = filter.getInternalIDs() != null && filter.getInternalIDs().size() == 1
                 ? filter.getInternalIDs().first().getIdAsLong() : null;
         Long minId = filter.getInternalIDs() != null && filter.getInternalIDs().size() > 1
@@ -1720,7 +1727,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 List<ArchiveGeneration> allCandidates = pruneAndBackfillLegacyResultTimeCandidates(
                         archiveCatalog.candidates(
                                 bounds.start(), bounds.end(), null, null, null, dataStreams,
-                                minResultTime, maxResultTime),
+                                minResultTime, maxResultTime, allowedProfiles),
                         minResultTime);
                 if (allCandidates.isEmpty())
                     return Stream.empty();
@@ -1769,7 +1776,89 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             ArchiveCatalog.InitialCandidateBatch initialBatch =
                     archiveCatalog.candidatesInitialClusters(
                             bounds.start(), bounds.end(), dataStreams, minResultTime, maxResultTime,
-                            descending, initialClusterLimit);
+                            descending, initialClusterLimit, allowedProfiles);
+            boolean plainUnfilteredBounded = fois == null &&
+                    readerLimit != Long.MAX_VALUE &&
+                    (filter.getCQLFilter() == null || filter.getCQLFilter() == org.geotools.api.filter.Filter.INCLUDE);
+            if (plainUnfilteredBounded && initialBatch.generations().size() > 1) {
+                List<ArchiveGeneration> initialEffective = pruneAndBackfillLegacyResultTimeCandidates(
+                        initialBatch.generations(), minResultTime);
+                JsonCqlEvaluator.SummaryCounterSpec rowCountSpec =
+                        JsonCqlEvaluator.summaryCounterSpec(null).orElseThrow();
+                ArchiveCatalog.CandidateSelectionPlan initialPlan = initialEffective.isEmpty()
+                        ? new ArchiveCatalog.CandidateSelectionPlan(List.of(), List.of())
+                        : archiveCatalog.selectSummaryMatchedCandidates(
+                                initialEffective, filter.getPhenomenonTime(), filter.getResultTime(),
+                                dataStreams, descending, callerLimit, readerLimit, hasMutations,
+                                rowCountSpec, null, null,
+                                hasMutations
+                                        ? (chunk, mutatedByGen) -> countMutatedSummaryBaseMatchesByGeneration(
+                                                chunk, mutatedByGen, filter, dataStreams, fois)
+                                        : null,
+                                0L, null);
+                ObsFilter coldStreamFilter = callerLimit == readerLimit
+                        ? filter
+                        : ObsFilter.Builder.from(filter).withLimit(callerLimit).build();
+                if (initialBatch.complete()) {
+                    if (initialPlan.primaryCandidates().isEmpty())
+                        return Stream.empty();
+                    if (initialPlan.overflowCandidates().isEmpty()) {
+                        return streamColdBasesFromPreprunedCandidates(
+                                initialPlan.primaryCandidates(), coldStreamFilter, readerLimit,
+                                dataStreams, fois, hasMutations, mutationBatchSize);
+                    }
+                    java.util.concurrent.atomic.AtomicLong emitted = new java.util.concurrent.atomic.AtomicLong();
+                    Supplier<Stream<Entry<BigId, IObsData>>> primarySupplier = () ->
+                            streamColdBasesFromPreprunedCandidates(
+                                    initialPlan.primaryCandidates(), coldStreamFilter, readerLimit,
+                                    dataStreams, fois, hasMutations, mutationBatchSize)
+                                    .peek(ignored -> emitted.incrementAndGet());
+                    Supplier<Stream<Entry<BigId, IObsData>>> overflowSupplier = () -> {
+                        long remainingLimit = readerLimit - emitted.get();
+                        if (remainingLimit <= 0)
+                            return Stream.empty();
+                        return streamColdBasesFromPreprunedCandidates(
+                                initialPlan.overflowCandidates(), coldStreamFilter, remainingLimit,
+                                dataStreams, fois, hasMutations, mutationBatchSize);
+                    };
+                    return Stream.of(primarySupplier, overflowSupplier).flatMap(Supplier::get);
+                }
+                Set<UUID> initialIds = initialBatch.generations().stream()
+                        .map(ArchiveGeneration::id)
+                        .collect(Collectors.toSet());
+                java.util.concurrent.atomic.AtomicLong emitted = new java.util.concurrent.atomic.AtomicLong();
+                Supplier<Stream<Entry<BigId, IObsData>>> primarySupplier = () ->
+                        initialPlan.primaryCandidates().isEmpty()
+                                ? Stream.empty()
+                                : streamColdBasesFromPreprunedCandidates(
+                                        initialPlan.primaryCandidates(), coldStreamFilter, readerLimit,
+                                        dataStreams, fois, hasMutations, mutationBatchSize)
+                                        .peek(ignored -> emitted.incrementAndGet());
+                Supplier<Stream<Entry<BigId, IObsData>>> overflowSupplier = () -> {
+                    long remainingLimit = readerLimit - emitted.get();
+                    if (remainingLimit <= 0 || initialPlan.overflowCandidates().isEmpty())
+                        return Stream.empty();
+                    return streamColdBasesFromPreprunedCandidates(
+                            initialPlan.overflowCandidates(), coldStreamFilter, remainingLimit,
+                            dataStreams, fois, hasMutations, mutationBatchSize)
+                            .peek(ignored -> emitted.incrementAndGet());
+                };
+                Supplier<Stream<Entry<BigId, IObsData>>> remainderSupplier = () -> {
+                    long remainingLimit = readerLimit - emitted.get();
+                    if (remainingLimit <= 0)
+                        return Stream.empty();
+                    List<ArchiveGeneration> remaining = archiveCatalog.candidates(
+                                    bounds.start(), bounds.end(), null, null, null, dataStreams,
+                                    minResultTime, maxResultTime, allowedProfiles)
+                            .stream()
+                            .filter(generation -> !initialIds.contains(generation.id()))
+                            .toList();
+                    return streamColdBasesFromCandidates(
+                            remaining, filter, remainingLimit,
+                            dataStreams, fois, hasMutations, mutationBatchSize);
+                };
+                return Stream.of(primarySupplier, overflowSupplier, remainderSupplier).flatMap(Supplier::get);
+            }
             if (initialBatch.complete()) {
                 return streamColdBasesFromCandidates(
                         initialBatch.generations(), filter, readerLimit,
@@ -1792,7 +1881,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     return Stream.empty();
                 List<ArchiveGeneration> remaining = archiveCatalog.candidates(
                                 bounds.start(), bounds.end(), null, null, null, dataStreams,
-                                minResultTime, maxResultTime)
+                                minResultTime, maxResultTime, allowedProfiles)
                         .stream()
                         .filter(generation -> !initialIds.contains(generation.id()))
                         .toList();
@@ -1819,7 +1908,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         } else {
             candidates = archiveCatalog.candidates(
                     bounds.start(), bounds.end(), oneId, minId, maxId, dataStreams,
-                    minResultTime, maxResultTime);
+                    minResultTime, maxResultTime, allowedProfiles);
         }
         return streamColdBasesFromCandidates(
                 candidates, filter, readerLimit, dataStreams, fois, hasMutations, mutationBatchSize);
@@ -2389,6 +2478,48 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         return true;
     }
 
+    /**
+     * Restricts catalog scans to {@link TieredArchiveConfig#EVENT_QUERY_PROFILES}
+     * via {@code oscar_archive_generation_time_idx} when every requested
+     * datastream is an {@link TieredArchiveConfig#EVENT_OUTPUT_NAMES} output
+     * and has no legacy {@code RAW_TELEMETRY}/{@code DAILY_TELEMETRY} generations.
+     */
+    public Set<String> resolveAllowedProfilesForDataStreams(Set<Long> dataStreams) {
+        if (!archiveConfig.isParquetPrimary() || dataStreams == null || dataStreams.isEmpty())
+            return null;
+        List<Long> uncachedEventStreams = null;
+        for (Long dsId : dataStreams) {
+            Boolean eventOnly = eventOnlyProfileStreamCache.get(dsId);
+            if (Boolean.FALSE.equals(eventOnly))
+                return null;
+            if (eventOnly == null) {
+                IDataStreamInfo info = getDataStreamInfo(BigId.fromLong(idScope, dsId));
+                if (info == null)
+                    return null;
+                if (!TieredArchiveConfig.isEventOutputName(info.getOutputName())) {
+                    eventOnlyProfileStreamCache.putIfAbsent(dsId, Boolean.FALSE);
+                    return null;
+                }
+                if (uncachedEventStreams == null)
+                    uncachedEventStreams = new ArrayList<>();
+                uncachedEventStreams.add(dsId);
+            }
+        }
+        if (uncachedEventStreams != null) {
+            Set<Long> inTelemetry = archiveCatalog.dataStreamsWithTelemetryProfiles(uncachedEventStreams);
+            boolean allEventOnly = true;
+            for (Long dsId : uncachedEventStreams) {
+                boolean isEventOnly = !inTelemetry.contains(dsId);
+                eventOnlyProfileStreamCache.putIfAbsent(dsId, isEventOnly);
+                if (!isEventOnly)
+                    allEventOnly = false;
+            }
+            if (!allEventOnly)
+                return null;
+        }
+        return TieredArchiveConfig.EVENT_QUERY_PROFILES;
+    }
+
     private static int adaptiveInitialPageSize(long callerLimit) {
         if (callerLimit == Long.MAX_VALUE)
             return STREAM_FETCH_SIZE;
@@ -2752,10 +2883,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 ? resolvedFilter.getInternalIDs().first().getIdAsLong() : null;
         Long maxId = resolvedFilter.getInternalIDs() != null && resolvedFilter.getInternalIDs().size() > 1
                 ? resolvedFilter.getInternalIDs().last().getIdAsLong() : null;
+        Set<String> allowedProfiles = resolveAllowedProfilesForDataStreams(related.dataStreams());
         List<ArchiveGeneration> candidates = pruneAndBackfillLegacyResultTimeCandidates(
                 archiveCatalog.candidates(
                         bounds.start(), bounds.end(), oneId, minId, maxId,
-                        related.dataStreams(), minResultTime, maxResultTime),
+                        related.dataStreams(), minResultTime, maxResultTime, allowedProfiles),
                 minResultTime);
         return new MetadataScanPlan(resolvedFilter, related.dataStreams(), related.fois(), candidates, true);
     }
@@ -4824,10 +4956,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     ? resolvedFilter.getInternalIDs().first().getIdAsLong() : null;
             Long maxId = resolvedFilter.getInternalIDs() != null && resolvedFilter.getInternalIDs().size() > 1
                     ? resolvedFilter.getInternalIDs().last().getIdAsLong() : null;
+            Set<String> allowedProfiles = resolveAllowedProfilesForDataStreams(dataStreams);
             List<ArchiveGeneration> candidates = pruneAndBackfillLegacyResultTimeCandidates(
                     archiveCatalog.candidates(
                             bounds.start(), bounds.end(), oneId, minId, maxId,
-                            dataStreams, minResultTime, maxResultTime),
+                            dataStreams, minResultTime, maxResultTime, allowedProfiles),
                     minResultTime);
             if (!candidates.isEmpty()) {
                 Map<UUID, Set<Long>> mutatedByGen = hasMutations

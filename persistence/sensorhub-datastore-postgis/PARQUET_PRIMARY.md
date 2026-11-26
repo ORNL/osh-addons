@@ -188,6 +188,50 @@ following invariants:
      the local `ext4` `operationDirectory` (or `Local9pParquetCache`) using
      `ArchiveExporter.stageToLocalDirectory(...)` (16 KiB bounded reads)
      before calling `read_parquet(...)`.
+6. **10-Year Scale Catalog, Summary & Bounded-Read Invariants (`175,200+` `RAW_TELEMETRY` Generations):**
+   - **Never drop `s.generation_id = ANY (?::uuid[])` in summary queries:**
+     `ArchiveCatalog.pruneZeroMatchSummaryCandidates`,
+     `selectSummaryMatchedCandidates`, `summarizeColdCandidates`, and
+     `mutatedObservationIdsByGeneration` **must** always filter by
+     `s.generation_id = ANY (?::uuid[])` chunked in `2,048`-UUID batches
+     (`SUMMARY_GENERATION_BATCH_SIZE = 2_048`) so bounded `7d`/`15d`/`30d`
+     queries remain strictly `O(window_size)` instead of full-scanning 10 years
+     (`17.5M+` rows) of `oscar_archive_schema`.
+   - **Profile-scoped `oscar_archive_generation_time_idx` pruning:** Pure
+     event-stream queries (`OscarTieredObsStore.resolveAllowedProfilesForDataStreams`)
+     restrict catalog lookups (`candidates`, `candidatesInitialClusters`,
+     `candidatesPotentiallyNewerThanResultTime`) to
+     `TieredArchiveConfig.EVENT_QUERY_PROFILES` (`RAW_GATED`, `RAW_EVENTS`,
+     `DAILY_EVENTS`, `MONTHLY_EVENTS`) after a one-time per-stream check
+     (`ArchiveCatalog.dataStreamsWithTelemetryProfiles`) confirms no legacy
+     `RAW_TELEMETRY`/`DAILY_TELEMETRY` generation holds that datastream. This
+     bounds Year-10 Event Log, Dashboard, Statistics, OCR, and Report catalog
+     scans to `<= 198` event generations instead of `175,200+` telemetry rows
+     while preserving historical visibility if a future release promotes a
+     formerly-telemetry output into `EVENT_OUTPUT_NAMES`.
+   - **Exact cross-property `tamperStatus = true OR alarmState = 'Fault - ...'`
+     summary pushdown:** `JsonCqlEvaluator.tamperOrFaultSummarySpec` maps the
+     Viewer `StatusTable` `24h`/`7d`/`15d` fault-history `OR` filter to exact
+     PostgreSQL summary counters guarded by
+     `(COALESCE(s.tamper_true_count, 0) = 0 OR <faultExact> = 0)` in
+     `exactReadyExpr`, serving separate `tamper` and detector-fault streams
+     with zero DuckDB opens while safely falling back to DuckDB if any single
+     stream ever emits both fields.
+   - **Row-count prefix slicing on plain bounded queries:** Plain unfiltered
+     `LIMIT`-bounded queries (`GET /datastreams/{id}/observations?limit=N` with
+     `CQLFilter == null` or `Filter.INCLUDE`) run
+     `selectSummaryMatchedCandidates` with `COALESCE(s.row_count, 0)` over the
+     bounded `candidatesInitialClusters` prefix so DuckDB opens only the
+     minimum generation(s) needed (typically `1` file instead of `15`).
+   - **Bloat-gated `oscar_archive_schema` nightly reindex:**
+     `ArchiveCatalog.reindexMutableTables()` unconditionally reindexes the
+     small mutable tables (`ONLY obs`, `oscar_obs_stage_owner`, datastreams),
+     but reindexes `oscar_archive_schema` only when
+     `pg_relation_size < 256 MiB`, `n_dead_tup >= 50_000`, or dead ratio
+     `>= 10%` (`ArchiveCatalog.shouldReindexArchiveSchema`), avoiding
+     multi-gigabyte nightly B-tree rebuilds on append-only multi-year
+     `RAW_TELEMETRY` metadata while still reclaiming bloat after compactions or
+     purges.
 
 ## Index Policy
 
