@@ -7,7 +7,10 @@ import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
@@ -357,10 +360,13 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS gamma_high_fault_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS gamma_low_fault_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS neutron_fault_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS neutron_high_fault_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS extended_occupancy_fault_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS tamper_true_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS rs350_gamma_alarm_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS rs350_neutron_alarm_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS alarm_category_gamma_count bigint");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS alarm_category_neutron_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_bloom bytea");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_min_norm text");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_max_norm text");
@@ -430,6 +436,31 @@ public final class ArchiveCatalog {
                 migratedSchemaRows = statement.executeUpdate("UPDATE oscar_archive_schema " +
                         "SET schema_sha256=encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), " +
                         "schema_json=NULL WHERE schema_json IS NOT NULL");
+                // Schema-driven zero-fill for newly added extended fault / RS-350 alarmCategoryCode
+                // summary columns so datastreams whose SWE schema cannot emit those fields become
+                // immediately summary-ready without scanning Parquet files.
+                statement.execute("UPDATE oscar_archive_schema " +
+                        "SET neutron_high_fault_count = 0 " +
+                        "WHERE summary_populated AND neutron_high_fault_count IS NULL AND (" +
+                        "  COALESCE(row_count, 0) = 0 OR schema_sha256 IN (" +
+                        "    SELECT schema_sha256 FROM oscar_archive_schema_blob " +
+                        "    WHERE position('alarmState' in schema_json::text) = 0 " +
+                        "       OR ((position('Fault - Gamma High' in schema_json::text) > 0 " +
+                        "            OR position('Fault - Extended Occupancy' in schema_json::text) > 0) " +
+                        "           AND position('Fault - Neutron High' in schema_json::text) = 0)" +
+                        "  )" +
+                        ")");
+                statement.execute("UPDATE oscar_archive_schema " +
+                        "SET alarm_category_gamma_count = COALESCE(alarm_category_gamma_count, 0), " +
+                        "    alarm_category_neutron_count = COALESCE(alarm_category_neutron_count, 0) " +
+                        "WHERE summary_populated " +
+                        "  AND (alarm_category_gamma_count IS NULL OR alarm_category_neutron_count IS NULL) " +
+                        "  AND (" +
+                        "    COALESCE(row_count, 0) = 0 OR schema_sha256 IN (" +
+                        "      SELECT schema_sha256 FROM oscar_archive_schema_blob " +
+                        "      WHERE position('alarmCategoryCode' in schema_json::text) = 0" +
+                        "    )" +
+                        "  )");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_event_locator (" +
                         "store_key text NOT NULL, id_scope integer NOT NULL, public_id text NOT NULL, " +
                         "observation_id bigint NOT NULL, generation_id uuid REFERENCES oscar_archive_generation(id), " +
@@ -1389,10 +1420,13 @@ public final class ArchiveCatalog {
                 "gamma_high_fault_count = agg.gamma_high_fault_count, " +
                 "gamma_low_fault_count = agg.gamma_low_fault_count, " +
                 "neutron_fault_count = agg.neutron_fault_count, " +
+                "neutron_high_fault_count = agg.neutron_high_fault_count, " +
                 "extended_occupancy_fault_count = agg.extended_occupancy_fault_count, " +
                 "tamper_true_count = agg.tamper_true_count, " +
                 "rs350_gamma_alarm_count = agg.rs350_gamma_alarm_count, " +
-                "rs350_neutron_alarm_count = agg.rs350_neutron_alarm_count " +
+                "rs350_neutron_alarm_count = agg.rs350_neutron_alarm_count, " +
+                "alarm_category_gamma_count = agg.alarm_category_gamma_count, " +
+                "alarm_category_neutron_count = agg.alarm_category_neutron_count " +
                 "FROM (" +
                 "SELECT datastream_id, " +
                 "count(*)::bigint AS row_count, " +
@@ -1414,10 +1448,13 @@ public final class ArchiveCatalog {
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma High\"'::jsonb)::bigint AS gamma_high_fault_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma Low\"'::jsonb)::bigint AS gamma_low_fault_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Neutron\"'::jsonb)::bigint AS neutron_fault_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Neutron High\"'::jsonb)::bigint AS neutron_high_fault_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Extended Occupancy\"'::jsonb)::bigint AS extended_occupancy_fault_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'tamperStatus' = 'true'::jsonb)::bigint AS tamper_true_count, " +
                 "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Gamma%')::bigint AS rs350_gamma_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Neutron%')::bigint AS rs350_neutron_alarm_count " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Neutron%')::bigint AS rs350_neutron_alarm_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmCategoryCode' = '\"Gamma\"'::jsonb)::bigint AS alarm_category_gamma_count, " +
+                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmCategoryCode' = '\"Neutron\"'::jsonb)::bigint AS alarm_category_neutron_count " +
                 "FROM oscar_archive_activation_row GROUP BY datastream_id" +
                 ") agg WHERE s.generation_id = ? AND s.datastream_id = agg.datastream_id";
         try (PreparedStatement statement = connection.prepareStatement(updateSummarySql)) {
@@ -2182,6 +2219,226 @@ public final class ArchiveCatalog {
             }
         }
         return backfilled;
+    }
+
+    /**
+     * Targeted DuckDB backfill for extended fault ({@code Fault - Neutron High})
+     * and RS-350 {@code alarmCategoryCode} summary counters on pre-upgrade archive
+     * generations without staging rows into PostgreSQL temporary tables.
+     */
+    public int backfillExtendedSummaryCountersBatch(Path archiveRoot, int maxGenerations) {
+        if (archiveRoot == null || maxGenerations < 1)
+            return 0;
+        List<ArchiveGeneration> pending = new ArrayList<>();
+        String pendingSql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
+                "FROM oscar_archive_generation g " +
+                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
+                "WHERE s.generation_id=g.id AND s.summary_populated " +
+                "AND (s.neutron_high_fault_count IS NULL OR s.alarm_category_gamma_count IS NULL " +
+                "OR s.alarm_category_neutron_count IS NULL)) " +
+                "ORDER BY g.window_end DESC, g.id LIMIT ?";
+        Map<UUID, Set<Long>> neededStreamsByGen = new HashMap<>();
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            try (PreparedStatement statement = connection.prepareStatement(pendingSql)) {
+                statement.setString(1, storeKey);
+                statement.setInt(2, idScope);
+                statement.setInt(3, maxGenerations);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next())
+                        pending.add(readGeneration(result));
+                }
+            }
+            if (pending.isEmpty())
+                return 0;
+            java.sql.Array genArray = connection.createArrayOf("uuid",
+                    pending.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
+            try (PreparedStatement streamsStmt = connection.prepareStatement(
+                    "SELECT generation_id, datastream_id FROM oscar_archive_schema " +
+                            "WHERE generation_id = ANY (?::uuid[]) AND summary_populated " +
+                            "AND (neutron_high_fault_count IS NULL OR alarm_category_gamma_count IS NULL " +
+                            "OR alarm_category_neutron_count IS NULL)")) {
+                streamsStmt.setArray(1, genArray);
+                try (ResultSet rs = streamsStmt.executeQuery()) {
+                    while (rs.next()) {
+                        neededStreamsByGen
+                                .computeIfAbsent(rs.getObject(1, UUID.class), ignored -> new HashSet<>())
+                                .add(rs.getLong(2));
+                    }
+                }
+            } finally {
+                genArray.free();
+            }
+        } catch (SQLException e) {
+            return 0;
+        }
+        if (neededStreamsByGen.isEmpty())
+            return 0;
+
+        Path realRoot;
+        try {
+            Path normalizedRoot = archiveRoot.toAbsolutePath().normalize();
+            if (!Files.isDirectory(normalizedRoot))
+                return 0;
+            realRoot = normalizedRoot.toRealPath();
+        } catch (Exception e) {
+            return 0;
+        }
+
+        List<ArchiveGeneration> readable = new ArrayList<>(pending.size());
+        Map<UUID, Path> realPathByGen = new HashMap<>(pending.size() * 2);
+        for (ArchiveGeneration generation : pending) {
+            Set<Long> needed = neededStreamsByGen.get(generation.id());
+            if (needed == null || needed.isEmpty())
+                continue;
+            Path resolved = resolveReadableArchiveFile(realRoot, generation.objectPath());
+            if (resolved != null) {
+                readable.add(generation);
+                realPathByGen.put(generation.id(), resolved);
+            }
+        }
+        if (readable.isEmpty())
+            return 0;
+
+        int backfilled = 0;
+        final int chunkSize = 16;
+        for (int start = 0; start < readable.size(); start += chunkSize) {
+            List<ArchiveGeneration> chunk = readable.subList(start, Math.min(readable.size(), start + chunkSize));
+            Map<String, UUID> genByPathString = new HashMap<>(chunk.size() * 2);
+            Map<Path, UUID> genByNormPath = new HashMap<>(chunk.size() * 2);
+            Set<Long> chunkStreams = new HashSet<>();
+            StringBuilder fileList = new StringBuilder();
+            for (ArchiveGeneration gen : chunk) {
+                Path file = realPathByGen.get(gen.id());
+                String pathStr = file.toString();
+                if (fileList.length() > 0)
+                    fileList.append(',');
+                fileList.append('\'').append(pathStr.replace("'", "''")).append('\'');
+                genByPathString.put(pathStr, gen.id());
+                genByNormPath.put(file.toAbsolutePath().normalize(), gen.id());
+                chunkStreams.addAll(neededStreamsByGen.getOrDefault(gen.id(), Set.of()));
+            }
+            if (chunkStreams.isEmpty())
+                continue;
+
+            List<Long> sortedStreams = new ArrayList<>(chunkStreams);
+            sortedStreams.sort(Long::compareTo);
+            StringBuilder streamList = new StringBuilder(sortedStreams.size() * 6);
+            for (int i = 0; i < sortedStreams.size(); i++) {
+                if (i > 0)
+                    streamList.append(',');
+                streamList.append(sortedStreams.get(i));
+            }
+
+            Map<UUID, Map<Long, long[]>> countsByGenStream = new HashMap<>(chunk.size() * 2);
+            String duckSql = "SELECT filename, datastream_id, " +
+                    "count(*) FILTER (WHERE result_json IS NOT NULL " +
+                    "  AND (contains(result_json, 'Fault - Neutron High') OR contains(result_json, '\\u')) " +
+                    "  AND json_valid(result_json) " +
+                    "  AND json_type(json_extract(result_json, '$.alarmState')) = 'VARCHAR' " +
+                    "  AND json_extract_string(result_json, '$.alarmState') = 'Fault - Neutron High')::bigint, " +
+                    "count(*) FILTER (WHERE result_json IS NOT NULL " +
+                    "  AND (contains(result_json, 'alarmCategoryCode') OR contains(result_json, '\\u')) " +
+                    "  AND json_valid(result_json) " +
+                    "  AND json_type(json_extract(result_json, '$.alarmCategoryCode')) = 'VARCHAR' " +
+                    "  AND json_extract_string(result_json, '$.alarmCategoryCode') = 'Gamma')::bigint, " +
+                    "count(*) FILTER (WHERE result_json IS NOT NULL " +
+                    "  AND (contains(result_json, 'alarmCategoryCode') OR contains(result_json, '\\u')) " +
+                    "  AND json_valid(result_json) " +
+                    "  AND json_type(json_extract(result_json, '$.alarmCategoryCode')) = 'VARCHAR' " +
+                    "  AND json_extract_string(result_json, '$.alarmCategoryCode') = 'Neutron')::bigint " +
+                    "FROM read_parquet([" + fileList + "], filename=true, union_by_name=true) " +
+                    "WHERE datastream_id IN (" + streamList + ") " +
+                    "GROUP BY filename, datastream_id";
+            try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(
+                    resourceConfig, "summary-backfill");
+                 Statement stmt = duckSession.connection().createStatement();
+                 ResultSet rs = stmt.executeQuery(duckSql)) {
+                while (rs.next()) {
+                    String rawFile = rs.getString(1);
+                    UUID genId = genByPathString.get(rawFile);
+                    if (genId == null && rawFile != null) {
+                        genId = genByNormPath.get(Path.of(rawFile).toAbsolutePath().normalize());
+                    }
+                    if (genId == null)
+                        continue;
+                    long dsId = rs.getLong(2);
+                    long[] counts = new long[]{rs.getLong(3), rs.getLong(4), rs.getLong(5)};
+                    countsByGenStream.computeIfAbsent(genId, ignored -> new HashMap<>()).put(dsId, counts);
+                }
+            } catch (Exception ignored) {
+                continue;
+            }
+
+            try (Connection connection = connections.open()) {
+                boolean oldAutoCommit = connection.getAutoCommit();
+                connection.setAutoCommit(false);
+                try (PreparedStatement update = connection.prepareStatement(
+                        "UPDATE oscar_archive_schema SET " +
+                                "neutron_high_fault_count = COALESCE(neutron_high_fault_count, ?), " +
+                                "alarm_category_gamma_count = COALESCE(alarm_category_gamma_count, ?), " +
+                                "alarm_category_neutron_count = COALESCE(alarm_category_neutron_count, ?) " +
+                                "WHERE generation_id = ? AND datastream_id = ?")) {
+                    int batchCount = 0;
+                    for (ArchiveGeneration gen : chunk) {
+                        Map<Long, long[]> streamCounts = countsByGenStream.getOrDefault(gen.id(), Map.of());
+                        for (Long dsId : neededStreamsByGen.getOrDefault(gen.id(), Set.of())) {
+                            long[] c = streamCounts.get(dsId);
+                            update.setLong(1, c != null ? c[0] : 0L);
+                            update.setLong(2, c != null ? c[1] : 0L);
+                            update.setLong(3, c != null ? c[2] : 0L);
+                            update.setObject(4, gen.id());
+                            update.setLong(5, dsId);
+                            update.addBatch();
+                            batchCount++;
+                            if (batchCount % 500 == 0)
+                                update.executeBatch();
+                        }
+                    }
+                    if (batchCount > 0)
+                        update.executeBatch();
+                    connection.commit();
+                    backfilled += chunk.size();
+                } catch (Exception ignored) {
+                    connection.rollback();
+                } finally {
+                    connection.setAutoCommit(oldAutoCommit);
+                }
+            } catch (Exception ignored) {
+                // Best-effort background backfill.
+            }
+        }
+        return backfilled;
+    }
+
+    private static Path resolveReadableArchiveFile(Path realRoot, Path relativeObjectPath) {
+        if (relativeObjectPath == null || relativeObjectPath.isAbsolute())
+            return null;
+        try {
+            Path candidate = realRoot.resolve(relativeObjectPath).normalize();
+            if (!candidate.startsWith(realRoot))
+                return null;
+            Path current = realRoot;
+            for (Path part : realRoot.relativize(candidate)) {
+                current = current.resolve(part);
+                if (!Files.exists(current, LinkOption.NOFOLLOW_LINKS))
+                    return null;
+                BasicFileAttributes attrs = Files.readAttributes(
+                        current, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                if (attrs.isSymbolicLink())
+                    return null;
+            }
+            BasicFileAttributes fileAttrs = Files.readAttributes(
+                    candidate, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!fileAttrs.isRegularFile())
+                return null;
+            Path realFile = candidate.toRealPath();
+            return realFile.startsWith(realRoot) ? realFile : null;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     /**
@@ -5077,14 +5334,16 @@ public final class ArchiveCatalog {
                         "UPDATE oscar_obs_overlay SET " +
                                 "base_summary_mask=?, base_datastream_id=?, base_foi_id=?, base_generation_sha256=? " +
                                 "WHERE store_key=? AND id_scope=? AND generation_id=? AND observation_id=? " +
-                                "AND (base_summary_mask IS NULL OR base_generation_sha256 IS DISTINCT FROM ?)");
+                                "AND (base_summary_mask IS NULL OR (base_summary_mask & " +
+                                JsonCqlEvaluator.BIT_MASK_V2 + ") = 0 OR base_generation_sha256 IS DISTINCT FROM ?)");
                      PreparedStatement tbStmt = connection.prepareStatement(
                              "UPDATE oscar_tombstone SET " +
                                      "base_summary_mask=?, datastream_id=COALESCE(datastream_id, ?), " +
                                      "base_foi_id=?, base_generation_sha256=? " +
                                      "WHERE store_key=? AND id_scope=? AND subject_type='OBSERVATION' " +
                                      "AND generation_id=? AND subject_id=? " +
-                                     "AND (base_summary_mask IS NULL OR base_generation_sha256 IS DISTINCT FROM ?)")) {
+                                     "AND (base_summary_mask IS NULL OR (base_summary_mask & " +
+                                     JsonCqlEvaluator.BIT_MASK_V2 + ") = 0 OR base_generation_sha256 IS DISTINCT FROM ?)")) {
                     for (MutatedBaseSummaryRow row : rows) {
                         if (row.summaryMask() == null || row.generationSha256() == null)
                             continue;
@@ -5387,10 +5646,13 @@ public final class ArchiveCatalog {
             long gammaHighFaultCount,
             long gammaLowFaultCount,
             long neutronFaultCount,
+            long neutronHighFaultCount,
             long extendedOccupancyFaultCount,
             long tamperTrueCount,
             long rs350GammaAlarmCount,
             long rs350NeutronAlarmCount,
+            long alarmCategoryGammaCount,
+            long alarmCategoryNeutronCount,
             OcrBloomFilter.Snapshot ocrSnapshot) {}
 
     public record StreamLatestCandidate(
@@ -6369,10 +6631,11 @@ public final class ArchiveCatalog {
                         "unadjudicated_alarm_count, adjudicated_alarm_count, " +
                         "unadjudicated_gamma_alarm_count, unadjudicated_neutron_alarm_count, unadjudicated_gamma_neutron_alarm_count, " +
                         "adjudicated_gamma_alarm_count, adjudicated_neutron_alarm_count, adjudicated_gamma_neutron_alarm_count, " +
-                        "gamma_high_fault_count, gamma_low_fault_count, neutron_fault_count, extended_occupancy_fault_count, " +
+                        "gamma_high_fault_count, gamma_low_fault_count, neutron_fault_count, neutron_high_fault_count, extended_occupancy_fault_count, " +
                         "tamper_true_count, rs350_gamma_alarm_count, rs350_neutron_alarm_count, " +
+                        "alarm_category_gamma_count, alarm_category_neutron_count, " +
                         "ocr_bloom, ocr_min_norm, ocr_max_norm) " +
-                        "VALUES (?, ?, ?, true, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+                        "VALUES (?, ?, ?, true, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
             Set<String> insertedBlobs = new HashSet<>();
             for (SchemaSnapshot schema : schemas) {
                 StreamSummaryCounters stats = summaries.get(schema.dataStreamId());
@@ -6407,10 +6670,13 @@ public final class ArchiveCatalog {
                 schemaStmt.setLong(p++, stats.gammaHighFaultCount());
                 schemaStmt.setLong(p++, stats.gammaLowFaultCount());
                 schemaStmt.setLong(p++, stats.neutronFaultCount());
+                schemaStmt.setLong(p++, stats.neutronHighFaultCount());
                 schemaStmt.setLong(p++, stats.extendedOccupancyFaultCount());
                 schemaStmt.setLong(p++, stats.tamperTrueCount());
                 schemaStmt.setLong(p++, stats.rs350GammaAlarmCount());
                 schemaStmt.setLong(p++, stats.rs350NeutronAlarmCount());
+                schemaStmt.setLong(p++, stats.alarmCategoryGammaCount());
+                schemaStmt.setLong(p++, stats.alarmCategoryNeutronCount());
                 OcrBloomFilter.Snapshot ocr = stats.ocrSnapshot();
                 schemaStmt.setBytes(p++, ocr != null ? ocr.bloomBytes() : OcrBloomFilter.EMPTY_INDEXED_SENTINEL);
                 if (ocr == null || ocr.minNorm() == null)

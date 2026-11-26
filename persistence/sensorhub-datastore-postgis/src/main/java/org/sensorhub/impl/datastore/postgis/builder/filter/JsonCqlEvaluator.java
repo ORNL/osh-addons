@@ -30,9 +30,11 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Predicate;
@@ -347,8 +349,7 @@ public final class JsonCqlEvaluator {
                     isZeroNumber(lit.getValue())) {
                 return resolveBaseAndSummarySpec(null, null, false, Boolean.FALSE);
             }
-            return singleEqualitySummaryCounter(eq)
-                    .map(expr -> new SummaryCounterSpec(expr, expr, "s.summary_populated"));
+            return singleEqualitySummarySpec(eq);
         }
         if (filter instanceof PropertyIsGreaterThan gt &&
                 gt.getExpression1() instanceof PropertyName prop &&
@@ -389,22 +390,9 @@ public final class JsonCqlEvaluator {
             if (statusMask != null) {
                 return resolveDisjointStatusMaskSpec(statusMask, null);
             }
-            Set<String> faultColumns = new LinkedHashSet<>();
-            for (Filter child : or.getChildren()) {
-                if (!(child instanceof PropertyIsEqualTo eq)) {
-                    faultColumns.clear();
-                    break;
-                }
-                Optional<String> col = singleFaultSummaryColumn(eq);
-                if (col.isEmpty()) {
-                    faultColumns.clear();
-                    break;
-                }
-                faultColumns.add(col.get());
-            }
-            if (!faultColumns.isEmpty()) {
-                String expr = "(" + String.join(" + ", faultColumns) + ")";
-                return Optional.of(new SummaryCounterSpec(expr, expr, "s.summary_populated"));
+            Optional<SummaryCounterSpec> disjointStringOr = disjointStringEqualityOrSummarySpec(or);
+            if (disjointStringOr.isPresent()) {
+                return disjointStringOr;
             }
             if (!or.getChildren().isEmpty()) {
                 List<String> childUpperExprs = new ArrayList<>(or.getChildren().size());
@@ -1008,7 +996,7 @@ public final class JsonCqlEvaluator {
         return Optional.of(new CqlTimeBounds(minTime, maxTime));
     }
 
-    private static Optional<String> singleEqualitySummaryCounter(PropertyIsEqualTo eq) {
+    private static Optional<SummaryCounterSpec> singleEqualitySummarySpec(PropertyIsEqualTo eq) {
         if (!(eq.getExpression1() instanceof PropertyName prop) ||
                 !(eq.getExpression2() instanceof Literal lit) ||
                 lit.getValue() == null)
@@ -1016,32 +1004,125 @@ public final class JsonCqlEvaluator {
         String name = prop.getPropertyName();
         Object val = lit.getValue();
         if (val instanceof Boolean boolVal) {
-            if ("gammaAlarm".equals(name) && boolVal)
-                return Optional.of("COALESCE(s.gamma_true_count, 0)");
-            if ("neutronAlarm".equals(name) && boolVal)
-                return Optional.of("COALESCE(s.neutron_true_count, 0)");
-            if ("tamperStatus".equals(name) && boolVal)
-                return Optional.of("COALESCE(s.tamper_true_count, 0)");
+            if ("gammaAlarm".equals(name) && boolVal) {
+                String expr = "COALESCE(s.gamma_true_count, 0)";
+                return Optional.of(new SummaryCounterSpec(expr, expr, "s.summary_populated"));
+            }
+            if ("neutronAlarm".equals(name) && boolVal) {
+                String expr = "COALESCE(s.neutron_true_count, 0)";
+                return Optional.of(new SummaryCounterSpec(expr, expr, "s.summary_populated"));
+            }
+            if ("tamperStatus".equals(name) && boolVal) {
+                String expr = "COALESCE(s.tamper_true_count, 0)";
+                return Optional.of(new SummaryCounterSpec(expr, expr, "s.summary_populated"));
+            }
             return Optional.empty();
         }
-        return singleFaultSummaryColumn(eq);
+        return singleDisjointStringSummarySpec(eq).map(DisjointStringTerm::spec);
     }
 
-    private static Optional<String> singleFaultSummaryColumn(PropertyIsEqualTo eq) {
+    private record DisjointStringTerm(String propertyName, String literalValue, SummaryCounterSpec spec) {}
+
+    private static Optional<DisjointStringTerm> singleDisjointStringSummarySpec(PropertyIsEqualTo eq) {
         if (!eq.isMatchingCase() ||
                 !(eq.getExpression1() instanceof PropertyName prop) ||
                 !(eq.getExpression2() instanceof Literal lit) ||
                 !(lit.getValue() instanceof String text))
             return Optional.empty();
-        if (!"alarmState".equals(prop.getPropertyName()))
+        String propName = prop.getPropertyName();
+        if ("alarmState".equals(propName)) {
+            SummaryCounterSpec spec = switch (text) {
+                case "Fault - Gamma High" -> new SummaryCounterSpec(
+                        "COALESCE(s.gamma_high_fault_count, 0)",
+                        "COALESCE(s.gamma_high_fault_count, 0)",
+                        "s.summary_populated");
+                case "Fault - Gamma Low" -> new SummaryCounterSpec(
+                        "COALESCE(s.gamma_low_fault_count, 0)",
+                        "COALESCE(s.gamma_low_fault_count, 0)",
+                        "s.summary_populated");
+                case "Fault - Neutron" -> new SummaryCounterSpec(
+                        "COALESCE(s.neutron_fault_count, 0)",
+                        "COALESCE(s.neutron_fault_count, 0)",
+                        "s.summary_populated");
+                case "Fault - Neutron High" -> new SummaryCounterSpec(
+                        "COALESCE(s.neutron_high_fault_count, COALESCE(s.row_count, 0))",
+                        "COALESCE(s.neutron_high_fault_count, 0)",
+                        "(s.summary_populated AND s.neutron_high_fault_count IS NOT NULL)");
+                case "Fault - Extended Occupancy" -> new SummaryCounterSpec(
+                        "COALESCE(s.extended_occupancy_fault_count, 0)",
+                        "COALESCE(s.extended_occupancy_fault_count, 0)",
+                        "s.summary_populated");
+                default -> null;
+            };
+            return spec == null ? Optional.empty() : Optional.of(new DisjointStringTerm(propName, text, spec));
+        }
+        if ("alarmCategoryCode".equals(propName)) {
+            SummaryCounterSpec spec = switch (text) {
+                case "Gamma" -> new SummaryCounterSpec(
+                        "COALESCE(s.alarm_category_gamma_count, COALESCE(s.row_count, 0))",
+                        "COALESCE(s.alarm_category_gamma_count, 0)",
+                        "(s.summary_populated AND s.alarm_category_gamma_count IS NOT NULL)");
+                case "Neutron" -> new SummaryCounterSpec(
+                        "COALESCE(s.alarm_category_neutron_count, COALESCE(s.row_count, 0))",
+                        "COALESCE(s.alarm_category_neutron_count, 0)",
+                        "(s.summary_populated AND s.alarm_category_neutron_count IS NOT NULL)");
+                default -> null;
+            };
+            return spec == null ? Optional.empty() : Optional.of(new DisjointStringTerm(propName, text, spec));
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<SummaryCounterSpec> disjointStringEqualityOrSummarySpec(Or or) {
+        List<Filter> disjuncts = new ArrayList<>();
+        flattenOrChildren(or, disjuncts);
+        if (disjuncts.isEmpty())
             return Optional.empty();
-        return switch (text) {
-            case "Fault - Gamma High" -> Optional.of("COALESCE(s.gamma_high_fault_count, 0)");
-            case "Fault - Gamma Low" -> Optional.of("COALESCE(s.gamma_low_fault_count, 0)");
-            case "Fault - Neutron" -> Optional.of("COALESCE(s.neutron_fault_count, 0)");
-            case "Fault - Extended Occupancy" -> Optional.of("COALESCE(s.extended_occupancy_fault_count, 0)");
-            default -> Optional.empty();
-        };
+        String sharedProperty = null;
+        Map<String, SummaryCounterSpec> byValue = new LinkedHashMap<>();
+        for (Filter child : disjuncts) {
+            if (!(child instanceof PropertyIsEqualTo eq))
+                return Optional.empty();
+            Optional<DisjointStringTerm> termOpt = singleDisjointStringSummarySpec(eq);
+            if (termOpt.isEmpty())
+                return Optional.empty();
+            DisjointStringTerm term = termOpt.get();
+            if (sharedProperty == null)
+                sharedProperty = term.propertyName();
+            else if (!sharedProperty.equals(term.propertyName()))
+                return Optional.empty();
+            byValue.putIfAbsent(term.literalValue(), term.spec());
+        }
+        if (byValue.isEmpty())
+            return Optional.empty();
+        if (byValue.size() == 1)
+            return Optional.of(byValue.values().iterator().next());
+
+        List<String> uppers = new ArrayList<>(byValue.size());
+        List<String> exacts = new ArrayList<>(byValue.size());
+        Set<String> readies = new LinkedHashSet<>();
+        boolean hasStrictSummaryPopulated = false;
+        for (SummaryCounterSpec spec : byValue.values()) {
+            uppers.add(spec.upperBoundExpr());
+            exacts.add(spec.exactExpr());
+            String ready = spec.exactReadyExpr();
+            if (!"true".equals(ready)) {
+                readies.add(ready);
+                if (ready.contains("s.summary_populated AND "))
+                    hasStrictSummaryPopulated = true;
+            }
+        }
+        if (hasStrictSummaryPopulated)
+            readies.remove("s.summary_populated");
+        String combinedReady = readies.isEmpty()
+                ? "true"
+                : (readies.size() == 1
+                        ? readies.iterator().next()
+                        : "(" + String.join(" AND ", readies) + ")");
+        return Optional.of(new SummaryCounterSpec(
+                "(" + String.join(" + ", uppers) + ")",
+                "(" + String.join(" + ", exacts) + ")",
+                combinedReady));
     }
 
     /**
@@ -2656,32 +2737,40 @@ public final class JsonCqlEvaluator {
     public static final int BIT_TAMPER_TRUE = 1 << 10;
     public static final int BIT_RS350_GAMMA = 1 << 11;
     public static final int BIT_RS350_NEUTRON = 1 << 12;
+    public static final int BIT_FAULT_NEUTRON_HIGH = 1 << 13;
+    public static final int BIT_ALARM_CAT_GAMMA = 1 << 14;
+    public static final int BIT_ALARM_CAT_NEUTRON = 1 << 15;
+    /** Marker bit set on masks computed with v2 extended fault/alarm-category bits (bits 13..15). */
+    public static final int BIT_MASK_V2 = 1 << 30;
+    private static final int V2_SUMMARY_BITS_MASK =
+            BIT_FAULT_NEUTRON_HIGH | BIT_ALARM_CAT_GAMMA | BIT_ALARM_CAT_NEUTRON;
 
     private static final Set<String> SUMMARY_MASK_PROJECTED_KEYS = Set.of(
             "gammaAlarm", "neutronAlarm", "adjudicatedIdsCount", "adjudicatedIds",
-            "alarmState", "tamperStatus", "derivedData");
+            "alarmState", "tamperStatus", "derivedData", "alarmCategoryCode");
     private static final String[] SEG_GAMMA_ALARM = {"gammaAlarm"};
     private static final String[] SEG_NEUTRON_ALARM = {"neutronAlarm"};
     private static final String[] SEG_ADJ_COUNT = {"adjudicatedIdsCount"};
     private static final String[] SEG_ALARM_STATE = {"alarmState"};
     private static final String[] SEG_TAMPER_STATUS = {"tamperStatus"};
     private static final String[] SEG_ALARM_CATEGORY = {"derivedData", "alarmCategory"};
+    private static final String[] SEG_ALARM_CATEGORY_CODE = {"alarmCategoryCode"};
     private static final Pattern RS350_GAMMA_PATTERN = Pattern.compile(".*Gamma.*", Pattern.DOTALL);
     private static final Pattern RS350_NEUTRON_PATTERN = Pattern.compile(".*Neutron.*", Pattern.DOTALL);
 
     /**
-     * Computes a compact 4-byte non-negative bitmask capturing all 13 atomic
+     * Computes a compact 4-byte non-negative bitmask capturing all atomic
      * summary-counter predicates over an immutable cold base observation's JSON,
      * allowing PostgreSQL overlay/tombstone rows to answer summary inclusion-exclusion
      * counts without duplicating cold JSONB payloads or touching Parquet files.
      */
     public static int computeSummaryMask(String resultJson) {
         if (resultJson == null || resultJson.isBlank())
-            return 0;
+            return BIT_MASK_V2;
         JsonObject obj = parseProjectedJsonObject(resultJson, SUMMARY_MASK_PROJECTED_KEYS);
         if (obj == null)
-            return 0;
-        int mask = 0;
+            return BIT_MASK_V2;
+        int mask = BIT_MASK_V2;
         if (evaluateCompiledComparison(ComparisonKind.EQ, true, "gammaAlarm", SEG_GAMMA_ALARM, Boolean.TRUE, null, null, obj))
             mask |= BIT_GAMMA_TRUE;
         if (evaluateCompiledComparison(ComparisonKind.EQ, true, "gammaAlarm", SEG_GAMMA_ALARM, Boolean.FALSE, null, null, obj))
@@ -2700,6 +2789,8 @@ public final class JsonCqlEvaluator {
             mask |= BIT_FAULT_GAMMA_LOW;
         if (evaluateCompiledComparison(ComparisonKind.EQ, true, "alarmState", SEG_ALARM_STATE, "Fault - Neutron", null, null, obj))
             mask |= BIT_FAULT_NEUTRON;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "alarmState", SEG_ALARM_STATE, "Fault - Neutron High", null, null, obj))
+            mask |= BIT_FAULT_NEUTRON_HIGH;
         if (evaluateCompiledComparison(ComparisonKind.EQ, true, "alarmState", SEG_ALARM_STATE, "Fault - Extended Occupancy", null, null, obj))
             mask |= BIT_FAULT_EXT_OCC;
         if (evaluateCompiledComparison(ComparisonKind.EQ, true, "tamperStatus", SEG_TAMPER_STATUS, Boolean.TRUE, null, null, obj))
@@ -2708,6 +2799,10 @@ public final class JsonCqlEvaluator {
             mask |= BIT_RS350_GAMMA;
         if (matchesCompiledLike(obj, "derivedData.alarmCategory", SEG_ALARM_CATEGORY, RS350_NEUTRON_PATTERN))
             mask |= BIT_RS350_NEUTRON;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "alarmCategoryCode", SEG_ALARM_CATEGORY_CODE, "Gamma", null, null, obj))
+            mask |= BIT_ALARM_CAT_GAMMA;
+        if (evaluateCompiledComparison(ComparisonKind.EQ, true, "alarmCategoryCode", SEG_ALARM_CATEGORY_CODE, "Neutron", null, null, obj))
+            mask |= BIT_ALARM_CAT_NEUTRON;
         return mask;
     }
 
@@ -2764,6 +2859,8 @@ public final class JsonCqlEvaluator {
         int bit = leafSummaryBit(filter);
         if (bit == 0)
             return Optional.empty();
+        if ((bit & V2_SUMMARY_BITS_MASK) != 0 && (mask & BIT_MASK_V2) == 0)
+            return Optional.empty();
         return Optional.of((mask & bit) != 0);
     }
 
@@ -2772,7 +2869,41 @@ public final class JsonCqlEvaluator {
      * {@link #computeSummaryMask(String)} without reading JSON payloads.
      */
     public static boolean supportsSummaryMaskEvaluation(Filter filter) {
-        return tryEvaluateSummaryMask(filter, 0).isPresent();
+        return tryEvaluateSummaryMask(filter, BIT_MASK_V2).isPresent();
+    }
+
+    /**
+     * Returns {@code true} when any predicate in {@code conjuncts} requires
+     * v2 extended summary-mask bits (marked by {@link #BIT_MASK_V2}).
+     */
+    public static boolean requiresSummaryMaskV2(List<Filter> conjuncts) {
+        if (conjuncts == null || conjuncts.isEmpty())
+            return false;
+        for (Filter filter : conjuncts) {
+            if (requiresSummaryMaskV2(filter))
+                return true;
+        }
+        return false;
+    }
+
+    private static boolean requiresSummaryMaskV2(Filter filter) {
+        if (filter == null || filter == Filter.INCLUDE || filter == Filter.EXCLUDE)
+            return false;
+        if (filter instanceof And and) {
+            for (Filter child : and.getChildren()) {
+                if (requiresSummaryMaskV2(child))
+                    return true;
+            }
+            return false;
+        }
+        if (filter instanceof Or or) {
+            for (Filter child : or.getChildren()) {
+                if (requiresSummaryMaskV2(child))
+                    return true;
+            }
+            return false;
+        }
+        return (leafSummaryBit(filter) & V2_SUMMARY_BITS_MASK) != 0;
     }
 
     /**
@@ -2853,7 +2984,15 @@ public final class JsonCqlEvaluator {
                     case "Fault - Gamma High" -> BIT_FAULT_GAMMA_HIGH;
                     case "Fault - Gamma Low" -> BIT_FAULT_GAMMA_LOW;
                     case "Fault - Neutron" -> BIT_FAULT_NEUTRON;
+                    case "Fault - Neutron High" -> BIT_FAULT_NEUTRON_HIGH;
                     case "Fault - Extended Occupancy" -> BIT_FAULT_EXT_OCC;
+                    default -> 0;
+                };
+            }
+            if (eq.isMatchingCase() && "alarmCategoryCode".equals(name) && val instanceof String text) {
+                return switch (text) {
+                    case "Gamma" -> BIT_ALARM_CAT_GAMMA;
+                    case "Neutron" -> BIT_ALARM_CAT_NEUTRON;
                     default -> 0;
                 };
             }

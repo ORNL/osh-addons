@@ -544,7 +544,8 @@ final class DuckDbResourcePolicy {
             return "cold-cql-count".equals(operation)
                     || "cold-cql-id-count".equals(operation)
                     || "archive-compaction".equals(operation)
-                    || "compaction-verify".equals(operation);
+                    || "compaction-verify".equals(operation)
+                    || "summary-backfill".equals(operation);
         }
 
         private void enqueueRequest(AdmissionRequest request) {

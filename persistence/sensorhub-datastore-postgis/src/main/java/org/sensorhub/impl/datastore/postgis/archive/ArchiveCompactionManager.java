@@ -1747,30 +1747,36 @@ public final class ArchiveCompactionManager {
         long gammaHighFaultCount;
         long gammaLowFaultCount;
         long neutronFaultCount;
+        long neutronHighFaultCount;
         long extendedOccupancyFaultCount;
         long tamperTrueCount;
         long rs350GammaAlarmCount;
         long rs350NeutronAlarmCount;
+        long alarmCategoryGammaCount;
+        long alarmCategoryNeutronCount;
         final OcrBloomFilter.Accumulator ocrAccumulator = new OcrBloomFilter.Accumulator();
 
         int observeRow(long obsId, String resultJson, Map<String, Long> eventLocators) {
             rowCount++;
             if (resultJson == null || resultJson.isBlank())
-                return 0;
+                return JsonCqlEvaluator.BIT_MASK_V2;
 
             boolean maybeSummary = resultJson.indexOf("gammaAlarm") >= 0
                     || resultJson.indexOf("neutronAlarm") >= 0
                     || resultJson.indexOf("alarmState") >= 0
                     || resultJson.indexOf("tamperStatus") >= 0
                     || resultJson.indexOf("derivedData") >= 0
+                    || resultJson.indexOf("alarmCategoryCode") >= 0
                     || resultJson.indexOf("adjudicatedIds") >= 0
                     || resultJson.indexOf("\\u") >= 0;
             boolean maybeOcr = resultJson.indexOf("normalizedValue") >= 0 || resultJson.indexOf("\\u") >= 0;
             boolean maybeEventId = resultJson.indexOf("eventId") >= 0 || resultJson.indexOf("\\u") >= 0;
             if (!maybeSummary && !maybeOcr && !maybeEventId)
-                return 0;
+                return JsonCqlEvaluator.BIT_MASK_V2;
 
-            int mask = maybeSummary ? JsonCqlEvaluator.computeSummaryMask(resultJson) : 0;
+            int mask = maybeSummary
+                    ? JsonCqlEvaluator.computeSummaryMask(resultJson)
+                    : JsonCqlEvaluator.BIT_MASK_V2;
             if (maybeSummary) {
                 boolean gTrue = (mask & JsonCqlEvaluator.BIT_GAMMA_TRUE) != 0;
                 boolean gFalse = (mask & JsonCqlEvaluator.BIT_GAMMA_FALSE) != 0;
@@ -1802,10 +1808,13 @@ public final class ArchiveCompactionManager {
                 if ((mask & JsonCqlEvaluator.BIT_FAULT_GAMMA_HIGH) != 0) gammaHighFaultCount++;
                 if ((mask & JsonCqlEvaluator.BIT_FAULT_GAMMA_LOW) != 0) gammaLowFaultCount++;
                 if ((mask & JsonCqlEvaluator.BIT_FAULT_NEUTRON) != 0) neutronFaultCount++;
+                if ((mask & JsonCqlEvaluator.BIT_FAULT_NEUTRON_HIGH) != 0) neutronHighFaultCount++;
                 if ((mask & JsonCqlEvaluator.BIT_FAULT_EXT_OCC) != 0) extendedOccupancyFaultCount++;
                 if ((mask & JsonCqlEvaluator.BIT_TAMPER_TRUE) != 0) tamperTrueCount++;
                 if ((mask & JsonCqlEvaluator.BIT_RS350_GAMMA) != 0) rs350GammaAlarmCount++;
                 if ((mask & JsonCqlEvaluator.BIT_RS350_NEUTRON) != 0) rs350NeutronAlarmCount++;
+                if ((mask & JsonCqlEvaluator.BIT_ALARM_CAT_GAMMA) != 0) alarmCategoryGammaCount++;
+                if ((mask & JsonCqlEvaluator.BIT_ALARM_CAT_NEUTRON) != 0) alarmCategoryNeutronCount++;
             }
 
             if (maybeOcr || maybeEventId) {
@@ -1891,10 +1900,13 @@ public final class ArchiveCompactionManager {
                     gammaHighFaultCount,
                     gammaLowFaultCount,
                     neutronFaultCount,
+                    neutronHighFaultCount,
                     extendedOccupancyFaultCount,
                     tamperTrueCount,
                     rs350GammaAlarmCount,
                     rs350NeutronAlarmCount,
+                    alarmCategoryGammaCount,
+                    alarmCategoryNeutronCount,
                     ocrAccumulator.finish());
         }
     }

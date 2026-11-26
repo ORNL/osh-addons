@@ -183,7 +183,9 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     archiveConfig);
             this.archiveCatalog.migrate();
             if (archiveConfig.enabled && archiveConfig.rootDirectory != null && !archiveConfig.rootDirectory.isBlank()) {
-                this.archiveCatalog.backfillGenerationSummariesBatch(Path.of(archiveConfig.rootDirectory), 500);
+                Path archiveRoot = Path.of(archiveConfig.rootDirectory);
+                this.archiveCatalog.backfillGenerationSummariesBatch(archiveRoot, 500);
+                this.archiveCatalog.backfillExtendedSummaryCountersBatch(archiveRoot, 32);
             }
             this.archiveCatalog.maximumObservationId().ifPresent(archiveMaximum ->
                     lastId.accumulateAndGet(archiveMaximum, Math::max));
@@ -360,7 +362,9 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             immutableStage.retireVerifiedPartitions();
         if (archiveCompaction != null)
             archiveCompaction.drainDeletingGenerations(Instant.now());
-        archiveCatalog.backfillGenerationSummariesBatch(Path.of(archiveConfig.rootDirectory), 100);
+        Path archiveRoot = Path.of(archiveConfig.rootDirectory);
+        archiveCatalog.backfillGenerationSummariesBatch(archiveRoot, 100);
+        archiveCatalog.backfillExtendedSummaryCountersBatch(archiveRoot, 32);
         archiveCatalog.migrateLegacyOverlaySchemas(250);
         backfillLegacyTombstoneDataStreams(500);
         long now = System.currentTimeMillis();
@@ -4988,6 +4992,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             List<ArchiveGeneration> unbackedGens = new ArrayList<>();
             Map<UUID, Set<Long>> missingMaskIdsByGen = new HashMap<>();
 
+            boolean needV2Mask = JsonCqlEvaluator.requiresSummaryMaskV2(maskConjuncts);
             for (ArchiveGeneration generation : misses) {
                 Set<Long> genMutated = missTargets.get(generation.id());
                 Map<Long, ArchiveCatalog.MutatedBaseSummaryRow> rowsById = persisted.get(generation.id());
@@ -4999,7 +5004,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     for (Long obsId : genMutated) {
                         ArchiveCatalog.MutatedBaseSummaryRow row = rowsById.get(obsId);
                         if (row == null || row.summaryMask() == null || row.dataStreamId() == null ||
-                                !generation.sha256().equals(row.generationSha256())) {
+                                !generation.sha256().equals(row.generationSha256()) ||
+                                (needV2Mask && (row.summaryMask() & JsonCqlEvaluator.BIT_MASK_V2) == 0)) {
                             allReady = false;
                             if (missingIds == null)
                                 missingIds = new HashSet<>();
@@ -5033,7 +5039,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 boolean allReady = rowsById != null && genMutated.stream().allMatch(obsId -> {
                     ArchiveCatalog.MutatedBaseSummaryRow row = rowsById.get(obsId);
                     return row != null && row.summaryMask() != null && row.dataStreamId() != null &&
-                            generation.sha256().equals(row.generationSha256());
+                            generation.sha256().equals(row.generationSha256()) &&
+                            (!needV2Mask || (row.summaryMask() & JsonCqlEvaluator.BIT_MASK_V2) != 0);
                 });
                 if (allReady) {
                     long matched = countMatchingPersistedBaseMasks(
@@ -5132,9 +5139,23 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     }
 
     private void runBackgroundBaseSummaryBackfill() {
+        long totalExtendedGens = 0L;
         long totalRows = 0L;
         long totalGens = 0L;
         try {
+            if (archiveConfig.rootDirectory != null && !archiveConfig.rootDirectory.isBlank()) {
+                Path archiveRoot = Path.of(archiveConfig.rootDirectory);
+                while (!storeClosed.get() && !Thread.currentThread().isInterrupted()) {
+                    int batch = archiveCatalog.backfillExtendedSummaryCountersBatch(archiveRoot, 32);
+                    if (batch <= 0)
+                        break;
+                    totalExtendedGens += batch;
+                }
+                if (totalExtendedGens > 0L) {
+                    LOG.info("Backfilled extended fault/alarm-category summary counters across {} archive generation(s)",
+                            totalExtendedGens);
+                }
+            }
             while (!storeClosed.get() && !Thread.currentThread().isInterrupted()) {
                 java.util.LinkedHashMap<ArchiveGeneration, Set<Long>> missing =
                         archiveCatalog.findMutatedGenerationsMissingBaseSummary(16);

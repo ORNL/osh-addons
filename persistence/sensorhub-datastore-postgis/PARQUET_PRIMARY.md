@@ -90,11 +90,87 @@ WSL 2), and keeps `oscar_archive_schema` completely free of compaction churn.
   directories, keeping `oscar.sh archive verify` continuously clean while
   failing closed on any file whose UUID appears in `oscar_archive_generation`.
 - **Metadata acceleration:** `oscar_obs_latest` serves `resultTime=latest` /
-  `phenomenonTime=latest` in `< 1 ms`; `oscar_archive_schema` stores 23 exact
-  per-generation, per-datastream summary counters plus selective 256-byte
-  `ocr_bloom` + min/max zone-maps (`NULL` on `RAW_TELEMETRY`, 1-byte sentinel
-  on non-OCR event streams); `oscar_event_locator` indexes `eventId`; and
+  `phenomenonTime=latest` in `< 1 ms`; `oscar_archive_schema` stores 26 exact
+  per-generation, per-datastream summary counters (including
+  `neutron_high_fault_count`, `alarm_category_gamma_count`, and
+  `alarm_category_neutron_count` alongside occupancy, gamma/neutron/combined
+  alarm, adjudication-split, gamma/extended-occupancy fault, tamper, and
+  legacy RS-350 counters) plus selective 256-byte `ocr_bloom` + min/max
+  zone-maps (`NULL` on `RAW_TELEMETRY`, 1-byte sentinel on non-OCR event
+  streams); `oscar_event_locator` indexes `eventId`; and
   `oscar_archive_id_block` prunes point lookups before opening Parquet.
+
+## Developer Anti-Regression Guide
+
+Future contributors modifying CQL filters, statistics/report queries, summary
+counters, export/compaction pipelines, or DuckDB operations **must** uphold the
+following invariants:
+
+1. **CQL <-> Summary Counter Lockstep (`StatisticsOutput` / `ReportDataAggregator`):**
+   - Every CQL predicate executed across high-volume telemetry streams
+     (`gammaCounts`, `neutronCounts`, `occupancyStatus`, `alarm`) must map to
+     an exact `JsonCqlEvaluator.SummaryCounterSpec` backed by columns in
+     `oscar_archive_schema`, populated in both
+     `ArchiveCatalog.populateGenerationSummariesAndLatest` and
+     `ArchiveCompactionManager.StreamStatsAccumulator`.
+   - Even a minor string mismatch (for example, matching `"Fault - Neutron"`
+     instead of `"Fault - Neutron High"`, or omitting
+     `alarmCategoryCode = 'Gamma'` / `'Neutron'`) causes `summaryCounterSpec()`
+     to return empty for the entire `OR` predicate (`faultCQL`), forcing every
+     hourly `StatisticsOutput` tick and Report query to full-scan 30 days of
+     `RAW_TELEMETRY` (`135M+` rows, `> 5` minutes) in DuckDB and hold live
+     `cold-cql-count-*` scratch directories.
+   - Whenever adding or changing a CQL filter in `StatisticsOutput` or
+     `reports/helpers/Utils`, add an assertion to
+     `TestArchiveLifecycleInvariants.statisticsAndReportCqlQueriesMapToExactSummaryCountersAndV2Masks`
+     proving an exact `SummaryCounterSpec` and summary-mask coverage.
+2. **Adding New Nullable Summary Columns Safely (Zero False Pruning & Fast Upgrades):**
+   - Never use `COALESCE(s.<new_col>, 0)` as `SummaryCounterSpec.upperBoundExpr()`
+     for a nullable column added after initial archive creation: pre-backfill
+     rows with `summary_populated = true` and `<new_col> IS NULL` would evaluate
+     to `0` and be falsely pruned as zero-match generations. Always use
+     `COALESCE(s.<new_col>, COALESCE(s.row_count, 0))` for `upperBoundExpr` and
+     `(s.summary_populated AND s.<new_col> IS NOT NULL)` for `exactReadyExpr`.
+   - In `ArchiveCatalog.migrate()`, immediately zero-fill streams whose SWE
+     schema cannot emit the target field via a subquery on the compact
+     `oscar_archive_schema_blob` table (`WHERE schema_sha256 IN (SELECT
+     schema_sha256 FROM oscar_archive_schema_blob WHERE ...)`). Never join and
+     text-scan `oscar_archive_schema` directly across millions of rows.
+   - Backfill remaining eligible pre-upgrade generations via a targeted
+     read-only DuckDB aggregation (`read_parquet([...], filename=true,
+     union_by_name=true)` filtered by `WHERE datastream_id IN (...)` and
+     pre-gated by `contains(result_json, ...)` before `json_extract_string`) in
+     bounded chunks (e.g., `16` files per session) — never via PostgreSQL
+     temporary-table staging (`stageExportedRows`).
+   - Register every background DuckDB operation name (such as
+     `"summary-backfill"`, `"archive-compaction"`, `"cold-cql-count"`) in
+     `DuckDbResourcePolicy.AdmissionController.isBackgroundCountOperation(...)`
+     so background work always leaves one of the two DuckDB session permits
+     available for interactive UI/API queries and exports.
+3. **Versioned `base_summary_mask` Bitmask Evolution:**
+   - Overlay and tombstone rows persist a compact 4-byte `base_summary_mask`
+     computed by `JsonCqlEvaluator.computeSummaryMask(resultJson)`. Whenever
+     adding new summary bits (e.g., `BIT_FAULT_NEUTRON_HIGH`,
+     `BIT_ALARM_CAT_GAMMA`, `BIT_ALARM_CAT_NEUTRON`), guard them behind a
+     non-negative version marker bit (`BIT_MASK_V2 = 1 << 30`). Legacy pre-upgrade
+     masks lacking the version marker must return `Optional.empty()` for the new
+     predicates (triggering lazy on-demand backfill and upgrade in
+     `OscarTieredObsStore.resolveMutatedBaseMatchCountsByGeneration` and
+     `ArchiveCatalog.backfillMutatedBaseSummaries`) while continuing to answer
+     all legacy predicates directly with zero Parquet I/O.
+4. **Mixed V1/V2 Parquet Reads & Bounded Memory (`256 MiB` DuckDB Cap):**
+   - Always pass `union_by_name=true` when calling DuckDB `read_parquet([...])`
+     across multiple generations so 11-column (`RAW_GATED`, `RAW_TELEMETRY`)
+     and 20-column (`RAW_EVENTS`, `DAILY_EVENTS`, `MONTHLY_EVENTS`) Parquet
+     files combine without schema mismatch errors.
+   - Always use `DuckDbResourcePolicy.openFileBacked(...)` with native
+     `DuckDBAppender` (never in-memory `jdbc:duckdb:` or multi-row SQL `VALUES`
+     inserts) for large export/compaction writes, and spill multi-generation
+     merge chunks through `DuckDbResourcePolicy.ScratchDirectory` to avoid
+     DuckDB native OOMs under `256 MiB` `memory_limit`.
+   - Never route high-frequency telemetry streams into `RAW_EVENTS` /
+     `DAILY_EVENTS` / `MONTHLY_EVENTS`, and never allocate `ocr_bloom` bytes on
+     `RAW_TELEMETRY` (`ocr_bloom` must remain `NULL`).
 
 ## Index Policy
 

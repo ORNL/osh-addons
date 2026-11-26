@@ -1484,4 +1484,225 @@ public class TestMultiTierParquetCompactionIntegration {
             }
         }
     }
+
+    @Test
+    public void extendedFaultAndAlarmCategorySummariesServeFromCatalogAndBackfillPreUpgradeNulls() throws Exception {
+        Path archiveRoot = temporary.newFolder("extended-summary-archive").toPath();
+        Path spillRoot = archiveRoot.resolveSibling("extended-summary-spill");
+        String table = uniqueTableName("ext_summary");
+
+        TieredArchiveConfig config = parquetPrimaryConfig(archiveRoot, spillRoot,
+                List.of("alarm", "gammaCounts", "neutronCounts", "occupancyStatus"));
+        config.compactionUnlinkGraceMinutes = 0;
+
+        OscarTieredObsStore store = openStore(table, config);
+        BigId gammaStream = addAlarmStateStream(store, 601L, "gammaCounts",
+                new String[]{"Background", "Alarm", "Fault - Gamma High", "Fault - Gamma Low"});
+        BigId neutronStream = addAlarmStateStream(store, 602L, "neutronCounts",
+                new String[]{"Background", "Alarm", "Fault - Neutron High", "Fault - Neutron Low"});
+        BigId occStatusStream = addAlarmStateStream(store, 603L, "occupancyStatus",
+                new String[]{"Occupied", "Fault - Extended Occupancy"});
+        BigId rs350AlarmStream = addAlarmCategoryStream(store, 604L, "alarm");
+
+        Instant day = Instant.parse("2026-08-22T00:00:00Z");
+        Instant now = Instant.parse("2026-08-25T12:00:00Z");
+
+        store.add(alarmStateObs(gammaStream, day.plusSeconds(30L), "Background"));
+        store.add(alarmStateObs(gammaStream, day.plusSeconds(60L), "Fault - Gamma High"));
+        store.add(alarmStateObs(gammaStream, day.plusSeconds(90L), "Fault - Gamma Low"));
+
+        store.add(alarmStateObs(neutronStream, day.plusSeconds(30L), "Background"));
+        store.add(alarmStateObs(neutronStream, day.plusSeconds(60L), "Fault - Neutron High"));
+        store.add(alarmStateObs(neutronStream, day.plusSeconds(90L), "Fault - Neutron High"));
+        store.add(alarmStateObs(neutronStream, day.plusSeconds(120L), "Fault - Neutron Low"));
+
+        store.add(alarmStateObs(occStatusStream, day.plusSeconds(60L), "Fault - Extended Occupancy"));
+
+        store.add(alarmCategoryObs(rs350AlarmStream, day.plusSeconds(45L), "Gamma"));
+        store.add(alarmCategoryObs(rs350AlarmStream, day.plusSeconds(75L), "Gamma"));
+        store.add(alarmCategoryObs(rs350AlarmStream, day.plusSeconds(105L), "Neutron"));
+        commitStore(store);
+
+        // Split-at-export writes RS-350 alarm -> RAW_EVENTS and gammaCounts/neutronCounts/occupancyStatus -> RAW_TELEMETRY.
+        ArchiveGeneration rawEvents = store.archiveWindow(
+                day, day.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
+        store.archiveWindow(day, day.plus(30, ChronoUnit.MINUTES), TieredArchiveConfig.PROFILE_RAW_TELEMETRY).orElseThrow();
+        store.maintainArchiveLifecycle();
+        try (Connection conn = openPg();
+             PreparedStatement backdate = conn.prepareStatement(
+                     "UPDATE oscar_archive_generation SET activated_at = ? WHERE id = ?")) {
+            UtcJdbcTime.setInstant(backdate, 1, now.minus(4, ChronoUnit.HOURS));
+            backdate.setObject(2, rawEvents.id());
+            backdate.executeUpdate();
+        }
+        ArchiveCompactionManager.CompactionCycleSummary compactSummary = store.runCompactionCycle(now);
+        assertEquals(1, compactSummary.daysCompacted());
+
+        ObsFilter neutronHighFilter = new ObsFilter.Builder()
+                .withDataStreams(neutronStream, rs350AlarmStream)
+                .withCQLFilter("alarmState = 'Fault - Neutron High'")
+                .build();
+        ObsFilter allFaultsFilter = new ObsFilter.Builder()
+                .withDataStreams(gammaStream, neutronStream, occStatusStream, rs350AlarmStream)
+                .withCQLFilter("alarmState = 'Fault - Neutron High' OR alarmState = 'Fault - Gamma Low' OR alarmState = 'Fault - Gamma High' OR alarmState = 'Fault - Extended Occupancy'")
+                .build();
+        ObsFilter rs350GammaFilter = new ObsFilter.Builder()
+                .withDataStreams(rs350AlarmStream)
+                .withCQLFilter("alarmCategoryCode = 'Gamma'")
+                .build();
+        ObsFilter rs350NeutronFilter = new ObsFilter.Builder()
+                .withDataStreams(rs350AlarmStream)
+                .withCQLFilter("alarmCategoryCode = 'Neutron'")
+                .build();
+
+        assertEquals(2L, store.countMatchingEntries(neutronHighFilter));
+        assertEquals(5L, store.countMatchingEntries(allFaultsFilter));
+        assertEquals(2L, store.countMatchingEntries(rs350GammaFilter));
+        assertEquals(1L, store.countMatchingEntries(rs350NeutronFilter));
+
+        // Catalog summary plan must answer all four queries purely from PostgreSQL with 0 remaining DuckDB candidates!
+        List<ArchiveGeneration> allCold = store.getArchiveCatalog().candidates(
+                day, day.plus(1, ChronoUnit.DAYS), null, null, null, null);
+        assertEquals(2, allCold.size()); // 1 DAILY_EVENTS + 1 RAW_TELEMETRY
+        var nhPlan = store.getArchiveCatalog().summarizeColdCandidates(
+                allCold, null, null, Set.of(neutronStream.getIdAsLong(), rs350AlarmStream.getIdAsLong()),
+                Set.of(), org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.summaryCounterSpec(
+                        neutronHighFilter.getCQLFilter()).orElseThrow());
+        assertEquals(2L, nhPlan.summarizedCount());
+        assertTrue("Expected zero DuckDB candidates for neutronFaultCQL", nhPlan.remainingCandidates().isEmpty());
+
+        var faultPlan = store.getArchiveCatalog().summarizeColdCandidates(
+                allCold, null, null, Set.of(gammaStream.getIdAsLong(), neutronStream.getIdAsLong(),
+                        occStatusStream.getIdAsLong(), rs350AlarmStream.getIdAsLong()),
+                Set.of(), org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.summaryCounterSpec(
+                        allFaultsFilter.getCQLFilter()).orElseThrow());
+        assertEquals(5L, faultPlan.summarizedCount());
+        assertTrue("Expected zero DuckDB candidates for faultCQL", faultPlan.remainingCandidates().isEmpty());
+
+        // Simulate pre-upgrade NULL extended columns:
+        // 1) Counts MUST stay 100% exact via DuckDB fallback (never falsely pruned to 0).
+        // 2) migrate() MUST zero-fill ineligible schemas (gammaCounts, occupancyStatus) while keeping eligible streams NULL.
+        // 3) backfillExtendedSummaryCountersBatch MUST populate all remaining eligible rows with exact counts.
+        try (Connection conn = openPg(); Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate("UPDATE oscar_archive_schema SET " +
+                    "neutron_high_fault_count = NULL, alarm_category_gamma_count = NULL, alarm_category_neutron_count = NULL");
+        }
+        assertEquals(2L, store.countMatchingEntries(neutronHighFilter));
+        assertEquals(5L, store.countMatchingEntries(allFaultsFilter));
+        assertEquals(2L, store.countMatchingEntries(rs350GammaFilter));
+        assertEquals(1L, store.countMatchingEntries(rs350NeutronFilter));
+
+        store.getArchiveCatalog().migrate();
+        try (Connection conn = openPg();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT datastream_id, neutron_high_fault_count, alarm_category_gamma_count, alarm_category_neutron_count " +
+                             "FROM oscar_archive_schema WHERE generation_id IN (SELECT id FROM oscar_archive_generation WHERE store_key = ? AND state IN ('ACTIVE','SEALED'))")) {
+            ps.setString(1, table);
+            Map<Long, Long[]> afterMigrate = new HashMap<>();
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    afterMigrate.put(rs.getLong(1), new Long[]{
+                            rs.getObject(2, Long.class),
+                            rs.getObject(3, Long.class),
+                            rs.getObject(4, Long.class)
+                    });
+                }
+            }
+            // gammaCounts & occupancyStatus have Gamma/ExtendedOccupancy schemas without Neutron High or alarmCategoryCode -> zeroed immediately
+            assertEquals(Long.valueOf(0L), afterMigrate.get(gammaStream.getIdAsLong())[0]);
+            assertEquals(Long.valueOf(0L), afterMigrate.get(gammaStream.getIdAsLong())[1]);
+            assertEquals(Long.valueOf(0L), afterMigrate.get(occStatusStream.getIdAsLong())[0]);
+            // neutronCounts has Neutron High allowedValue -> stays NULL until DuckDB backfill; alarmCategoryCode zeroed immediately
+            assertEquals(null, afterMigrate.get(neutronStream.getIdAsLong())[0]);
+            assertEquals(Long.valueOf(0L), afterMigrate.get(neutronStream.getIdAsLong())[1]);
+            // rs350 alarm has alarmCategoryCode -> alarmCategory columns stay NULL until DuckDB backfill; neutron_high zeroed immediately
+            assertEquals(Long.valueOf(0L), afterMigrate.get(rs350AlarmStream.getIdAsLong())[0]);
+            assertEquals(null, afterMigrate.get(rs350AlarmStream.getIdAsLong())[1]);
+        }
+
+        int backfilledGens = store.getArchiveCatalog().backfillExtendedSummaryCountersBatch(archiveRoot, 32);
+        assertEquals(2, backfilledGens);
+        assertEquals(0, store.getArchiveCatalog().backfillExtendedSummaryCountersBatch(archiveRoot, 32));
+
+        var postBackfillPlan = store.getArchiveCatalog().summarizeColdCandidates(
+                allCold, null, null, Set.of(gammaStream.getIdAsLong(), neutronStream.getIdAsLong(),
+                        occStatusStream.getIdAsLong(), rs350AlarmStream.getIdAsLong()),
+                Set.of(), org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.summaryCounterSpec(
+                        allFaultsFilter.getCQLFilter()).orElseThrow());
+        assertEquals(5L, postBackfillPlan.summarizedCount());
+        assertTrue(postBackfillPlan.remainingCandidates().isEmpty());
+
+        List<ArchiveGeneration> rs350Cold = store.getArchiveCatalog().candidates(
+                day, day.plus(1, ChronoUnit.DAYS), null, null, null, Set.of(rs350AlarmStream.getIdAsLong()));
+        assertEquals(1, rs350Cold.size()); // Only DAILY_EVENTS contains rs350AlarmStream; RAW_TELEMETRY is excluded
+        var postRsGammaPlan = store.getArchiveCatalog().summarizeColdCandidates(
+                rs350Cold, null, null, Set.of(rs350AlarmStream.getIdAsLong()),
+                Set.of(), org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.summaryCounterSpec(
+                        rs350GammaFilter.getCQLFilter()).orElseThrow());
+        assertEquals(2L, postRsGammaPlan.summarizedCount());
+        assertTrue(postRsGammaPlan.remainingCandidates().isEmpty());
+    }
+
+    private static BigId addAlarmStateStream(
+            OscarTieredObsStore store, long sysNum, String outputName, String[] allowedStates) throws Exception {
+        SWEHelper swe = new SWEHelper();
+        var catBuilder = swe.createCategory().name("alarmState");
+        if (allowedStates != null && allowedStates.length > 0)
+            catBuilder.addAllowedValues(allowedStates);
+        DataRecord rec = swe.createRecord().name(outputName)
+                .addField("alarmState", catBuilder.build())
+                .build();
+        DataStreamInfo info = new DataStreamInfo.Builder()
+                .withName(outputName)
+                .withSystem(new FeatureId(BigId.fromLong(ID_SCOPE, sysNum), "urn:oscar:test:sys:" + sysNum))
+                .withRecordDescription(rec)
+                .withRecordEncoding(new TextEncodingImpl())
+                .build();
+        return store.getDataStreams().add(info).getInternalID();
+    }
+
+    private static IObsData alarmStateObs(BigId stream, Instant time, String state) {
+        SWEHelper swe = new SWEHelper();
+        DataRecord rec = swe.createRecord().name("alarmStateRec")
+                .addField("alarmState", swe.createCategory().build())
+                .build();
+        DataBlock block = rec.createDataBlock();
+        block.setStringValue(0, state);
+        return new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(time)
+                .withResultTime(time)
+                .withResult(block)
+                .build();
+    }
+
+    private static BigId addAlarmCategoryStream(OscarTieredObsStore store, long sysNum, String outputName)
+            throws Exception {
+        SWEHelper swe = new SWEHelper();
+        DataRecord rec = swe.createRecord().name(outputName)
+                .addField("alarmCategoryCode", swe.createCategory().addAllowedValues("Gamma", "Neutron").build())
+                .build();
+        DataStreamInfo info = new DataStreamInfo.Builder()
+                .withName(outputName)
+                .withSystem(new FeatureId(BigId.fromLong(ID_SCOPE, sysNum), "urn:oscar:test:sys:" + sysNum))
+                .withRecordDescription(rec)
+                .withRecordEncoding(new TextEncodingImpl())
+                .build();
+        return store.getDataStreams().add(info).getInternalID();
+    }
+
+    private static IObsData alarmCategoryObs(BigId stream, Instant time, String category) {
+        SWEHelper swe = new SWEHelper();
+        DataRecord rec = swe.createRecord().name("alarm")
+                .addField("alarmCategoryCode", swe.createCategory().build())
+                .build();
+        DataBlock block = rec.createDataBlock();
+        block.setStringValue(0, category);
+        return new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(time)
+                .withResultTime(time)
+                .withResult(block)
+                .build();
+    }
 }

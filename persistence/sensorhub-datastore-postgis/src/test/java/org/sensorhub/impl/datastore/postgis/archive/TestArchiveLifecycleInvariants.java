@@ -921,4 +921,91 @@ public class TestArchiveLifecycleInvariants {
         assertEquals(java.util.Optional.of(Boolean.TRUE), org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMaskConjuncts(windowAConjuncts, gnMask));
         assertEquals(java.util.Optional.of(Boolean.FALSE), org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMaskConjuncts(windowAConjuncts, gOnlyMask));
     }
+
+    @Test
+    public void statisticsAndReportCqlQueriesMapToExactSummaryCountersAndV2Masks() {
+        String[] exactStatsAndReportCqls = {
+                "gammaAlarm = true AND neutronAlarm = true",
+                "gammaAlarm = true AND neutronAlarm = false",
+                "gammaAlarm = false AND neutronAlarm = true",
+                "gammaAlarm = true OR neutronAlarm = true",
+                "alarmState = 'Fault - Neutron High' OR alarmState = 'Fault - Gamma Low' OR alarmState = 'Fault - Gamma High' OR alarmState = 'Fault - Extended Occupancy'",
+                "alarmState = 'Fault - Gamma Low' OR alarmState = 'Fault - Gamma High'",
+                "alarmState = 'Fault - Gamma High'",
+                "alarmState = 'Fault - Gamma Low'",
+                "alarmState = 'Fault - Neutron High'",
+                "alarmState = 'Fault - Extended Occupancy'",
+                "tamperStatus = true",
+                "alarmCategoryCode = 'Gamma'",
+                "alarmCategoryCode = 'Neutron'",
+                "alarmCategoryCode = 'Gamma' OR alarmCategoryCode = 'Neutron'"
+        };
+        for (String cql : exactStatsAndReportCqls) {
+            var filter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                    .withCQLFilter(cql).build().getCQLFilter();
+            var specOpt = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.summaryCounterSpec(filter);
+            assertTrue("Expected exact SummaryCounterSpec for Statistics/Report CQL: " + cql, specOpt.isPresent());
+            var spec = specOpt.get();
+            assertFalse("SummaryCounterSpec must be exact-ready for Statistics/Report CQL: " + cql,
+                    "false".equals(spec.exactReadyExpr()));
+            assertTrue("Expected summary-mask support for Statistics/Report CQL: " + cql,
+                    org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.supportsSummaryMaskEvaluation(filter));
+        }
+
+        // Nullable v2 counters must NEVER use COALESCE(col, 0) as upperBoundExpr (which would
+        // falsely prune pre-backfill generations as zero-match), and must guard exactReadyExpr on IS NOT NULL.
+        var nhFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("alarmState = 'Fault - Neutron High'").build().getCQLFilter();
+        var nhSpec = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.summaryCounterSpec(nhFilter).orElseThrow();
+        assertEquals("COALESCE(s.neutron_high_fault_count, COALESCE(s.row_count, 0))", nhSpec.upperBoundExpr());
+        assertEquals("COALESCE(s.neutron_high_fault_count, 0)", nhSpec.exactExpr());
+        assertEquals("(s.summary_populated AND s.neutron_high_fault_count IS NOT NULL)", nhSpec.exactReadyExpr());
+
+        var faultOrFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("alarmState = 'Fault - Neutron High' OR alarmState = 'Fault - Gamma Low' OR alarmState = 'Fault - Gamma High' OR alarmState = 'Fault - Extended Occupancy'")
+                .build().getCQLFilter();
+        var faultOrSpec = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.summaryCounterSpec(faultOrFilter).orElseThrow();
+        assertTrue(faultOrSpec.upperBoundExpr().contains("COALESCE(s.neutron_high_fault_count, COALESCE(s.row_count, 0))"));
+        assertEquals("(s.summary_populated AND s.neutron_high_fault_count IS NOT NULL)", faultOrSpec.exactReadyExpr());
+
+        var rsGammaFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("alarmCategoryCode = 'Gamma'").build().getCQLFilter();
+        var rsGammaSpec = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.summaryCounterSpec(rsGammaFilter).orElseThrow();
+        assertEquals("COALESCE(s.alarm_category_gamma_count, COALESCE(s.row_count, 0))", rsGammaSpec.upperBoundExpr());
+        assertEquals("(s.summary_populated AND s.alarm_category_gamma_count IS NOT NULL)", rsGammaSpec.exactReadyExpr());
+
+        // V2 bitmask evaluation & legacy V1 bitmask backward safety
+        int nhMask = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.computeSummaryMask(
+                "{\"alarmState\":\"Fault - Neutron High\"}");
+        int rsGammaMask = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.computeSummaryMask(
+                "{\"alarmCategoryCode\":\"Gamma\"}");
+        int rsNeutronMask = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.computeSummaryMask(
+                "{\"alarmCategoryCode\":\"Neutron\"}");
+        int gammaHighMask = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.computeSummaryMask(
+                "{\"alarmState\":\"Fault - Gamma High\"}");
+
+        assertTrue((nhMask & org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.BIT_MASK_V2) != 0);
+        assertEquals(java.util.Optional.of(Boolean.TRUE),
+                org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMask(nhFilter, nhMask));
+        assertEquals(java.util.Optional.of(Boolean.TRUE),
+                org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMask(faultOrFilter, nhMask));
+        assertEquals(java.util.Optional.of(Boolean.FALSE),
+                org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMask(nhFilter, gammaHighMask));
+        assertEquals(java.util.Optional.of(Boolean.TRUE),
+                org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMask(rsGammaFilter, rsGammaMask));
+        assertEquals(java.util.Optional.of(Boolean.FALSE),
+                org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMask(rsGammaFilter, rsNeutronMask));
+
+        // Legacy V1 mask (no BIT_MASK_V2) must return Optional.empty() for V2 predicates so callers fall back safely,
+        // while continuing to evaluate V1 predicates directly.
+        int legacyV1Mask = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.BIT_FAULT_GAMMA_HIGH;
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMask(nhFilter, legacyV1Mask).isEmpty());
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMask(rsGammaFilter, legacyV1Mask).isEmpty());
+        var ghFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withCQLFilter("alarmState = 'Fault - Gamma High'").build().getCQLFilter();
+        assertEquals(java.util.Optional.of(Boolean.TRUE),
+                org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.tryEvaluateSummaryMask(ghFilter, legacyV1Mask));
+        assertTrue(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.requiresSummaryMaskV2(List.of(faultOrFilter)));
+        assertFalse(org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.requiresSummaryMaskV2(List.of(ghFilter)));
+    }
 }
