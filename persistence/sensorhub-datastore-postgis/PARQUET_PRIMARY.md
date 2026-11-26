@@ -146,7 +146,13 @@ following invariants:
      `"summary-backfill"`, `"archive-compaction"`, `"cold-cql-count"`) in
      `DuckDbResourcePolicy.AdmissionController.isBackgroundCountOperation(...)`
      so background work always leaves one of the two DuckDB session permits
-     available for interactive UI/API queries and exports.
+     available for interactive UI/API queries and exports. Because all
+     background operations share that single background permit, background
+     backfill loops **must** distinguish `SQLTransientException` busy timeouts
+     from "no work remaining" and retry with backoff rather than exiting
+     prematurely while startup `StatisticsOutput` runs; also pre-filter in
+     `WHERE` (only for columns still `NULL` in the chunk) so non-matching
+     telemetry rows never enter DuckDB `GROUP BY` hash aggregates.
 3. **Versioned `base_summary_mask` Bitmask Evolution:**
    - Overlay and tombstone rows persist a compact 4-byte `base_summary_mask`
      computed by `JsonCqlEvaluator.computeSummaryMask(resultJson)`. Whenever

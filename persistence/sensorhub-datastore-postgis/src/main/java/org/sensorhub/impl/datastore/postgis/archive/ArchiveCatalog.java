@@ -2225,6 +2225,10 @@ public final class ArchiveCatalog {
      * Targeted DuckDB backfill for extended fault ({@code Fault - Neutron High})
      * and RS-350 {@code alarmCategoryCode} summary counters on pre-upgrade archive
      * generations without staging rows into PostgreSQL temporary tables.
+     *
+     * @return number of generations backfilled, {@code 0} when no readable pending
+     *         generations remain, or {@code -1} when DuckDB background admission
+     *         was transiently busy so the caller should retry after a short backoff.
      */
     public int backfillExtendedSummaryCountersBatch(Path archiveRoot, int maxGenerations) {
         if (archiveRoot == null || maxGenerations < 1)
@@ -2240,6 +2244,8 @@ public final class ArchiveCatalog {
                 "OR s.alarm_category_neutron_count IS NULL)) " +
                 "ORDER BY g.window_end DESC, g.id LIMIT ?";
         Map<UUID, Set<Long>> neededStreamsByGen = new HashMap<>();
+        Set<UUID> gensNeedingNh = new HashSet<>();
+        Set<UUID> gensNeedingAc = new HashSet<>();
         try (Connection connection = connections.open()) {
             connection.setReadOnly(true);
             try (PreparedStatement statement = connection.prepareStatement(pendingSql)) {
@@ -2256,16 +2262,24 @@ public final class ArchiveCatalog {
             java.sql.Array genArray = connection.createArrayOf("uuid",
                     pending.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
             try (PreparedStatement streamsStmt = connection.prepareStatement(
-                    "SELECT generation_id, datastream_id FROM oscar_archive_schema " +
+                    "SELECT generation_id, datastream_id, " +
+                            "(neutron_high_fault_count IS NULL) AS need_nh, " +
+                            "(alarm_category_gamma_count IS NULL OR alarm_category_neutron_count IS NULL) AS need_ac " +
+                            "FROM oscar_archive_schema " +
                             "WHERE generation_id = ANY (?::uuid[]) AND summary_populated " +
                             "AND (neutron_high_fault_count IS NULL OR alarm_category_gamma_count IS NULL " +
                             "OR alarm_category_neutron_count IS NULL)")) {
                 streamsStmt.setArray(1, genArray);
                 try (ResultSet rs = streamsStmt.executeQuery()) {
                     while (rs.next()) {
+                        UUID genId = rs.getObject(1, UUID.class);
                         neededStreamsByGen
-                                .computeIfAbsent(rs.getObject(1, UUID.class), ignored -> new HashSet<>())
+                                .computeIfAbsent(genId, ignored -> new HashSet<>())
                                 .add(rs.getLong(2));
+                        if (rs.getBoolean(3))
+                            gensNeedingNh.add(genId);
+                        if (rs.getBoolean(4))
+                            gensNeedingAc.add(genId);
                     }
                 }
             } finally {
@@ -2303,12 +2317,15 @@ public final class ArchiveCatalog {
             return 0;
 
         int backfilled = 0;
+        boolean transientBusy = false;
         final int chunkSize = 16;
         for (int start = 0; start < readable.size(); start += chunkSize) {
             List<ArchiveGeneration> chunk = readable.subList(start, Math.min(readable.size(), start + chunkSize));
             Map<String, UUID> genByPathString = new HashMap<>(chunk.size() * 2);
             Map<Path, UUID> genByNormPath = new HashMap<>(chunk.size() * 2);
             Set<Long> chunkStreams = new HashSet<>();
+            boolean chunkNeedNh = false;
+            boolean chunkNeedAc = false;
             StringBuilder fileList = new StringBuilder();
             for (ArchiveGeneration gen : chunk) {
                 Path file = realPathByGen.get(gen.id());
@@ -2319,8 +2336,12 @@ public final class ArchiveCatalog {
                 genByPathString.put(pathStr, gen.id());
                 genByNormPath.put(file.toAbsolutePath().normalize(), gen.id());
                 chunkStreams.addAll(neededStreamsByGen.getOrDefault(gen.id(), Set.of()));
+                if (gensNeedingNh.contains(gen.id()))
+                    chunkNeedNh = true;
+                if (gensNeedingAc.contains(gen.id()))
+                    chunkNeedAc = true;
             }
-            if (chunkStreams.isEmpty())
+            if (chunkStreams.isEmpty() || (!chunkNeedNh && !chunkNeedAc))
                 continue;
 
             List<Long> sortedStreams = new ArrayList<>(chunkStreams);
@@ -2332,25 +2353,38 @@ public final class ArchiveCatalog {
                 streamList.append(sortedStreams.get(i));
             }
 
+            // Pre-filter in WHERE so non-matching rows (~99.99% of telemetry) never enter DuckDB's
+            // GROUP BY hash aggregate, and omit FILTER expressions for columns already populated.
+            List<String> whereMatchTerms = new ArrayList<>(3);
+            if (chunkNeedNh)
+                whereMatchTerms.add("contains(result_json, 'Fault - Neutron High')");
+            if (chunkNeedAc)
+                whereMatchTerms.add("contains(result_json, 'alarmCategoryCode')");
+            whereMatchTerms.add("contains(result_json, '\\u')");
+
+            String nhExpr = chunkNeedNh
+                    ? "count(*) FILTER (WHERE json_valid(result_json) " +
+                      "  AND json_type(json_extract(result_json, '$.alarmState')) = 'VARCHAR' " +
+                      "  AND json_extract_string(result_json, '$.alarmState') = 'Fault - Neutron High')::bigint"
+                    : "0::bigint";
+            String acGammaExpr = chunkNeedAc
+                    ? "count(*) FILTER (WHERE json_valid(result_json) " +
+                      "  AND json_type(json_extract(result_json, '$.alarmCategoryCode')) = 'VARCHAR' " +
+                      "  AND json_extract_string(result_json, '$.alarmCategoryCode') = 'Gamma')::bigint"
+                    : "0::bigint";
+            String acNeutronExpr = chunkNeedAc
+                    ? "count(*) FILTER (WHERE json_valid(result_json) " +
+                      "  AND json_type(json_extract(result_json, '$.alarmCategoryCode')) = 'VARCHAR' " +
+                      "  AND json_extract_string(result_json, '$.alarmCategoryCode') = 'Neutron')::bigint"
+                    : "0::bigint";
+
             Map<UUID, Map<Long, long[]>> countsByGenStream = new HashMap<>(chunk.size() * 2);
             String duckSql = "SELECT filename, datastream_id, " +
-                    "count(*) FILTER (WHERE result_json IS NOT NULL " +
-                    "  AND (contains(result_json, 'Fault - Neutron High') OR contains(result_json, '\\u')) " +
-                    "  AND json_valid(result_json) " +
-                    "  AND json_type(json_extract(result_json, '$.alarmState')) = 'VARCHAR' " +
-                    "  AND json_extract_string(result_json, '$.alarmState') = 'Fault - Neutron High')::bigint, " +
-                    "count(*) FILTER (WHERE result_json IS NOT NULL " +
-                    "  AND (contains(result_json, 'alarmCategoryCode') OR contains(result_json, '\\u')) " +
-                    "  AND json_valid(result_json) " +
-                    "  AND json_type(json_extract(result_json, '$.alarmCategoryCode')) = 'VARCHAR' " +
-                    "  AND json_extract_string(result_json, '$.alarmCategoryCode') = 'Gamma')::bigint, " +
-                    "count(*) FILTER (WHERE result_json IS NOT NULL " +
-                    "  AND (contains(result_json, 'alarmCategoryCode') OR contains(result_json, '\\u')) " +
-                    "  AND json_valid(result_json) " +
-                    "  AND json_type(json_extract(result_json, '$.alarmCategoryCode')) = 'VARCHAR' " +
-                    "  AND json_extract_string(result_json, '$.alarmCategoryCode') = 'Neutron')::bigint " +
+                    nhExpr + ", " + acGammaExpr + ", " + acNeutronExpr + " " +
                     "FROM read_parquet([" + fileList + "], filename=true, union_by_name=true) " +
                     "WHERE datastream_id IN (" + streamList + ") " +
+                    "AND result_json IS NOT NULL " +
+                    "AND (" + String.join(" OR ", whereMatchTerms) + ") " +
                     "GROUP BY filename, datastream_id";
             try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(
                     resourceConfig, "summary-backfill");
@@ -2368,6 +2402,9 @@ public final class ArchiveCatalog {
                     long[] counts = new long[]{rs.getLong(3), rs.getLong(4), rs.getLong(5)};
                     countsByGenStream.computeIfAbsent(genId, ignored -> new HashMap<>()).put(dsId, counts);
                 }
+            } catch (java.sql.SQLTransientException busy) {
+                transientBusy = true;
+                break;
             } catch (Exception ignored) {
                 continue;
             }
@@ -2410,7 +2447,7 @@ public final class ArchiveCatalog {
                 // Best-effort background backfill.
             }
         }
-        return backfilled;
+        return (backfilled == 0 && transientBusy) ? -1 : backfilled;
     }
 
     private static Path resolveReadableArchiveFile(Path realRoot, Path relativeObjectPath) {

@@ -5145,9 +5145,28 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         try {
             if (archiveConfig.rootDirectory != null && !archiveConfig.rootDirectory.isBlank()) {
                 Path archiveRoot = Path.of(archiveConfig.rootDirectory);
+                int consecutiveBusyRetries = 0;
+                final int maxBusyRetries = 120;
                 while (!storeClosed.get() && !Thread.currentThread().isInterrupted()) {
-                    int batch = archiveCatalog.backfillExtendedSummaryCountersBatch(archiveRoot, 32);
-                    if (batch <= 0)
+                    int batch = archiveCatalog.backfillExtendedSummaryCountersBatch(archiveRoot, 64);
+                    if (batch < 0) {
+                        // DuckDB background slot transiently held (e.g., startup StatisticsOutput scan);
+                        // back off and retry instead of abandoning pre-upgrade backfill prematurely.
+                        if (++consecutiveBusyRetries > maxBusyRetries) {
+                            LOG.warn("Deferring remaining extended summary backfill after {} busy retries (will resume on lifecycle tick)",
+                                    maxBusyRetries);
+                            break;
+                        }
+                        try {
+                            Thread.sleep(5_000L);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                        continue;
+                    }
+                    consecutiveBusyRetries = 0;
+                    if (batch == 0)
                         break;
                     totalExtendedGens += batch;
                 }
