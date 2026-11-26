@@ -131,11 +131,23 @@ following invariants:
      to `0` and be falsely pruned as zero-match generations. Always use
      `COALESCE(s.<new_col>, COALESCE(s.row_count, 0))` for `upperBoundExpr` and
      `(s.summary_populated AND s.<new_col> IS NOT NULL)` for `exactReadyExpr`.
-   - In `ArchiveCatalog.migrate()`, immediately zero-fill streams whose SWE
-     schema cannot emit the target field via a subquery on the compact
-     `oscar_archive_schema_blob` table (`WHERE schema_sha256 IN (SELECT
-     schema_sha256 FROM oscar_archive_schema_blob WHERE ...)`). Never join and
-     text-scan `oscar_archive_schema` directly across millions of rows.
+   - **Never run unbounded full-table `UPDATE`s or multi-file DuckDB backfills
+     synchronously during `ArchiveCatalog.migrate()` or `OscarTieredObsStore`
+     startup (`ModuleRegistry.loadAllModules` enforces a hard `60-second`
+     datastore startup timeout).** On multi-week/multi-year upgrades
+     (`> 64` catalog generations), a full-table `UPDATE oscar_archive_schema`
+     across millions of rows exceeds `60 s`, throws `TimeoutException`, rolls
+     back the transaction, and puts `oscar` into an infinite crash-loop. Gate
+     inline `migrate()` / constructor zero-fills to tiny archives
+     (`<= 64` generations via `hasAtMostGenerations(64)`), and drain larger
+     upgrades in bounded newest-first committed batches on
+     `oscar-base-summary-backfill` (`backfillPendingSchemaUpgradeColumnsBatch(128)`
+     combining all column updates into one pass per batch using
+     `oscar_archive_schema_blob` hash lists, followed by
+     `backfillGenerationSummariesBatch` and
+     `backfillExtendedSummaryCountersBatch`), latching each completed phase so
+     steady-state 1-minute maintenance ticks execute zero `oscar_archive_schema`
+     scans once caught up.
    - Backfill remaining eligible pre-upgrade generations via a targeted
      read-only DuckDB aggregation (`read_parquet([...], filename=true,
      union_by_name=true)` filtered by `WHERE datastream_id IN (...)` and

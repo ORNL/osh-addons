@@ -374,55 +374,72 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_bloom bytea");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_min_norm text");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_max_norm text");
-                statement.execute("UPDATE oscar_archive_schema SET " +
-                        "unadjudicated_gamma_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
-                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END, " +
-                        "unadjudicated_neutron_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END, " +
-                        "unadjudicated_gamma_neutron_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END, " +
-                        "adjudicated_gamma_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
-                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END, " +
-                        "adjudicated_neutron_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END, " +
-                        "adjudicated_gamma_neutron_alarm_count = CASE " +
-                        "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
-                        "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
-                        "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 " +
-                        "  ELSE NULL END " +
-                        "WHERE summary_populated AND (" +
-                        "  COALESCE(any_alarm_count, 0) = 0 OR " +
-                        "  COALESCE(unadjudicated_alarm_count, 0) = 0 OR " +
-                        "  COALESCE(adjudicated_alarm_count, 0) = 0 OR " +
-                        "  (COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) OR " +
-                        "  (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) OR " +
-                        "  (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0)" +
-                        ") AND (" +
-                        "  unadjudicated_gamma_alarm_count IS NULL OR " +
-                        "  unadjudicated_neutron_alarm_count IS NULL OR " +
-                        "  unadjudicated_gamma_neutron_alarm_count IS NULL" +
-                        ")");
+                // ModuleRegistry.loadAllModules enforces a 60-second datastore startup timeout.
+                // On real multi-day/multi-year deployments (> 64 generations), defer multi-million-row
+                // oscar_archive_schema backfills to bounded newest-first committed batches on
+                // OscarTieredObsStore's background backfill thread so upgrades never timeout or crash-loop.
+                int inlineLimit = inlineMigrationMaxGenerations;
+                boolean tinyArchiveForInlineBackfill;
+                try (PreparedStatement genCountProbe = connection.prepareStatement(
+                        "SELECT count(*) <= ? FROM (SELECT 1 FROM oscar_archive_generation LIMIT ?) t")) {
+                    genCountProbe.setInt(1, inlineLimit);
+                    genCountProbe.setInt(2, inlineLimit + 1);
+                    try (ResultSet rs = genCountProbe.executeQuery()) {
+                        rs.next();
+                        tinyArchiveForInlineBackfill = rs.getBoolean(1);
+                    }
+                }
+                if (tinyArchiveForInlineBackfill) {
+                    statement.execute("UPDATE oscar_archive_schema SET " +
+                            "unadjudicated_gamma_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
+                            "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END, " +
+                            "unadjudicated_neutron_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END, " +
+                            "unadjudicated_gamma_neutron_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END, " +
+                            "adjudicated_gamma_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
+                            "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END, " +
+                            "adjudicated_neutron_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END, " +
+                            "adjudicated_gamma_neutron_alarm_count = CASE " +
+                            "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                            "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                            "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 " +
+                            "  ELSE NULL END " +
+                            "WHERE summary_populated AND (" +
+                            "  COALESCE(any_alarm_count, 0) = 0 OR " +
+                            "  COALESCE(unadjudicated_alarm_count, 0) = 0 OR " +
+                            "  COALESCE(adjudicated_alarm_count, 0) = 0 OR " +
+                            "  (COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) OR " +
+                            "  (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) OR " +
+                            "  (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0)" +
+                            ") AND (" +
+                            "  unadjudicated_gamma_alarm_count IS NULL OR " +
+                            "  unadjudicated_neutron_alarm_count IS NULL OR " +
+                            "  unadjudicated_gamma_neutron_alarm_count IS NULL" +
+                            ")");
+                }
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_archive_schema_datastream_idx " +
                         "ON oscar_archive_schema (datastream_id, generation_id)");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_obs_latest (" +
@@ -433,38 +450,40 @@ public final class ArchiveCatalog {
                         "result_json jsonb NOT NULL, schema_json jsonb NOT NULL, profile text NOT NULL, " +
                         "updated_at timestamptz NOT NULL DEFAULT now(), " +
                         "PRIMARY KEY(store_key, id_scope, datastream_id))");
-                statement.execute("INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
-                        "SELECT DISTINCT encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), schema_json " +
-                        "FROM oscar_archive_schema WHERE schema_json IS NOT NULL " +
-                        "ON CONFLICT (schema_sha256) DO NOTHING");
-                migratedSchemaRows = statement.executeUpdate("UPDATE oscar_archive_schema " +
-                        "SET schema_sha256=encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), " +
-                        "schema_json=NULL WHERE schema_json IS NOT NULL");
-                // Schema-driven zero-fill for newly added extended fault / RS-350 alarmCategoryCode
-                // summary columns so datastreams whose SWE schema cannot emit those fields become
-                // immediately summary-ready without scanning Parquet files.
-                statement.execute("UPDATE oscar_archive_schema " +
-                        "SET neutron_high_fault_count = 0 " +
-                        "WHERE summary_populated AND neutron_high_fault_count IS NULL AND (" +
-                        "  COALESCE(row_count, 0) = 0 OR schema_sha256 IN (" +
-                        "    SELECT schema_sha256 FROM oscar_archive_schema_blob " +
-                        "    WHERE position('alarmState' in schema_json::text) = 0 " +
-                        "       OR ((position('Fault - Gamma High' in schema_json::text) > 0 " +
-                        "            OR position('Fault - Extended Occupancy' in schema_json::text) > 0) " +
-                        "           AND position('Fault - Neutron High' in schema_json::text) = 0)" +
-                        "  )" +
-                        ")");
-                statement.execute("UPDATE oscar_archive_schema " +
-                        "SET alarm_category_gamma_count = COALESCE(alarm_category_gamma_count, 0), " +
-                        "    alarm_category_neutron_count = COALESCE(alarm_category_neutron_count, 0) " +
-                        "WHERE summary_populated " +
-                        "  AND (alarm_category_gamma_count IS NULL OR alarm_category_neutron_count IS NULL) " +
-                        "  AND (" +
-                        "    COALESCE(row_count, 0) = 0 OR schema_sha256 IN (" +
-                        "      SELECT schema_sha256 FROM oscar_archive_schema_blob " +
-                        "      WHERE position('alarmCategoryCode' in schema_json::text) = 0" +
-                        "    )" +
-                        "  )");
+                if (tinyArchiveForInlineBackfill) {
+                    statement.execute("INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
+                            "SELECT DISTINCT encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), schema_json " +
+                            "FROM oscar_archive_schema WHERE schema_json IS NOT NULL " +
+                            "ON CONFLICT (schema_sha256) DO NOTHING");
+                    migratedSchemaRows = statement.executeUpdate("UPDATE oscar_archive_schema " +
+                            "SET schema_sha256=encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), " +
+                            "schema_json=NULL WHERE schema_json IS NOT NULL");
+                    // Schema-driven zero-fill for newly added extended fault / RS-350 alarmCategoryCode
+                    // summary columns so datastreams whose SWE schema cannot emit those fields become
+                    // immediately summary-ready without scanning Parquet files.
+                    statement.execute("UPDATE oscar_archive_schema " +
+                            "SET neutron_high_fault_count = 0 " +
+                            "WHERE summary_populated AND neutron_high_fault_count IS NULL AND (" +
+                            "  COALESCE(row_count, 0) = 0 OR schema_sha256 IN (" +
+                            "    SELECT schema_sha256 FROM oscar_archive_schema_blob " +
+                            "    WHERE position('alarmState' in schema_json::text) = 0 " +
+                            "       OR ((position('Fault - Gamma High' in schema_json::text) > 0 " +
+                            "            OR position('Fault - Extended Occupancy' in schema_json::text) > 0) " +
+                            "           AND position('Fault - Neutron High' in schema_json::text) = 0)" +
+                            "  )" +
+                            ")");
+                    statement.execute("UPDATE oscar_archive_schema " +
+                            "SET alarm_category_gamma_count = COALESCE(alarm_category_gamma_count, 0), " +
+                            "    alarm_category_neutron_count = COALESCE(alarm_category_neutron_count, 0) " +
+                            "WHERE summary_populated " +
+                            "  AND (alarm_category_gamma_count IS NULL OR alarm_category_neutron_count IS NULL) " +
+                            "  AND (" +
+                            "    COALESCE(row_count, 0) = 0 OR schema_sha256 IN (" +
+                            "      SELECT schema_sha256 FROM oscar_archive_schema_blob " +
+                            "      WHERE position('alarmCategoryCode' in schema_json::text) = 0" +
+                            "    )" +
+                            "  )");
+                }
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_event_locator (" +
                         "store_key text NOT NULL, id_scope integer NOT NULL, public_id text NOT NULL, " +
                         "observation_id bigint NOT NULL, generation_id uuid REFERENCES oscar_archive_generation(id), " +
@@ -2215,6 +2234,235 @@ public final class ArchiveCatalog {
                 ") dup WHERE o.id = dup.id");
     }
 
+    private volatile int inlineMigrationMaxGenerations = 64;
+
+    void setInlineMigrationMaxGenerationsForTesting(int maxGenerations) {
+        this.inlineMigrationMaxGenerations = Math.max(0, maxGenerations);
+    }
+
+    /**
+     * Returns {@code true} when {@code oscar_archive_generation} holds at most
+     * {@code maxGenerations} rows (bounded probe, never scans full history).
+     */
+    public boolean hasAtMostGenerations(int maxGenerations) {
+        if (maxGenerations < 0)
+            return false;
+        String sql = "SELECT count(*) <= ? FROM (SELECT 1 FROM oscar_archive_generation LIMIT ?) t";
+        try (Connection connection = connections.open();
+             PreparedStatement stmt = connection.prepareStatement(sql)) {
+            stmt.setInt(1, maxGenerations);
+            stmt.setInt(2, maxGenerations + 1);
+            try (ResultSet rs = stmt.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Bounded, newest-first committed SQL backfill for upgrade columns added to
+     * {@code oscar_archive_schema} ({@code schema_sha256} deduplication, derivable
+     * {@code unadjudicated_* / adjudicated_*} alarm splits, and schema-ineligible
+     * zero-fills for {@code neutron_high_fault_count} and {@code alarm_category_*}).
+     * Combines all pending column updates into a single per-batch UPDATE so multi-year
+     * upgrades touch each row at most once and never block datastore startup.
+     *
+     * @return number of generations updated in this batch ({@code 0} when caught up)
+     */
+    public int backfillPendingSchemaUpgradeColumnsBatch(int maxGenerations) {
+        if (maxGenerations < 1)
+            return 0;
+        List<String> ineligibleNh = new ArrayList<>();
+        List<String> ineligibleAc = new ArrayList<>();
+        List<UUID> pendingIds = new ArrayList<>();
+        boolean anyInlineSchemaJson = false;
+        try (Connection connection = connections.open()) {
+            connection.setReadOnly(true);
+            loadIneligibleExtendedSchemaHashes(connection, ineligibleNh, ineligibleAc);
+            String[] nhArr = ineligibleNh.toArray(new String[0]);
+            String[] acArr = ineligibleAc.toArray(new String[0]);
+            java.sql.Array nhSqlArr = connection.createArrayOf("text", nhArr);
+            java.sql.Array acSqlArr = connection.createArrayOf("text", acArr);
+            String pendingSql = "SELECT g.id, " +
+                    "EXISTS (SELECT 1 FROM oscar_archive_schema s0 WHERE s0.generation_id = g.id AND s0.schema_json IS NOT NULL) AS has_inline_json " +
+                    "FROM oscar_archive_generation g " +
+                    "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                    "AND EXISTS (" +
+                    "  SELECT 1 FROM oscar_archive_schema s WHERE s.generation_id = g.id AND (" +
+                    "    s.schema_json IS NOT NULL " +
+                    "    OR (s.summary_populated AND (" +
+                    "      ((s.unadjudicated_gamma_alarm_count IS NULL " +
+                    "        OR s.unadjudicated_neutron_alarm_count IS NULL " +
+                    "        OR s.unadjudicated_gamma_neutron_alarm_count IS NULL) " +
+                    "       AND (COALESCE(s.any_alarm_count, 0) = 0 " +
+                    "         OR COALESCE(s.unadjudicated_alarm_count, 0) = 0 " +
+                    "         OR COALESCE(s.adjudicated_alarm_count, 0) = 0 " +
+                    "         OR (COALESCE(s.neutron_alarm_count, 0) = 0 AND COALESCE(s.gamma_neutron_alarm_count, 0) = 0) " +
+                    "         OR (COALESCE(s.gamma_alarm_count, 0) = 0 AND COALESCE(s.gamma_neutron_alarm_count, 0) = 0) " +
+                    "         OR (COALESCE(s.gamma_alarm_count, 0) = 0 AND COALESCE(s.neutron_alarm_count, 0) = 0))) " +
+                    "      OR (s.neutron_high_fault_count IS NULL " +
+                    "          AND (COALESCE(s.row_count, 0) = 0 OR s.schema_sha256 = ANY (?::text[]))) " +
+                    "      OR ((s.alarm_category_gamma_count IS NULL OR s.alarm_category_neutron_count IS NULL) " +
+                    "          AND (COALESCE(s.row_count, 0) = 0 OR s.schema_sha256 = ANY (?::text[])))" +
+                    "    ))" +
+                    "  )" +
+                    ") ORDER BY g.window_end DESC, g.id LIMIT ?";
+            try (PreparedStatement stmt = connection.prepareStatement(pendingSql)) {
+                stmt.setString(1, storeKey);
+                stmt.setInt(2, idScope);
+                stmt.setArray(3, nhSqlArr);
+                stmt.setArray(4, acSqlArr);
+                stmt.setInt(5, maxGenerations);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        pendingIds.add(rs.getObject(1, UUID.class));
+                        if (rs.getBoolean(2))
+                            anyInlineSchemaJson = true;
+                    }
+                }
+            } finally {
+                nhSqlArr.free();
+                acSqlArr.free();
+            }
+        } catch (SQLException e) {
+            return 0;
+        }
+        if (pendingIds.isEmpty())
+            return 0;
+        try (Connection connection = connections.open()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                java.sql.Array genArray = connection.createArrayOf("uuid", pendingIds.toArray(new UUID[0]));
+                try {
+                    if (anyInlineSchemaJson) {
+                        try (PreparedStatement insBlob = connection.prepareStatement(
+                                "INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
+                                        "SELECT DISTINCT encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), schema_json " +
+                                        "FROM oscar_archive_schema WHERE generation_id = ANY (?::uuid[]) AND schema_json IS NOT NULL " +
+                                        "ON CONFLICT (schema_sha256) DO NOTHING")) {
+                            insBlob.setArray(1, genArray);
+                            insBlob.executeUpdate();
+                        }
+                        try (PreparedStatement updBlob = connection.prepareStatement(
+                                "UPDATE oscar_archive_schema " +
+                                        "SET schema_sha256=encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), " +
+                                        "schema_json=NULL " +
+                                        "WHERE generation_id = ANY (?::uuid[]) AND schema_json IS NOT NULL")) {
+                            updBlob.setArray(1, genArray);
+                            updBlob.executeUpdate();
+                        }
+                        ineligibleNh.clear();
+                        ineligibleAc.clear();
+                        loadIneligibleExtendedSchemaHashes(connection, ineligibleNh, ineligibleAc);
+                    }
+                    java.sql.Array nhSqlArr = connection.createArrayOf("text", ineligibleNh.toArray(new String[0]));
+                    java.sql.Array acSqlArr = connection.createArrayOf("text", ineligibleAc.toArray(new String[0]));
+                    try (PreparedStatement upd = connection.prepareStatement(
+                            "UPDATE oscar_archive_schema SET " +
+                                    "unadjudicated_gamma_alarm_count = COALESCE(unadjudicated_gamma_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
+                                    "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "unadjudicated_neutron_alarm_count = COALESCE(unadjudicated_neutron_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "unadjudicated_gamma_neutron_alarm_count = COALESCE(unadjudicated_gamma_neutron_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(adjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(unadjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "adjudicated_gamma_alarm_count = COALESCE(adjudicated_gamma_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_alarm_count, 0) " +
+                                    "  WHEN COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "adjudicated_neutron_alarm_count = COALESCE(adjudicated_neutron_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(neutron_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(neutron_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "adjudicated_gamma_neutron_alarm_count = COALESCE(adjudicated_gamma_neutron_alarm_count, CASE " +
+                                    "  WHEN COALESCE(any_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 THEN 0 " +
+                                    "  WHEN COALESCE(unadjudicated_alarm_count, 0) = 0 THEN COALESCE(gamma_neutron_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
+                                    "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 ELSE NULL END), " +
+                                    "neutron_high_fault_count = CASE " +
+                                    "  WHEN neutron_high_fault_count IS NOT NULL THEN neutron_high_fault_count " +
+                                    "  WHEN COALESCE(row_count, 0) = 0 OR schema_sha256 = ANY (?::text[]) THEN 0 " +
+                                    "  ELSE NULL END, " +
+                                    "alarm_category_gamma_count = CASE " +
+                                    "  WHEN alarm_category_gamma_count IS NOT NULL THEN alarm_category_gamma_count " +
+                                    "  WHEN COALESCE(row_count, 0) = 0 OR schema_sha256 = ANY (?::text[]) THEN 0 " +
+                                    "  ELSE NULL END, " +
+                                    "alarm_category_neutron_count = CASE " +
+                                    "  WHEN alarm_category_neutron_count IS NOT NULL THEN alarm_category_neutron_count " +
+                                    "  WHEN COALESCE(row_count, 0) = 0 OR schema_sha256 = ANY (?::text[]) THEN 0 " +
+                                    "  ELSE NULL END " +
+                                    "WHERE generation_id = ANY (?::uuid[]) AND summary_populated AND (" +
+                                    "  ((unadjudicated_gamma_alarm_count IS NULL OR unadjudicated_neutron_alarm_count IS NULL OR unadjudicated_gamma_neutron_alarm_count IS NULL) " +
+                                    "   AND (COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 " +
+                                    "     OR (COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) " +
+                                    "     OR (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) " +
+                                    "     OR (COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0))) " +
+                                    "  OR (neutron_high_fault_count IS NULL AND (COALESCE(row_count, 0) = 0 OR schema_sha256 = ANY (?::text[]))) " +
+                                    "  OR ((alarm_category_gamma_count IS NULL OR alarm_category_neutron_count IS NULL) AND (COALESCE(row_count, 0) = 0 OR schema_sha256 = ANY (?::text[])))" +
+                                    ")")) {
+                        upd.setArray(1, nhSqlArr);
+                        upd.setArray(2, acSqlArr);
+                        upd.setArray(3, acSqlArr);
+                        upd.setArray(4, genArray);
+                        upd.setArray(5, nhSqlArr);
+                        upd.setArray(6, acSqlArr);
+                        upd.executeUpdate();
+                    } finally {
+                        nhSqlArr.free();
+                        acSqlArr.free();
+                    }
+                } finally {
+                    genArray.free();
+                }
+                connection.commit();
+                return pendingIds.size();
+            } catch (Exception e) {
+                connection.rollback();
+                return 0;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (SQLException e) {
+            return 0;
+        }
+    }
+
+    private static void loadIneligibleExtendedSchemaHashes(Connection connection,
+                                                           List<String> ineligibleNh,
+                                                           List<String> ineligibleAc) throws SQLException {
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT schema_sha256, " +
+                             "(position('alarmState' in schema_json::text) = 0 " +
+                             " OR ((position('Fault - Gamma High' in schema_json::text) > 0 " +
+                             "      OR position('Fault - Extended Occupancy' in schema_json::text) > 0) " +
+                             "     AND position('Fault - Neutron High' in schema_json::text) = 0)) AS inelig_nh, " +
+                             "(position('alarmCategoryCode' in schema_json::text) = 0) AS inelig_ac " +
+                             "FROM oscar_archive_schema_blob")) {
+            while (rs.next()) {
+                String hash = rs.getString(1);
+                if (hash == null)
+                    continue;
+                if (rs.getBoolean(2))
+                    ineligibleNh.add(hash);
+                if (rs.getBoolean(3))
+                    ineligibleAc.add(hash);
+            }
+        }
+    }
+
     /**
      * Incrementally populates per-datastream summary counters, event locators,
      * and {@code oscar_obs_latest} for pre-upgrade archive generations.
@@ -2222,30 +2470,6 @@ public final class ArchiveCatalog {
     public int backfillGenerationSummariesBatch(Path archiveRoot, int maxGenerations) {
         if (archiveRoot == null || maxGenerations < 1)
             return 0;
-        try (Connection connection = connections.open();
-             PreparedStatement fastPath = connection.prepareStatement(
-                     "UPDATE oscar_archive_schema s SET " +
-                     "summary_populated = TRUE, " +
-                     "unadjudicated_gamma_alarm_count = COALESCE(s.unadjudicated_gamma_alarm_count, 0), " +
-                     "unadjudicated_neutron_alarm_count = COALESCE(s.unadjudicated_neutron_alarm_count, 0), " +
-                     "unadjudicated_gamma_neutron_alarm_count = COALESCE(s.unadjudicated_gamma_neutron_alarm_count, 0), " +
-                     "adjudicated_gamma_alarm_count = COALESCE(s.adjudicated_gamma_alarm_count, 0), " +
-                     "adjudicated_neutron_alarm_count = COALESCE(s.adjudicated_neutron_alarm_count, 0), " +
-                     "adjudicated_gamma_neutron_alarm_count = COALESCE(s.adjudicated_gamma_neutron_alarm_count, 0) " +
-                     "FROM oscar_archive_generation g, " + safeIdentifier(storeKey + "_datastreams") + " d, oscar_obs_latest l " +
-                     "WHERE g.id = s.generation_id AND g.store_key=? AND g.id_scope=? " +
-                     "AND (NOT s.summary_populated OR s.unadjudicated_gamma_alarm_count IS NULL) " +
-                     "AND d.id = s.datastream_id " +
-                     "AND l.store_key = g.store_key AND l.id_scope = g.id_scope AND l.datastream_id = s.datastream_id " +
-                     "AND l.phenomenon_time >= g.window_end " +
-                     "AND COALESCE(d.data->>'outputName', d.data->'recordSchema'->>'name', '') " +
-                     "    NOT IN ('occupancy', 'tamper', 'connectionStatus', 'occupancyStatus', 'adjudication', 'report')")) {
-            fastPath.setString(1, storeKey);
-            fastPath.setInt(2, idScope);
-            fastPath.executeUpdate();
-        } catch (Exception ignored) {
-            // Optional fast-path when datastream table is accessible.
-        }
         List<ArchiveGeneration> pending = new ArrayList<>();
         String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
                 "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
@@ -2266,8 +2490,66 @@ public final class ArchiveCatalog {
         } catch (SQLException e) {
             return 0;
         }
-        int backfilled = 0;
-        for (ArchiveGeneration generation : pending) {
+        if (pending.isEmpty())
+            return 0;
+        // Scoped fast-path strictly for the bounded pending batch (never a full-table UPDATE)
+        try (Connection connection = connections.open()) {
+            java.sql.Array genArray = connection.createArrayOf("uuid",
+                    pending.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
+            try (PreparedStatement fastPath = connection.prepareStatement(
+                    "UPDATE oscar_archive_schema s SET " +
+                            "summary_populated = TRUE, " +
+                            "unadjudicated_gamma_alarm_count = COALESCE(s.unadjudicated_gamma_alarm_count, 0), " +
+                            "unadjudicated_neutron_alarm_count = COALESCE(s.unadjudicated_neutron_alarm_count, 0), " +
+                            "unadjudicated_gamma_neutron_alarm_count = COALESCE(s.unadjudicated_gamma_neutron_alarm_count, 0), " +
+                            "adjudicated_gamma_alarm_count = COALESCE(s.adjudicated_gamma_alarm_count, 0), " +
+                            "adjudicated_neutron_alarm_count = COALESCE(s.adjudicated_neutron_alarm_count, 0), " +
+                            "adjudicated_gamma_neutron_alarm_count = COALESCE(s.adjudicated_gamma_neutron_alarm_count, 0) " +
+                            "FROM oscar_archive_generation g, " + safeIdentifier(storeKey + "_datastreams") + " d, oscar_obs_latest l " +
+                            "WHERE g.id = s.generation_id AND g.id = ANY (?::uuid[]) AND g.store_key=? AND g.id_scope=? " +
+                            "AND (NOT s.summary_populated OR s.unadjudicated_gamma_alarm_count IS NULL) " +
+                            "AND d.id = s.datastream_id " +
+                            "AND l.store_key = g.store_key AND l.id_scope = g.id_scope AND l.datastream_id = s.datastream_id " +
+                            "AND l.phenomenon_time >= g.window_end " +
+                            "AND COALESCE(d.data->>'outputName', d.data->'recordSchema'->>'name', '') " +
+                            "    NOT IN ('occupancy', 'tamper', 'connectionStatus', 'occupancyStatus', 'adjudication', 'report')")) {
+                fastPath.setArray(1, genArray);
+                fastPath.setString(2, storeKey);
+                fastPath.setInt(3, idScope);
+                fastPath.executeUpdate();
+            } finally {
+                genArray.free();
+            }
+        } catch (Exception ignored) {
+            // Optional fast-path when datastream table is accessible.
+        }
+        // Re-check which of the bounded pending generations still need Parquet backfill
+        List<ArchiveGeneration> stillPending = new ArrayList<>();
+        try (Connection connection = connections.open()) {
+            java.sql.Array genArray = connection.createArrayOf("uuid",
+                    pending.stream().map(ArchiveGeneration::id).toArray(UUID[]::new));
+            try (PreparedStatement recheck = connection.prepareStatement(
+                    "SELECT DISTINCT generation_id FROM oscar_archive_schema " +
+                            "WHERE generation_id = ANY (?::uuid[]) " +
+                            "AND (NOT summary_populated OR unadjudicated_gamma_alarm_count IS NULL)")) {
+                recheck.setArray(1, genArray);
+                Set<UUID> remaining = new HashSet<>();
+                try (ResultSet rs = recheck.executeQuery()) {
+                    while (rs.next())
+                        remaining.add(rs.getObject(1, UUID.class));
+                }
+                for (ArchiveGeneration g : pending) {
+                    if (remaining.contains(g.id()))
+                        stillPending.add(g);
+                }
+            } finally {
+                genArray.free();
+            }
+        } catch (SQLException e) {
+            stillPending = pending;
+        }
+        int backfilled = pending.size() - stillPending.size();
+        for (ArchiveGeneration generation : stillPending) {
             try (Connection connection = connections.open()) {
                 boolean oldAutoCommit = connection.getAutoCommit();
                 connection.setAutoCommit(false);

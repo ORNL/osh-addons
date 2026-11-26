@@ -1769,6 +1769,116 @@ public class TestMultiTierParquetCompactionIntegration {
                 1, store.getArchiveReader().maxBatchFileCountSeenForTesting());
     }
 
+    @Test
+    public void largeArchiveUpgradeDefersSchemaBackfillFromMigrateAndDrainsIncrementallyNewestFirst() throws Exception {
+        String table = uniqueTableName("upgdrain");
+        Path archiveRoot = temporary.newFolder("archive-upgdrain").toPath();
+        Path duckTmp = archiveRoot.resolveSibling("ducktmp-upgdrain");
+        TieredArchiveConfig cfg = parquetPrimaryConfig(archiveRoot, duckTmp,
+                List.of("occupancy", "gammaCounts", "neutronCounts"));
+        OscarTieredObsStore store = openStore(table, cfg);
+
+        BigId occStream = addEventOccupancyStream(store, 301L, "occupancy");
+        BigId gammaStream = addAlarmStateStream(store, 301L, "gammaCounts",
+                new String[]{"Background", "Alarm", "Fault - Gamma High", "Fault - Gamma Low"});
+        BigId neutronStream = addAlarmStateStream(store, 301L, "neutronCounts",
+                new String[]{"Background", "Alarm", "Fault - Neutron High"});
+
+        // Export 6 half-hour windows (12 generations: 6 RAW_EVENTS + 6 RAW_TELEMETRY).
+        Instant base = Instant.parse("2026-08-05T00:00:00Z");
+        for (int i = 0; i < 6; i++) {
+            Instant winStart = base.plusSeconds(i * 1800L);
+            Instant winEnd = winStart.plusSeconds(1800L);
+            Instant ts = winStart.plusSeconds(60L);
+            store.add(eventOccupancyObs(occStream, ts, ts, "occ-upg-" + i, i % 2 == 0, false, 150, 2, 0, 0));
+            store.add(alarmStateObs(neutronStream, ts, i == 5 ? "Fault - Neutron High" : "Background"));
+            store.add(alarmStateObs(gammaStream, ts, "Background"));
+            commitStore(store);
+            store.archiveWindow(winStart, winEnd, TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
+            store.archiveWindow(winStart, winEnd, TieredArchiveConfig.PROFILE_RAW_TELEMETRY).orElseThrow();
+        }
+        store.maintainArchiveLifecycle();
+
+        // Simulate a pre-v3.12.0 upgraded catalog where newly added columns are NULL across all 12 generations.
+        try (Connection c = openPg();
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE oscar_archive_schema SET " +
+                             "unadjudicated_gamma_alarm_count = NULL, " +
+                             "unadjudicated_neutron_alarm_count = NULL, " +
+                             "unadjudicated_gamma_neutron_alarm_count = NULL, " +
+                             "adjudicated_gamma_alarm_count = NULL, " +
+                             "adjudicated_neutron_alarm_count = NULL, " +
+                             "adjudicated_gamma_neutron_alarm_count = NULL, " +
+                             "neutron_high_fault_count = NULL, " +
+                             "alarm_category_gamma_count = NULL, " +
+                             "alarm_category_neutron_count = NULL " +
+                             "WHERE generation_id IN (SELECT id FROM oscar_archive_generation WHERE store_key = ?)")) {
+            ps.setString(1, table);
+            ps.executeUpdate();
+        }
+
+        // With archive exceeding inline threshold (4), migrate() must NOT run a synchronous full-table UPDATE.
+        store.getArchiveCatalog().setInlineMigrationMaxGenerationsForTesting(4);
+        assertFalse(store.getArchiveCatalog().hasAtMostGenerations(4));
+        store.getArchiveCatalog().migrate();
+        try (Connection c = openPg();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT count(*) FROM oscar_archive_schema s " +
+                             "JOIN oscar_archive_generation g ON g.id = s.generation_id " +
+                             "WHERE g.store_key = ? AND s.alarm_category_gamma_count IS NULL")) {
+            ps.setString(1, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                assertEquals("migrate() must defer full-table schema backfill when archive exceeds inline threshold",
+                        18L, rs.getLong(1));
+            }
+        }
+
+        // Incremental SQL backfill drains in bounded batches without infinite-looping on eligible neutron streams.
+        int firstBatch = store.getArchiveCatalog().backfillPendingSchemaUpgradeColumnsBatch(5);
+        assertEquals(5, firstBatch);
+        int drained = firstBatch;
+        int rounds = 0;
+        while (rounds++ < 10) {
+            int n = store.getArchiveCatalog().backfillPendingSchemaUpgradeColumnsBatch(5);
+            if (n == 0)
+                break;
+            drained += n;
+        }
+        assertEquals(12, drained);
+        assertEquals("SQL upgrade backfill must converge to 0 without looping on DuckDB-eligible streams",
+                0, store.getArchiveCatalog().backfillPendingSchemaUpgradeColumnsBatch(5));
+
+        // Ineligible schemas (occupancy, gamma) are zero-filled in SQL; eligible neutron stream remains NULL for DuckDB.
+        try (Connection c = openPg();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT count(*) FILTER (WHERE s.alarm_category_gamma_count IS NULL), " +
+                             "count(*) FILTER (WHERE s.neutron_high_fault_count IS NULL AND s.datastream_id = ?), " +
+                             "count(*) FILTER (WHERE s.neutron_high_fault_count IS NULL AND s.datastream_id = ?) " +
+                             "FROM oscar_archive_schema s " +
+                             "JOIN oscar_archive_generation g ON g.id = s.generation_id " +
+                             "WHERE g.store_key = ?")) {
+            ps.setLong(1, gammaStream.getIdAsLong());
+            ps.setLong(2, neutronStream.getIdAsLong());
+            ps.setString(3, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                assertEquals(0L, rs.getLong(1));
+                assertEquals(0L, rs.getLong(2));
+                assertEquals(6L, rs.getLong(3));
+            }
+        }
+
+        // Targeted DuckDB backfill fills the remaining eligible neutron streams and preserves exact fault count.
+        assertEquals(6, store.getArchiveCatalog().backfillExtendedSummaryCountersBatch(archiveRoot, 32));
+        assertEquals(0, store.getArchiveCatalog().backfillExtendedSummaryCountersBatch(archiveRoot, 32));
+        ObsFilter neutronHighFault = new ObsFilter.Builder()
+                .withDataStreams(neutronStream)
+                .withCQLFilter("alarmState='Fault - Neutron High'")
+                .build();
+        assertEquals(1L, store.countMatchingEntries(neutronHighFault));
+    }
+
     private static BigId addTamperStream(OscarTieredObsStore store, long sysNum) throws Exception {
         SWEHelper swe = new SWEHelper();
         DataRecord rec = swe.createRecord().name("tamper")

@@ -129,6 +129,9 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             .build();
     private final java.util.concurrent.atomic.AtomicLong decodedArchivedResultCount =
             new java.util.concurrent.atomic.AtomicLong();
+    private volatile boolean schemaUpgradeSqlBackfillComplete;
+    private volatile boolean generationSummaryBackfillComplete;
+    private volatile boolean extendedSummaryBackfillComplete;
     private final Cache<Long, CachedOverlaySchema> liveOverlaySchemas = CacheBuilder.newBuilder()
             .maximumSize(2048)
             .expireAfterAccess(30, TimeUnit.MINUTES)
@@ -183,10 +186,12 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             this.archiveCatalog = new ArchiveCatalog(connectionManager::getConnection, dataStoreName, idScope,
                     archiveConfig);
             this.archiveCatalog.migrate();
-            if (archiveConfig.enabled && archiveConfig.rootDirectory != null && !archiveConfig.rootDirectory.isBlank()) {
+            if (archiveConfig.enabled && archiveConfig.rootDirectory != null && !archiveConfig.rootDirectory.isBlank()
+                    && this.archiveCatalog.hasAtMostGenerations(64)) {
                 Path archiveRoot = Path.of(archiveConfig.rootDirectory);
-                this.archiveCatalog.backfillGenerationSummariesBatch(archiveRoot, 500);
-                this.archiveCatalog.backfillExtendedSummaryCountersBatch(archiveRoot, 32);
+                this.archiveCatalog.backfillPendingSchemaUpgradeColumnsBatch(64);
+                this.archiveCatalog.backfillGenerationSummariesBatch(archiveRoot, 64);
+                this.archiveCatalog.backfillExtendedSummaryCountersBatch(archiveRoot, 64);
             }
             this.archiveCatalog.maximumObservationId().ifPresent(archiveMaximum ->
                     lastId.accumulateAndGet(archiveMaximum, Math::max));
@@ -364,8 +369,19 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         if (archiveCompaction != null)
             archiveCompaction.drainDeletingGenerations(Instant.now());
         Path archiveRoot = Path.of(archiveConfig.rootDirectory);
-        archiveCatalog.backfillGenerationSummariesBatch(archiveRoot, 100);
-        archiveCatalog.backfillExtendedSummaryCountersBatch(archiveRoot, 32);
+        if (!schemaUpgradeSqlBackfillComplete) {
+            if (archiveCatalog.backfillPendingSchemaUpgradeColumnsBatch(128) == 0)
+                schemaUpgradeSqlBackfillComplete = true;
+        }
+        if (schemaUpgradeSqlBackfillComplete && !generationSummaryBackfillComplete) {
+            if (archiveCatalog.backfillGenerationSummariesBatch(archiveRoot, 64) == 0)
+                generationSummaryBackfillComplete = true;
+        }
+        if (schemaUpgradeSqlBackfillComplete && !extendedSummaryBackfillComplete) {
+            int extBatch = archiveCatalog.backfillExtendedSummaryCountersBatch(archiveRoot, 32);
+            if (extBatch == 0)
+                extendedSummaryBackfillComplete = true;
+        }
         archiveCatalog.migrateLegacyOverlaySchemas(250);
         backfillLegacyTombstoneDataStreams(500);
         long now = System.currentTimeMillis();
@@ -5272,12 +5288,38 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     }
 
     private void runBackgroundBaseSummaryBackfill() {
+        long totalSqlUpgradeGens = 0L;
+        long totalGenSummaryGens = 0L;
         long totalExtendedGens = 0L;
         long totalRows = 0L;
         long totalGens = 0L;
         try {
             if (archiveConfig.rootDirectory != null && !archiveConfig.rootDirectory.isBlank()) {
                 Path archiveRoot = Path.of(archiveConfig.rootDirectory);
+                while (!storeClosed.get() && !Thread.currentThread().isInterrupted()) {
+                    int sqlBatch = archiveCatalog.backfillPendingSchemaUpgradeColumnsBatch(128);
+                    if (sqlBatch <= 0) {
+                        schemaUpgradeSqlBackfillComplete = true;
+                        break;
+                    }
+                    totalSqlUpgradeGens += sqlBatch;
+                }
+                if (totalSqlUpgradeGens > 0L) {
+                    LOG.info("Completed incremental SQL upgrade backfill on oscar_archive_schema across {} archive generation(s)",
+                            totalSqlUpgradeGens);
+                }
+                while (!storeClosed.get() && !Thread.currentThread().isInterrupted()) {
+                    int summaryBatch = archiveCatalog.backfillGenerationSummariesBatch(archiveRoot, 64);
+                    if (summaryBatch <= 0) {
+                        generationSummaryBackfillComplete = true;
+                        break;
+                    }
+                    totalGenSummaryGens += summaryBatch;
+                }
+                if (totalGenSummaryGens > 0L) {
+                    LOG.info("Backfilled archive generation summaries across {} archive generation(s)",
+                            totalGenSummaryGens);
+                }
                 int consecutiveBusyRetries = 0;
                 final int maxBusyRetries = 120;
                 while (!storeClosed.get() && !Thread.currentThread().isInterrupted()) {
@@ -5299,8 +5341,10 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         continue;
                     }
                     consecutiveBusyRetries = 0;
-                    if (batch == 0)
+                    if (batch == 0) {
+                        extendedSummaryBackfillComplete = true;
                         break;
+                    }
                     totalExtendedGens += batch;
                 }
                 if (totalExtendedGens > 0L) {
