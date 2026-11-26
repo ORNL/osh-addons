@@ -61,6 +61,7 @@ public class TestDuckDbResourcePolicy {
                 assertTrue(byteSetting(statement, "memory_limit") <= 64L * 1024 * 1024);
                 assertTrue(byteSetting(statement, "max_temp_directory_size") <= 96L * 1024 * 1024);
                 assertEquals(operationDirectory.toString(), textSetting(statement, "temp_directory"));
+                assertEquals("true", textSetting(statement, "parquet_metadata_cache"));
 
                 // The generated values plus the hash sort are deliberately
                 // close to the 64 MiB memory cap. The operation must finish
@@ -631,6 +632,148 @@ public class TestDuckDbResourcePolicy {
                     countWaiterDone.await(3, TimeUnit.SECONDS));
             assertEquals(null, countWaiterError.get());
         }
+    }
+
+    @Test
+    public void antiStarvationAgingPreventsInteractiveWaitersFromJumpingAheadOfFiveSecondWaiters() throws Exception {
+        Path temporaryRoot = temporary.newFolder("anti-starvation-aging-spill").toPath();
+        TieredArchiveConfig config = config(temporaryRoot);
+        config.duckDbMaximumConcurrentSessions = 2;
+        config.duckDbSessionAcquireTimeoutSeconds = 5;
+
+        java.util.concurrent.atomic.AtomicLong fakeNanos = new java.util.concurrent.atomic.AtomicLong(1_000_000_000L);
+        DuckDbResourcePolicy.setNanoClockForTesting(fakeNanos::get);
+        try {
+            // Sub-case 1: waiter aged < 5s (1s) IS bypassed by arriving cold-query and point-query.
+            List<String> unagedOrder = new java.util.concurrent.CopyOnWriteArrayList<>();
+            DuckDbResourcePolicy.Session heldA = DuckDbResourcePolicy.open(config, "cold-query");
+            DuckDbResourcePolicy.Session heldB = DuckDbResourcePolicy.open(config, "cold-query");
+            try {
+                Thread bgWaiter = new Thread(() -> {
+                    try (DuckDbResourcePolicy.Session s = DuckDbResourcePolicy.open(config, "archive-compaction")) {
+                        unagedOrder.add("archive-compaction");
+                    } catch (Throwable err) {
+                        throw new AssertionError(err);
+                    }
+                }, "unaged-bg-waiter");
+                bgWaiter.setDaemon(true);
+                bgWaiter.start();
+                waitForWaitingCount(1);
+                assertFalse("Queued background compaction alone must not report interactive waiters",
+                        DuckDbResourcePolicy.hasInteractiveWaiters());
+
+                fakeNanos.addAndGet(TimeUnit.SECONDS.toNanos(1)); // Only 1s elapsed (< 5s bound)
+                Thread coldWaiter = new Thread(() -> {
+                    try (DuckDbResourcePolicy.Session s = DuckDbResourcePolicy.open(config, "cold-query")) {
+                        unagedOrder.add("cold-query");
+                    } catch (Throwable err) {
+                        throw new AssertionError(err);
+                    }
+                }, "unaged-cold-waiter");
+                coldWaiter.setDaemon(true);
+                coldWaiter.start();
+                waitForWaitingCount(2);
+                assertTrue(DuckDbResourcePolicy.hasInteractiveWaiters());
+
+                Thread pointWaiter = new Thread(() -> {
+                    try (DuckDbResourcePolicy.Session s = DuckDbResourcePolicy.open(config, "point-query")) {
+                        unagedOrder.add("point-query");
+                    } catch (Throwable err) {
+                        throw new AssertionError(err);
+                    }
+                }, "unaged-point-waiter");
+                pointWaiter.setDaemon(true);
+                pointWaiter.start();
+                waitForWaitingCount(3);
+
+                // Release ONLY heldA so exactly one admission slot opens at a time -> strict queue order!
+                heldA.close();
+                bgWaiter.join(3_000L);
+                coldWaiter.join(3_000L);
+                pointWaiter.join(3_000L);
+                heldB.close();
+                assertEquals("Waiter aged < 5s yields queue position to point-query and cold-query",
+                        List.of("point-query", "cold-query", "archive-compaction"), unagedOrder);
+            } finally {
+                try { heldA.close(); } catch (Throwable ignored) {}
+                try { heldB.close(); } catch (Throwable ignored) {}
+            }
+
+            // Sub-case 2: waiter aged >= 5s (5.0s) is NEVER jumped by arriving cold-query or point-query.
+            fakeNanos.set(10_000_000_000L);
+            List<String> agedOrder = new java.util.concurrent.CopyOnWriteArrayList<>();
+            CountDownLatch agedBgEntered = new CountDownLatch(1);
+            CountDownLatch releaseAgedBg = new CountDownLatch(1);
+            DuckDbResourcePolicy.Session heldC = DuckDbResourcePolicy.open(config, "cold-query");
+            DuckDbResourcePolicy.Session heldD = DuckDbResourcePolicy.open(config, "cold-query");
+            try {
+                Thread agedBgWaiter = new Thread(() -> {
+                    try (DuckDbResourcePolicy.Session s = DuckDbResourcePolicy.open(config, "cold-cql-count")) {
+                        agedOrder.add("cold-cql-count");
+                        agedBgEntered.countDown();
+                        releaseAgedBg.await(3, TimeUnit.SECONDS);
+                    } catch (Throwable err) {
+                        throw new AssertionError(err);
+                    }
+                }, "aged-bg-waiter");
+                agedBgWaiter.setDaemon(true);
+                agedBgWaiter.start();
+                waitForWaitingCount(1);
+
+                // Advance synthetic clock by >= 5 seconds so cold-cql-count reaches anti-starvation bound.
+                fakeNanos.addAndGet(DuckDbResourcePolicy.ANTI_STARVATION_AGING_NANOS);
+
+                Thread lateColdWaiter = new Thread(() -> {
+                    try (DuckDbResourcePolicy.Session s = DuckDbResourcePolicy.open(config, "cold-query")) {
+                        agedOrder.add("cold-query");
+                    } catch (Throwable err) {
+                        throw new AssertionError(err);
+                    }
+                }, "late-cold-waiter");
+                lateColdWaiter.setDaemon(true);
+                lateColdWaiter.start();
+                waitForWaitingCount(2);
+
+                Thread latePointWaiter = new Thread(() -> {
+                    try (DuckDbResourcePolicy.Session s = DuckDbResourcePolicy.open(config, "point-query")) {
+                        agedOrder.add("point-query");
+                    } catch (Throwable err) {
+                        throw new AssertionError(err);
+                    }
+                }, "late-point-waiter");
+                latePointWaiter.setDaemon(true);
+                latePointWaiter.start();
+                waitForWaitingCount(3);
+
+                // Release ONE slot (heldC) while keeping heldD open so waiters drain strictly 1-by-1!
+                heldC.close();
+                assertTrue("Aged >= 5s background waiter must acquire first when one slot opens",
+                        agedBgEntered.await(2, TimeUnit.SECONDS));
+                assertEquals(List.of("cold-cql-count"), agedOrder);
+
+                releaseAgedBg.countDown();
+                agedBgWaiter.join(3_000L);
+                latePointWaiter.join(3_000L);
+                lateColdWaiter.join(3_000L);
+                heldD.close();
+                assertEquals("Point-query still orders ahead of unaged cold-query behind the aged waiter",
+                        List.of("cold-cql-count", "point-query", "cold-query"), agedOrder);
+            } finally {
+                releaseAgedBg.countDown();
+                try { heldC.close(); } catch (Throwable ignored) {}
+                try { heldD.close(); } catch (Throwable ignored) {}
+            }
+        } finally {
+            DuckDbResourcePolicy.setNanoClockForTesting(null);
+        }
+    }
+
+    private static void waitForWaitingCount(int expected) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (DuckDbResourcePolicy.waitingCountForTesting() < expected && System.nanoTime() < deadline) {
+            Thread.sleep(5L);
+        }
+        assertEquals(expected, DuckDbResourcePolicy.waitingCountForTesting());
     }
 
     @Test

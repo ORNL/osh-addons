@@ -388,7 +388,21 @@ public final class ArchiveExporter {
         return schemas;
     }
 
-    private void writeSchemaSnapshot(Path target, List<ArchiveCatalog.SchemaSnapshot> schemas) throws IOException {
+    static final List<String> V1_MANIFEST_COLUMNS = List.of(
+            "id_scope:INTEGER", "id_value:BIGINT", "datastream_scope:INTEGER", "datastream_id:BIGINT",
+            "foi_scope:INTEGER?", "foi_id:BIGINT?", "phenomenon_time:TIMESTAMP",
+            "result_time:TIMESTAMP", "result_json:VARCHAR", "archive_version:INTEGER", "profile:VARCHAR");
+
+    static final List<String> V2_EVENT_MANIFEST_COLUMNS = List.of(
+            "id_scope:INTEGER", "id_value:BIGINT", "datastream_scope:INTEGER", "datastream_id:BIGINT",
+            "foi_scope:INTEGER?", "foi_id:BIGINT?", "phenomenon_time:TIMESTAMP",
+            "result_time:TIMESTAMP", "result_json:VARCHAR", "archive_version:INTEGER", "profile:VARCHAR",
+            "ocr_norm:VARCHAR?", "occ_obs_id:VARCHAR?", "event_id:VARCHAR?",
+            "adj_code:INTEGER?", "adj_count:INTEGER?",
+            "gamma_alarm:BOOLEAN?", "neutron_alarm:BOOLEAN?",
+            "max_gamma:DOUBLE?", "max_neutron:DOUBLE?");
+
+    static void writeSchemaSnapshot(Path target, List<ArchiveCatalog.SchemaSnapshot> schemas) throws IOException {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("format", "oscar-datastream-schema-snapshot");
         snapshot.put("version", 1);
@@ -403,9 +417,17 @@ public final class ArchiveExporter {
     private void writeManifest(Path target, ArchiveGeneration generation, long bytes,
                                List<ArchiveCatalog.SchemaSnapshot> schemas, Path schemaPath,
                                String schemaSha256, long schemaBytes) throws IOException {
+        writeManifest(target, idScope, 1, V1_MANIFEST_COLUMNS, generation, bytes,
+                schemas, schemaPath, schemaSha256, schemaBytes);
+    }
+
+    static void writeManifest(Path target, int idScope, int archiveVersion, List<String> columns,
+                              ArchiveGeneration generation, long bytes,
+                              List<ArchiveCatalog.SchemaSnapshot> schemas, Path schemaPath,
+                              String schemaSha256, long schemaBytes) throws IOException {
         Map<String, Object> manifest = new LinkedHashMap<>();
         manifest.put("format", "oscar-observation-archive");
-        manifest.put("version", 1);
+        manifest.put("version", archiveVersion);
         manifest.put("generationId", generation.id().toString());
         manifest.put("profile", generation.profile());
         manifest.put("windowStart", generation.start().toString());
@@ -423,10 +445,7 @@ public final class ArchiveExporter {
                 "sha256", schemaSha256,
                 "bytes", schemaBytes,
                 "compression", "gzip"));
-        manifest.put("columns", List.of(
-                "id_scope:INTEGER", "id_value:BIGINT", "datastream_scope:INTEGER", "datastream_id:BIGINT",
-                "foi_scope:INTEGER?", "foi_id:BIGINT?", "phenomenon_time:TIMESTAMP",
-                "result_time:TIMESTAMP", "result_json:VARCHAR", "archive_version:INTEGER", "profile:VARCHAR"));
+        manifest.put("columns", columns);
         manifest.put("sort", List.of("datastream_id", "phenomenon_time", "result_time", "id_value"));
         manifest.put("compression", "zstd");
         manifest.put("createdAt", Instant.now().toString());
@@ -512,13 +531,13 @@ public final class ArchiveExporter {
         return message != null && message.contains("Cannot allocate memory");
     }
 
-    private static void forceFile(Path path) throws IOException {
+    static void forceFile(Path path) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
             channel.force(true);
         }
     }
 
-    private static void forceDirectory(Path directory) {
+    static void forceDirectory(Path directory) {
         try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
             channel.force(true);
         } catch (IOException ignored) {
@@ -527,7 +546,7 @@ public final class ArchiveExporter {
         }
     }
 
-    private static void atomicMove(Path source, Path target) throws IOException {
+    static void atomicMove(Path source, Path target) throws IOException {
         try {
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
         } catch (AtomicMoveNotSupportedException e) {
@@ -535,19 +554,19 @@ public final class ArchiveExporter {
         }
     }
 
-    private static String safeIdentifier(String identifier) {
+    static String safeIdentifier(String identifier) {
         if (identifier == null || !identifier.matches("[A-Za-z_][A-Za-z0-9_]*"))
             throw new IllegalArgumentException("Unsafe SQL identifier: " + identifier);
         return identifier;
     }
 
-    private static String safePathComponent(String value) {
+    static String safePathComponent(String value) {
         if (value == null || !value.matches("[A-Za-z0-9_-]+"))
             throw new IllegalArgumentException("Unsafe archive profile: " + value);
         return value;
     }
 
-    private static String sqlLiteral(String value) {
+    static String sqlLiteral(String value) {
         return value.replace("'", "''");
     }
 

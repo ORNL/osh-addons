@@ -20,6 +20,7 @@ import org.geotools.api.filter.PropertyIsLike;
 import org.geotools.api.filter.PropertyIsNotEqualTo;
 import org.geotools.api.filter.expression.Literal;
 import org.geotools.api.filter.expression.PropertyName;
+import org.sensorhub.impl.datastore.postgis.archive.OcrBloomFilter;
 import org.sensorhub.impl.datastore.postgis.archive.ParquetArchiveReader;
 
 import java.io.StringReader;
@@ -46,11 +47,28 @@ public final class JsonCqlEvaluator {
     private static final Set<String> EXACT_DUCKDB_SCALAR_KEYS = Set.of(
             "gammaAlarm", "neutronAlarm", "tamperStatus",
             "alarmState", "eventId", "laneId",
-            "maxGamma", "maxNeutron", "occupancyCount", "neutronBackground");
+            "maxGamma", "maxNeutron", "maxGammaCount", "maxNeutronCount",
+            "occupancyCount", "neutronBackground",
+            "normalizedValue", "occupancyObsId", "adjudicationCode", "vehicleId",
+            "startTime", "endTime", "samplingTime");
+    private static final Set<String> LIKE_EXACT_DUCKDB_STRING_KEYS = Set.of(
+            "normalizedValue", "vehicleId", "eventId", "occupancyObsId",
+            "alarmState", "laneId");
     private static final Pattern RFC3339_INSTANT = Pattern.compile(
             "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T" +
             "([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?" +
             "(Z|[+-]((0[0-9]|1[0-7]):[0-5][0-9]|18:00))$");
+
+    public enum ProjectedColumnMode {
+        NONE,
+        PURE_V2_EVENTS,
+        MIXED_UNION_BY_NAME
+    }
+
+    @FunctionalInterface
+    public interface OcrGenerationMatcher {
+        boolean mightMatch(byte[] bloom, String minNorm, String maxNorm);
+    }
 
     private JsonCqlEvaluator() {
     }
@@ -95,6 +113,25 @@ public final class JsonCqlEvaluator {
      */
     public static boolean appendDuckDbPrefilter(
             Filter filter, String column, StringBuilder sql, List<Object> parameters) {
+        return appendDuckDbPrefilter(filter, column, ProjectedColumnMode.NONE, sql, parameters);
+    }
+
+    public static boolean appendDuckDbPrefilter(
+            Filter filter, String column, ProjectedColumnMode mode,
+            StringBuilder sql, List<Object> parameters) {
+        if (mode != null && mode != ProjectedColumnMode.NONE) {
+            Optional<ExactDuckDbPredicate> exact = tryBuildExactDuckDbPredicate(filter, column, mode);
+            if (exact.isPresent()) {
+                ExactDuckDbPredicate pred = exact.get();
+                if ("FALSE".equals(pred.sql())) {
+                    sql.append(" AND FALSE");
+                } else if (!"TRUE".equals(pred.sql())) {
+                    sql.append(" AND (").append(pred.sql()).append(')');
+                    parameters.addAll(pred.parameters());
+                }
+                return true;
+            }
+        }
         PrefilterClause clause = buildDuckDbPrefilter(filter, column);
         if (clause == null)
             return false;
@@ -118,6 +155,65 @@ public final class JsonCqlEvaluator {
                 .append(") OR strpos(").append(column).append(", '\\u') > 0)");
         parameters.addAll(clause.parameters());
         return true;
+    }
+
+    public static Optional<OcrGenerationMatcher> extractOcrGenerationMatcher(Filter filter) {
+        if (filter == null || filter == Filter.INCLUDE || filter == Filter.EXCLUDE)
+            return Optional.empty();
+        if (filter instanceof PropertyIsEqualTo eq &&
+                eq.getExpression1() instanceof PropertyName prop &&
+                "normalizedValue".equals(prop.getPropertyName()) &&
+                eq.getExpression2() instanceof Literal lit &&
+                lit.getValue() instanceof String expected) {
+            boolean matchCase = eq.isMatchingCase();
+            return Optional.of((bloom, min, max) ->
+                    OcrBloomFilter.mightMatchExact(bloom, min, max, expected, matchCase));
+        }
+        if (filter instanceof PropertyIsLike like &&
+                like.getExpression() instanceof PropertyName prop &&
+                "normalizedValue".equals(prop.getPropertyName())) {
+            String literal = like.getLiteral();
+            String wildcard = like.getWildCard();
+            String single = like.getSingleChar();
+            String escape = like.getEscape();
+            boolean matchCase = like.isMatchingCase();
+            return Optional.of((bloom, min, max) ->
+                    OcrBloomFilter.mightMatchLike(bloom, min, max, literal, wildcard, single, escape, matchCase));
+        }
+        if (filter instanceof And and) {
+            List<OcrGenerationMatcher> matchers = new ArrayList<>();
+            for (Filter child : and.getChildren()) {
+                extractOcrGenerationMatcher(child).ifPresent(matchers::add);
+            }
+            if (matchers.isEmpty())
+                return Optional.empty();
+            return Optional.of((bloom, min, max) -> {
+                for (OcrGenerationMatcher m : matchers) {
+                    if (!m.mightMatch(bloom, min, max))
+                        return false;
+                }
+                return true;
+            });
+        }
+        if (filter instanceof Or or) {
+            if (or.getChildren().isEmpty())
+                return Optional.empty();
+            List<OcrGenerationMatcher> matchers = new ArrayList<>(or.getChildren().size());
+            for (Filter child : or.getChildren()) {
+                Optional<OcrGenerationMatcher> sub = extractOcrGenerationMatcher(child);
+                if (sub.isEmpty())
+                    return Optional.empty();
+                matchers.add(sub.get());
+            }
+            return Optional.of((bloom, min, max) -> {
+                for (OcrGenerationMatcher m : matchers) {
+                    if (m.mightMatch(bloom, min, max))
+                        return true;
+                }
+                return false;
+            });
+        }
+        return Optional.empty();
     }
 
     /**
@@ -1115,25 +1211,51 @@ public final class JsonCqlEvaluator {
                     comparison instanceof PropertyIsLessThan ||
                     comparison instanceof PropertyIsLessThanOrEqualTo) &&
                     !"adjudicatedIdsCount".equals(property.getPropertyName()) &&
-                    SAFE_JSON_DOLLAR_PATH.matcher(property.getPropertyName()).matches() &&
-                    (expected instanceof Number ||
-                            (expected instanceof String text && parseRfc3339Instant(text) == null))) {
-                String dec = formatExactDecimal38_9(expected);
-                if (dec != null) {
-                    String sqlOp = sqlComparisonOp(comparison);
-                    String jsonPath = "'$." + property.getPropertyName() + "'";
-                    List<Object> params = new ArrayList<>(2);
-                    StringBuilder expr = new StringBuilder();
-                    if (leafKey != null) {
-                        expr.append("strpos(").append(column).append(", ?) > 0 AND ");
-                        params.add(leafKey);
+                    SAFE_JSON_DOLLAR_PATH.matcher(property.getPropertyName()).matches()) {
+                if (expected instanceof String text) {
+                    Instant parsedInstant = parseRfc3339Instant(text);
+                    if (parsedInstant != null && parsedInstant.getNano() % 1_000 == 0) {
+                        String sqlOp = sqlComparisonOp(comparison);
+                        String jsonPath = "'$." + property.getPropertyName() + "'";
+                        String valExpr = "json_extract_string(" + column + ", " + jsonPath + ")";
+                        List<Object> params = new ArrayList<>(3);
+                        StringBuilder expr = new StringBuilder();
+                        if (leafKey != null) {
+                            expr.append("strpos(").append(column).append(", ?) > 0 AND ");
+                            params.add(leafKey);
+                        }
+                        expr.append("json_type(").append(column).append(", ").append(jsonPath)
+                                .append(") = 'VARCHAR' AND regexp_matches(").append(valExpr).append(", ?) ")
+                                .append("AND TRY_CAST(").append(valExpr)
+                                .append(" AS TIMESTAMPTZ) >= TIMESTAMPTZ '0001-01-01T00:00:00Z' ")
+                                .append("AND TRY_CAST(").append(valExpr)
+                                .append(" AS TIMESTAMPTZ) < TIMESTAMPTZ '10000-01-01T00:00:00Z' ")
+                                .append("AND TRY_CAST(").append(valExpr).append(" AS TIMESTAMPTZ) ")
+                                .append(sqlOp).append(" TRY_CAST(? AS TIMESTAMPTZ)");
+                        params.add(RFC3339_INSTANT.pattern());
+                        params.add(parsedInstant.toString());
+                        return new PrefilterClause(expr.toString(), params, true);
                     }
-                    expr.append("json_type(").append(column).append(", ").append(jsonPath)
-                            .append(") IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND TRY_CAST(json_extract(")
-                            .append(column).append(", ").append(jsonPath)
-                            .append(") AS DECIMAL(38, 9)) ").append(sqlOp).append(" CAST(? AS DECIMAL(38, 9))");
-                    params.add(dec);
-                    return new PrefilterClause(expr.toString(), params, true);
+                }
+                if (expected instanceof Number ||
+                        (expected instanceof String text && parseRfc3339Instant(text) == null)) {
+                    String dec = formatExactDecimal38_9(expected);
+                    if (dec != null) {
+                        String sqlOp = sqlComparisonOp(comparison);
+                        String jsonPath = "'$." + property.getPropertyName() + "'";
+                        List<Object> params = new ArrayList<>(2);
+                        StringBuilder expr = new StringBuilder();
+                        if (leafKey != null) {
+                            expr.append("strpos(").append(column).append(", ?) > 0 AND ");
+                            params.add(leafKey);
+                        }
+                        expr.append("json_type(").append(column).append(", ").append(jsonPath)
+                                .append(") IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND TRY_CAST(json_extract(")
+                                .append(column).append(", ").append(jsonPath)
+                                .append(") AS DECIMAL(38, 9)) ").append(sqlOp).append(" CAST(? AS DECIMAL(38, 9))");
+                        params.add(dec);
+                        return new PrefilterClause(expr.toString(), params, true);
+                    }
                 }
             }
             return leafKey == null ? null : leafKeyPrefilter(property.getPropertyName(), column);
@@ -1150,15 +1272,40 @@ public final class JsonCqlEvaluator {
      * DuckDB without transferring {@code result_json} strings across JDBC/JNI.
      */
     public static Optional<ExactDuckDbPredicate> tryBuildExactDuckDbPredicate(Filter filter, String column) {
+        return tryBuildExactDuckDbPredicate(filter, column, ProjectedColumnMode.NONE);
+    }
+
+    public static Optional<ExactDuckDbPredicate> tryBuildExactDuckDbPredicate(
+            Filter filter, String column, ProjectedColumnMode mode) {
+        ProjectedColumnMode effectiveMode = mode == null ? ProjectedColumnMode.NONE : mode;
         if (filter == null || filter == Filter.INCLUDE)
             return Optional.of(new ExactDuckDbPredicate("TRUE", List.of()));
         if (filter == Filter.EXCLUDE)
             return Optional.of(new ExactDuckDbPredicate("FALSE", List.of()));
-        ExactDuckDbPredicate node = buildExactDuckDbNode(filter, column);
+        ExactDuckDbPredicate node = buildExactDuckDbNode(filter, column, effectiveMode);
         if (node == null)
             return Optional.empty();
-        if ("FALSE".equals(node.sql()))
+        if ("FALSE".equals(node.sql()) || "TRUE".equals(node.sql()))
             return Optional.of(node);
+
+        if (effectiveMode == ProjectedColumnMode.PURE_V2_EVENTS) {
+            if (!node.sql().contains(column) && !containsNegation(filter)) {
+                return Optional.of(node);
+            }
+            return Optional.of(new ExactDuckDbPredicate(
+                    "json_type(" + column + ") = 'OBJECT' AND (" + node.sql() + ")",
+                    node.parameters()));
+        }
+        if (effectiveMode == ProjectedColumnMode.MIXED_UNION_BY_NAME) {
+            if (!containsNegation(filter)) {
+                return Optional.of(node);
+            }
+            return Optional.of(new ExactDuckDbPredicate(
+                    "((COALESCE(archive_version, 1) >= 2 AND profile IN ('DAILY_EVENTS', 'MONTHLY_EVENTS')) OR json_type(" +
+                            column + ") = 'OBJECT') AND (" + node.sql() + ")",
+                    node.parameters()));
+        }
+
         ExactDuckDbPredicate fastGuard = buildFastStrposGuard(filter, column);
         if (fastGuard != null && !"TRUE".equals(fastGuard.sql())) {
             List<Object> combined = new ArrayList<>(fastGuard.parameters().size() + node.parameters().size());
@@ -1173,6 +1320,23 @@ public final class JsonCqlEvaluator {
         return Optional.of(new ExactDuckDbPredicate(
                 "json_type(" + column + ") = 'OBJECT' AND (" + node.sql() + ")",
                 node.parameters()));
+    }
+
+    private static boolean containsNegation(Filter filter) {
+        if (filter instanceof Not)
+            return true;
+        if (filter instanceof And and) {
+            for (Filter child : and.getChildren()) {
+                if (containsNegation(child))
+                    return true;
+            }
+        } else if (filter instanceof Or or) {
+            for (Filter child : or.getChildren()) {
+                if (containsNegation(child))
+                    return true;
+            }
+        }
+        return false;
     }
 
     private static String nonStandardJsonFormattingEscape(String column) {
@@ -1227,6 +1391,13 @@ public final class JsonCqlEvaluator {
                     ? new ExactDuckDbPredicate("FALSE", List.of())
                     : new ExactDuckDbPredicate(String.join(" OR ", parts), params);
         }
+        if (filter instanceof PropertyIsLike like &&
+                like.getExpression() instanceof PropertyName property) {
+            String leafKey = extractSafeLeafKey(property.getPropertyName());
+            if (leafKey != null) {
+                return new ExactDuckDbPredicate("strpos(" + column + ", ?) > 0", List.of(leafKey));
+            }
+        }
         if (filter instanceof BinaryComparisonOperator cmp &&
                 cmp.getExpression1() instanceof PropertyName property &&
                 cmp.getExpression2() instanceof Literal literal) {
@@ -1260,7 +1431,8 @@ public final class JsonCqlEvaluator {
         return null;
     }
 
-    private static ExactDuckDbPredicate buildExactDuckDbNode(Filter filter, String column) {
+    private static ExactDuckDbPredicate buildExactDuckDbNode(
+            Filter filter, String column, ProjectedColumnMode mode) {
         if (filter == Filter.INCLUDE)
             return new ExactDuckDbPredicate("TRUE", List.of());
         if (filter == Filter.EXCLUDE)
@@ -1271,7 +1443,7 @@ public final class JsonCqlEvaluator {
             List<String> clauses = new ArrayList<>(and.getChildren().size());
             List<Object> params = new ArrayList<>();
             for (Filter child : and.getChildren()) {
-                ExactDuckDbPredicate sub = buildExactDuckDbNode(child, column);
+                ExactDuckDbPredicate sub = buildExactDuckDbNode(child, column, mode);
                 if (sub == null)
                     return null;
                 if ("FALSE".equals(sub.sql()))
@@ -1291,7 +1463,7 @@ public final class JsonCqlEvaluator {
             List<String> clauses = new ArrayList<>(or.getChildren().size());
             List<Object> params = new ArrayList<>();
             for (Filter child : or.getChildren()) {
-                ExactDuckDbPredicate sub = buildExactDuckDbNode(child, column);
+                ExactDuckDbPredicate sub = buildExactDuckDbNode(child, column, mode);
                 if (sub == null)
                     return null;
                 if ("TRUE".equals(sub.sql()))
@@ -1306,10 +1478,13 @@ public final class JsonCqlEvaluator {
                     : new ExactDuckDbPredicate(String.join(" OR ", clauses), params);
         }
         if (filter instanceof Not not) {
-            ExactDuckDbPredicate sub = buildExactDuckDbNode(not.getFilter(), column);
+            ExactDuckDbPredicate sub = buildExactDuckDbNode(not.getFilter(), column, mode);
             if (sub == null)
                 return null;
-            return new ExactDuckDbPredicate("NOT (" + sub.sql() + ")", sub.parameters());
+            return new ExactDuckDbPredicate("NOT COALESCE((" + sub.sql() + "), FALSE)", sub.parameters());
+        }
+        if (filter instanceof PropertyIsLike like) {
+            return buildExactDuckDbLikeNode(like, column, mode);
         }
         if (filter instanceof BinaryComparisonOperator cmp) {
             if (!(cmp.getExpression1() instanceof PropertyName property) ||
@@ -1319,100 +1494,423 @@ public final class JsonCqlEvaluator {
             Object expected = literal.getValue();
             if (expected == null || path == null || !SAFE_JSON_DOLLAR_PATH.matcher(path).matches())
                 return null;
-            String jsonPath = "'$." + path + "'";
-            String leafKey = extractSafeLeafKey(path);
 
-            if ("adjudicatedIdsCount".equals(path)) {
-                String sqlOp = sqlComparisonOp(cmp);
-                if (sqlOp == null)
-                    return null;
-                if (cmp instanceof PropertyIsEqualTo && !(expected instanceof Number))
-                    return null;
-                String dec = formatExactDecimal38_9(expected);
-                if (dec == null)
-                    return null;
-                String expr = "(CASE " +
-                        "WHEN json_type(" + column + ", '$.adjudicatedIdsCount') IN ('UBIGINT', 'BIGINT', 'DOUBLE') " +
-                        "THEN TRY_CAST(json_extract(" + column + ", '$.adjudicatedIdsCount') AS DECIMAL(38, 9)) " +
-                        "WHEN (json_type(" + column + ", '$.adjudicatedIdsCount') IS NULL OR " +
-                        "json_type(" + column + ", '$.adjudicatedIdsCount') = 'NULL') AND " +
-                        "json_type(" + column + ", '$.adjudicatedIds') = 'ARRAY' " +
-                        "THEN CAST(json_array_length(json_extract(" + column + ", '$.adjudicatedIds')) AS DECIMAL(38, 9)) " +
-                        "ELSE NULL END " + sqlOp + " CAST(? AS DECIMAL(38, 9)))";
-                return new ExactDuckDbPredicate(expr, List.of(dec));
+            ExactDuckDbPredicate v1Pred = buildV1JsonComparisonPredicate(cmp, path, expected, column);
+            if (v1Pred == null)
+                return null;
+            if (mode == ProjectedColumnMode.NONE)
+                return v1Pred;
+
+            ExactDuckDbPredicate v2Pred = tryBuildV2ProjectedComparisonPredicate(cmp, path, expected);
+            if (v2Pred != null) {
+                if (mode == ProjectedColumnMode.PURE_V2_EVENTS)
+                    return v2Pred;
+                return combineMixedV2AndV1(v2Pred, v1Pred, column);
             }
-
-            if (cmp instanceof PropertyIsGreaterThan ||
-                    cmp instanceof PropertyIsGreaterThanOrEqualTo ||
-                    cmp instanceof PropertyIsLessThan ||
-                    cmp instanceof PropertyIsLessThanOrEqualTo) {
-                if (expected instanceof String text && parseRfc3339Instant(text) != null)
-                    return null;
-                String dec = formatExactDecimal38_9(expected);
-                if (dec == null)
-                    return null;
-                String sqlOp = sqlComparisonOp(cmp);
-                List<Object> params = new ArrayList<>(2);
-                StringBuilder sb = new StringBuilder("(");
-                if (leafKey != null) {
-                    sb.append("(strpos(").append(column).append(", ?) > 0 OR strpos(")
-                            .append(column).append(", '\\u') > 0) AND ");
-                    params.add(leafKey);
-                }
-                sb.append("json_type(").append(column).append(", ").append(jsonPath)
-                        .append(") IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND TRY_CAST(json_extract(")
-                        .append(column).append(", ").append(jsonPath)
-                        .append(") AS DECIMAL(38, 9)) ").append(sqlOp).append(" CAST(? AS DECIMAL(38, 9)))");
-                params.add(dec);
-                return new ExactDuckDbPredicate(sb.toString(), params);
+            if (mode == ProjectedColumnMode.MIXED_UNION_BY_NAME) {
+                return new ExactDuckDbPredicate(
+                        "(json_type(" + column + ") = 'OBJECT' AND (" + v1Pred.sql() + "))",
+                        v1Pred.parameters());
             }
+            return v1Pred;
+        }
+        return null;
+    }
 
-            if (cmp instanceof PropertyIsEqualTo && EXACT_DUCKDB_SCALAR_KEYS.contains(path)) {
-                if (expected instanceof Boolean boolVal) {
-                    String token = boolVal ? "true" : "false";
-                    String expr = "((strpos(" + column + ", ?) > 0 OR strpos(" + column + ", '\\u') > 0) AND " +
-                            "json_type(" + column + ", " + jsonPath + ") = 'BOOLEAN' AND " +
-                            "CAST(json_extract(" + column + ", " + jsonPath + ") AS BOOLEAN) = ?)";
-                    return new ExactDuckDbPredicate(expr, List.of(token, boolVal));
-                }
-                if (expected instanceof Number) {
-                    String dec = formatExactDecimal38_9(expected);
-                    if (dec == null)
-                        return null;
-                    String expr = "((strpos(" + column + ", ?) > 0 OR strpos(" + column + ", '\\u') > 0) AND " +
-                            "json_type(" + column + ", " + jsonPath + ") IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND " +
-                            "TRY_CAST(json_extract(" + column + ", " + jsonPath +
-                            ") AS DECIMAL(38, 9)) = CAST(? AS DECIMAL(38, 9)))";
-                    return new ExactDuckDbPredicate(expr, List.of(path, dec));
-                }
-                if (expected instanceof String text) {
-                    List<Object> params = new ArrayList<>(2);
-                    StringBuilder sb = new StringBuilder("(");
-                    if (!text.isEmpty() && SAFE_JSON_STRING_LITERAL.matcher(text).matches()) {
-                        if (cmp.isMatchingCase()) {
-                            sb.append("(strpos(").append(column).append(", ?) > 0 OR strpos(")
-                                    .append(column).append(", '\\u') > 0) AND ");
-                            params.add(text);
-                        } else {
-                            sb.append("(strpos(lower(").append(column).append("), ?) > 0 OR strpos(")
-                                    .append(column).append(", '\\u') > 0) AND ");
-                            params.add(text.toLowerCase(Locale.ROOT));
-                        }
-                    }
-                    sb.append("json_type(").append(column).append(", ").append(jsonPath).append(") = 'VARCHAR' AND ");
-                    if (cmp.isMatchingCase()) {
-                        sb.append("json_extract_string(").append(column).append(", ").append(jsonPath).append(") = ?)");
-                        params.add(text);
-                    } else {
-                        sb.append("lower(json_extract_string(").append(column).append(", ").append(jsonPath)
-                                .append(")) = lower(?))");
-                        params.add(text);
-                    }
-                    return new ExactDuckDbPredicate(sb.toString(), params);
-                }
+    private static ExactDuckDbPredicate combineMixedV2AndV1(
+            ExactDuckDbPredicate v2Pred, ExactDuckDbPredicate v1Pred, String jsonColumn) {
+        List<Object> params = new ArrayList<>(v2Pred.parameters().size() + v1Pred.parameters().size());
+        params.addAll(v2Pred.parameters());
+        params.addAll(v1Pred.parameters());
+        String sql = "(CASE WHEN COALESCE(archive_version, 1) = 2 AND profile IN ('DAILY_EVENTS', 'MONTHLY_EVENTS') " +
+                "THEN COALESCE((" + v2Pred.sql() + "), FALSE) " +
+                "ELSE (json_type(" + jsonColumn + ") = 'OBJECT' AND COALESCE((" + v1Pred.sql() + "), FALSE)) END)";
+        return new ExactDuckDbPredicate(sql, params);
+    }
+
+    private static String projectedStringColumnFor(String path) {
+        return switch (path) {
+            case "normalizedValue" -> "ocr_norm";
+            case "occupancyObsId" -> "occ_obs_id";
+            case "eventId" -> "event_id";
+            default -> null;
+        };
+    }
+
+    private static ExactDuckDbPredicate tryBuildV2ProjectedComparisonPredicate(
+            BinaryComparisonOperator cmp, String path, Object expected) {
+        String sqlOp = sqlComparisonOp(cmp);
+        if (sqlOp == null)
+            return null;
+
+        String stringCol = projectedStringColumnFor(path);
+        if (stringCol != null && cmp instanceof PropertyIsEqualTo && expected instanceof String text) {
+            if (cmp.isMatchingCase()) {
+                return new ExactDuckDbPredicate(stringCol + " = ?", List.of(text));
+            }
+            return new ExactDuckDbPredicate("lower(" + stringCol + ") = lower(?)", List.of(text));
+        }
+
+        if (("gammaAlarm".equals(path) || "neutronAlarm".equals(path)) &&
+                cmp instanceof PropertyIsEqualTo && expected instanceof Boolean boolVal) {
+            String boolCol = "gammaAlarm".equals(path) ? "gamma_alarm" : "neutron_alarm";
+            return new ExactDuckDbPredicate(boolCol + " = ?", List.of(boolVal));
+        }
+
+        if ("adjudicationCode".equals(path) || "adjudicatedIdsCount".equals(path)) {
+            if (cmp instanceof PropertyIsEqualTo && !(expected instanceof Number))
+                return null;
+            String intCol = "adjudicationCode".equals(path) ? "adj_code" : "adj_count";
+            Integer exactInt = tryExactInteger(expected);
+            if (exactInt != null) {
+                return new ExactDuckDbPredicate(intCol + " " + sqlOp + " ?", List.of(exactInt));
+            }
+            String dec = formatExactDecimal38_9(expected);
+            if (dec != null) {
+                return new ExactDuckDbPredicate(
+                        "CAST(" + intCol + " AS DECIMAL(38, 9)) " + sqlOp + " CAST(? AS DECIMAL(38, 9))",
+                        List.of(dec));
+            }
+            return null;
+        }
+
+        if ("maxGammaCount".equals(path) || "maxNeutronCount".equals(path)) {
+            if (cmp instanceof PropertyIsEqualTo && !(expected instanceof Number))
+                return null;
+            Double exactDouble = tryExactIeeeDouble(expected);
+            if (exactDouble != null) {
+                String dblCol = "maxGammaCount".equals(path) ? "max_gamma" : "max_neutron";
+                return new ExactDuckDbPredicate(dblCol + " " + sqlOp + " ?", List.of(exactDouble));
             }
         }
         return null;
+    }
+
+    private static Integer tryExactInteger(Object value) {
+        if (!(value instanceof Number || value instanceof String))
+            return null;
+        try {
+            BigDecimal bd = new BigDecimal(value.toString()).stripTrailingZeros();
+            if (bd.scale() > 0)
+                return null;
+            return bd.intValueExact();
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static Double tryExactIeeeDouble(Object value) {
+        if (!(value instanceof Number || value instanceof String))
+            return null;
+        try {
+            BigDecimal bd = new BigDecimal(value.toString()).stripTrailingZeros();
+            double d = bd.doubleValue();
+            if (!Double.isFinite(d))
+                return null;
+            if (new BigDecimal(Double.toString(d)).compareTo(bd) == 0)
+                return d;
+            return null;
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private static ExactDuckDbPredicate buildV1JsonComparisonPredicate(
+            BinaryComparisonOperator cmp, String path, Object expected, String column) {
+        String jsonPath = "'$." + path + "'";
+        String leafKey = extractSafeLeafKey(path);
+
+        if ("adjudicatedIdsCount".equals(path)) {
+            String sqlOp = sqlComparisonOp(cmp);
+            if (sqlOp == null)
+                return null;
+            if (cmp instanceof PropertyIsEqualTo && !(expected instanceof Number))
+                return null;
+            String dec = formatExactDecimal38_9(expected);
+            if (dec == null)
+                return null;
+            String expr = "(CASE " +
+                    "WHEN json_type(" + column + ", '$.adjudicatedIdsCount') IN ('UBIGINT', 'BIGINT', 'DOUBLE') " +
+                    "THEN TRY_CAST(json_extract(" + column + ", '$.adjudicatedIdsCount') AS DECIMAL(38, 9)) " +
+                    "WHEN (json_type(" + column + ", '$.adjudicatedIdsCount') IS NULL OR " +
+                    "json_type(" + column + ", '$.adjudicatedIdsCount') = 'NULL') AND " +
+                    "json_type(" + column + ", '$.adjudicatedIds') = 'ARRAY' " +
+                    "THEN CAST(json_array_length(json_extract(" + column + ", '$.adjudicatedIds')) AS DECIMAL(38, 9)) " +
+                    "ELSE NULL END " + sqlOp + " CAST(? AS DECIMAL(38, 9)))";
+            return new ExactDuckDbPredicate(expr, List.of(dec));
+        }
+
+        if (cmp instanceof PropertyIsGreaterThan ||
+                cmp instanceof PropertyIsGreaterThanOrEqualTo ||
+                cmp instanceof PropertyIsLessThan ||
+                cmp instanceof PropertyIsLessThanOrEqualTo) {
+            String sqlOp = sqlComparisonOp(cmp);
+            if (expected instanceof String text) {
+                Instant parsedInstant = parseRfc3339Instant(text);
+                if (parsedInstant != null) {
+                    if (parsedInstant.getNano() % 1_000 != 0)
+                        return null;
+                    String valExpr = "json_extract_string(" + column + ", " + jsonPath + ")";
+                    List<Object> params = new ArrayList<>(3);
+                    StringBuilder sb = new StringBuilder("(");
+                    if (leafKey != null) {
+                        sb.append("(strpos(").append(column).append(", ?) > 0 OR strpos(")
+                                .append(column).append(", '\\u') > 0) AND ");
+                        params.add(leafKey);
+                    }
+                    sb.append("json_type(").append(column).append(", ").append(jsonPath)
+                            .append(") = 'VARCHAR' AND regexp_matches(").append(valExpr).append(", ?) ")
+                            .append("AND TRY_CAST(").append(valExpr)
+                            .append(" AS TIMESTAMPTZ) >= TIMESTAMPTZ '0001-01-01T00:00:00Z' ")
+                            .append("AND TRY_CAST(").append(valExpr)
+                            .append(" AS TIMESTAMPTZ) < TIMESTAMPTZ '10000-01-01T00:00:00Z' ")
+                            .append("AND TRY_CAST(").append(valExpr).append(" AS TIMESTAMPTZ) ")
+                            .append(sqlOp).append(" TRY_CAST(? AS TIMESTAMPTZ))");
+                    params.add(RFC3339_INSTANT.pattern());
+                    params.add(parsedInstant.toString());
+                    return new ExactDuckDbPredicate(sb.toString(), params);
+                }
+            }
+            String dec = formatExactDecimal38_9(expected);
+            if (dec == null)
+                return null;
+            List<Object> params = new ArrayList<>(2);
+            StringBuilder sb = new StringBuilder("(");
+            if (leafKey != null) {
+                sb.append("(strpos(").append(column).append(", ?) > 0 OR strpos(")
+                        .append(column).append(", '\\u') > 0) AND ");
+                params.add(leafKey);
+            }
+            sb.append("json_type(").append(column).append(", ").append(jsonPath)
+                    .append(") IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND TRY_CAST(json_extract(")
+                    .append(column).append(", ").append(jsonPath)
+                    .append(") AS DECIMAL(38, 9)) ").append(sqlOp).append(" CAST(? AS DECIMAL(38, 9)))");
+            params.add(dec);
+            return new ExactDuckDbPredicate(sb.toString(), params);
+        }
+
+        if (cmp instanceof PropertyIsEqualTo && EXACT_DUCKDB_SCALAR_KEYS.contains(path)) {
+            if (expected instanceof Boolean boolVal) {
+                String token = boolVal ? "true" : "false";
+                String expr = "((strpos(" + column + ", ?) > 0 OR strpos(" + column + ", '\\u') > 0) AND " +
+                        "json_type(" + column + ", " + jsonPath + ") = 'BOOLEAN' AND " +
+                        "CAST(json_extract(" + column + ", " + jsonPath + ") AS BOOLEAN) = ?)";
+                return new ExactDuckDbPredicate(expr, List.of(token, boolVal));
+            }
+            if (expected instanceof Number) {
+                String dec = formatExactDecimal38_9(expected);
+                if (dec == null)
+                    return null;
+                String expr = "((strpos(" + column + ", ?) > 0 OR strpos(" + column + ", '\\u') > 0) AND " +
+                        "json_type(" + column + ", " + jsonPath + ") IN ('UBIGINT', 'BIGINT', 'DOUBLE') AND " +
+                        "TRY_CAST(json_extract(" + column + ", " + jsonPath +
+                        ") AS DECIMAL(38, 9)) = CAST(? AS DECIMAL(38, 9)))";
+                return new ExactDuckDbPredicate(expr, List.of(path, dec));
+            }
+            if (expected instanceof String text) {
+                List<Object> params = new ArrayList<>(2);
+                StringBuilder sb = new StringBuilder("(");
+                if (!text.isEmpty() && SAFE_JSON_STRING_LITERAL.matcher(text).matches()) {
+                    if (cmp.isMatchingCase()) {
+                        sb.append("(strpos(").append(column).append(", ?) > 0 OR strpos(")
+                                .append(column).append(", '\\u') > 0) AND ");
+                        params.add(text);
+                    } else {
+                        sb.append("(strpos(lower(").append(column).append("), ?) > 0 OR strpos(")
+                                .append(column).append(", '\\u') > 0) AND ");
+                        params.add(text.toLowerCase(Locale.ROOT));
+                    }
+                }
+                sb.append("json_type(").append(column).append(", ").append(jsonPath).append(") = 'VARCHAR' AND ");
+                if (cmp.isMatchingCase()) {
+                    sb.append("json_extract_string(").append(column).append(", ").append(jsonPath).append(") = ?)");
+                    params.add(text);
+                } else {
+                    sb.append("lower(json_extract_string(").append(column).append(", ").append(jsonPath)
+                            .append(")) = lower(?))");
+                    params.add(text);
+                }
+                return new ExactDuckDbPredicate(sb.toString(), params);
+            }
+        }
+        return null;
+    }
+
+    private enum LikeShape {
+        EXACT,
+        PREFIX,
+        CONTAINS,
+        GENERAL
+    }
+
+    private record AnalyzedLikePattern(
+            LikeShape shape,
+            String literalValue,
+            String duckLikePattern) {}
+
+    private static AnalyzedLikePattern analyzeLikePattern(PropertyIsLike like) {
+        String literal = like.getLiteral() == null ? "" : like.getLiteral();
+        String wildcard = like.getWildCard() == null ? "" : like.getWildCard();
+        String single = like.getSingleChar() == null ? "" : like.getSingleChar();
+        String escape = like.getEscape() == null ? "" : like.getEscape();
+
+        List<Object> tokens = new ArrayList<>();
+        StringBuilder currentLiteral = new StringBuilder();
+        StringBuilder sqlLike = new StringBuilder(literal.length() + 4);
+        boolean hasSingle = false;
+
+        for (int index = 0; index < literal.length(); ) {
+            if (!escape.isEmpty() && literal.startsWith(escape, index)) {
+                index += escape.length();
+                if (index < literal.length()) {
+                    int cp = literal.codePointAt(index);
+                    currentLiteral.appendCodePoint(cp);
+                    appendDuckLikeEscapedCodePoint(sqlLike, cp);
+                    index += Character.charCount(cp);
+                }
+            } else if (!wildcard.isEmpty() && literal.startsWith(wildcard, index)) {
+                if (!currentLiteral.isEmpty()) {
+                    tokens.add(currentLiteral.toString());
+                    currentLiteral.setLength(0);
+                }
+                if (tokens.isEmpty() || !WILDCARD_MARKER.equals(tokens.get(tokens.size() - 1))) {
+                    tokens.add(WILDCARD_MARKER);
+                }
+                sqlLike.append('%');
+                index += wildcard.length();
+            } else if (!single.isEmpty() && literal.startsWith(single, index)) {
+                if (!currentLiteral.isEmpty()) {
+                    tokens.add(currentLiteral.toString());
+                    currentLiteral.setLength(0);
+                }
+                tokens.add(SINGLE_MARKER);
+                hasSingle = true;
+                sqlLike.append('_');
+                index += single.length();
+            } else {
+                int cp = literal.codePointAt(index);
+                currentLiteral.appendCodePoint(cp);
+                appendDuckLikeEscapedCodePoint(sqlLike, cp);
+                index += Character.charCount(cp);
+            }
+        }
+        if (!currentLiteral.isEmpty()) {
+            tokens.add(currentLiteral.toString());
+        }
+
+        if (tokens.isEmpty()) {
+            return new AnalyzedLikePattern(LikeShape.EXACT, "", "");
+        }
+        if (!hasSingle) {
+            if (tokens.size() == 1 && tokens.get(0) instanceof String exact) {
+                return new AnalyzedLikePattern(LikeShape.EXACT, exact, sqlLike.toString());
+            }
+            if (tokens.size() == 2 && tokens.get(0) instanceof String prefix &&
+                    WILDCARD_MARKER.equals(tokens.get(1))) {
+                return new AnalyzedLikePattern(LikeShape.PREFIX, prefix, sqlLike.toString());
+            }
+            if (tokens.size() == 3 && WILDCARD_MARKER.equals(tokens.get(0)) &&
+                    tokens.get(1) instanceof String inner &&
+                    WILDCARD_MARKER.equals(tokens.get(2))) {
+                return new AnalyzedLikePattern(LikeShape.CONTAINS, inner, sqlLike.toString());
+            }
+        }
+        return new AnalyzedLikePattern(LikeShape.GENERAL, null, sqlLike.toString());
+    }
+
+    private static final Object WILDCARD_MARKER = new Object();
+    private static final Object SINGLE_MARKER = new Object();
+
+    private static void appendDuckLikeEscapedCodePoint(StringBuilder out, int cp) {
+        if (cp == '\\' || cp == '%' || cp == '_') {
+            out.append('\\').append((char) cp);
+        } else {
+            out.appendCodePoint(cp);
+        }
+    }
+
+    private static boolean isPureAsciiString(String s) {
+        if (s == null)
+            return true;
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) > 0x7F)
+                return false;
+        }
+        return true;
+    }
+
+    private static ExactDuckDbPredicate buildStringExprLikePredicate(
+            String expr, AnalyzedLikePattern analyzed, boolean matchingCase) {
+        return switch (analyzed.shape()) {
+            case EXACT -> matchingCase
+                    ? new ExactDuckDbPredicate(expr + " = ?", List.of(analyzed.literalValue()))
+                    : new ExactDuckDbPredicate("lower(" + expr + ") = lower(?)", List.of(analyzed.literalValue()));
+            case PREFIX -> matchingCase
+                    ? new ExactDuckDbPredicate("starts_with(" + expr + ", ?)", List.of(analyzed.literalValue()))
+                    : new ExactDuckDbPredicate(expr + " ILIKE ? ESCAPE '\\'", List.of(analyzed.duckLikePattern()));
+            case CONTAINS -> {
+                if (matchingCase) {
+                    yield new ExactDuckDbPredicate("strpos(" + expr + ", ?) > 0", List.of(analyzed.literalValue()));
+                }
+                if (isPureAsciiString(analyzed.literalValue())) {
+                    yield new ExactDuckDbPredicate(
+                            "strpos(lower(" + expr + "), ?) > 0",
+                            List.of(analyzed.literalValue().toLowerCase(Locale.ROOT)));
+                }
+                yield new ExactDuckDbPredicate(expr + " ILIKE ? ESCAPE '\\'", List.of(analyzed.duckLikePattern()));
+            }
+            case GENERAL -> new ExactDuckDbPredicate(
+                    expr + (matchingCase ? " LIKE " : " ILIKE ") + "? ESCAPE '\\'",
+                    List.of(analyzed.duckLikePattern()));
+        };
+    }
+
+    private static ExactDuckDbPredicate buildExactDuckDbLikeNode(
+            PropertyIsLike like, String column, ProjectedColumnMode mode) {
+        if (!(like.getExpression() instanceof PropertyName property))
+            return null;
+        String path = property.getPropertyName();
+        if (path == null || !SAFE_JSON_DOLLAR_PATH.matcher(path).matches() ||
+                !LIKE_EXACT_DUCKDB_STRING_KEYS.contains(path)) {
+            return null;
+        }
+        if (!like.isMatchingCase() && !isPureAsciiString(like.getLiteral())) {
+            return null;
+        }
+
+        AnalyzedLikePattern analyzed = analyzeLikePattern(like);
+        String jsonPath = "'$." + path + "'";
+        String leafKey = extractSafeLeafKey(path);
+        String extractedExpr = "json_extract_string(" + column + ", " + jsonPath + ")";
+        ExactDuckDbPredicate rawV1 = buildStringExprLikePredicate(extractedExpr, analyzed, like.isMatchingCase());
+        List<Object> v1Params = new ArrayList<>(rawV1.parameters().size() + 1);
+        StringBuilder v1Sql = new StringBuilder("(");
+        if (leafKey != null) {
+            v1Sql.append("(strpos(").append(column).append(", ?) > 0 OR strpos(")
+                    .append(column).append(", '\\u') > 0) AND ");
+            v1Params.add(leafKey);
+        }
+        v1Sql.append("json_type(").append(column).append(", ").append(jsonPath)
+                .append(") = 'VARCHAR' AND ").append(rawV1.sql()).append(')');
+        v1Params.addAll(rawV1.parameters());
+        ExactDuckDbPredicate v1Pred = new ExactDuckDbPredicate(v1Sql.toString(), v1Params);
+
+        if (mode == ProjectedColumnMode.NONE)
+            return v1Pred;
+
+        String projCol = projectedStringColumnFor(path);
+        if (projCol != null) {
+            ExactDuckDbPredicate v2Pred = buildStringExprLikePredicate(projCol, analyzed, like.isMatchingCase());
+            if (mode == ProjectedColumnMode.PURE_V2_EVENTS)
+                return v2Pred;
+            return combineMixedV2AndV1(v2Pred, v1Pred, column);
+        }
+        if (mode == ProjectedColumnMode.MIXED_UNION_BY_NAME) {
+            return new ExactDuckDbPredicate(
+                    "(json_type(" + column + ") = 'OBJECT' AND (" + v1Pred.sql() + "))",
+                    v1Pred.parameters());
+        }
+        return v1Pred;
     }
 
     private static String sqlComparisonOp(BinaryComparisonOperator cmp) {

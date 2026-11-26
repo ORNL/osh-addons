@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Configuration for OSCAR's immutable Parquet observation tier.
@@ -172,6 +173,29 @@ public class TieredArchiveConfig {
     @DisplayInfo(label = "ZSTD compression level")
     public int zstdCompressionLevel = 6;
 
+    @Min(0)
+    @DisplayInfo(label = "Compaction unlink grace (minutes)",
+            desc = "Safety delay after superseding source generations before unlinking files so online backups stay consistent")
+    public int compactionUnlinkGraceMinutes = 15;
+
+    public static final String PROFILE_RAW_GATED = "RAW_GATED";
+    public static final String PROFILE_DAILY_EVENTS = "DAILY_EVENTS";
+    public static final String PROFILE_DAILY_TELEMETRY = "DAILY_TELEMETRY";
+    public static final String PROFILE_MONTHLY_EVENTS = "MONTHLY_EVENTS";
+
+    public static final Set<String> EVENT_OUTPUT_NAMES = Set.of(
+            "occupancy", "alarm", "adjudication", "report", "vehicleOcr",
+            "emlAnalysis", "tamper", "dailyFile", "siteStatistics",
+            "nationalSummary", "connectionStatus", "occupancyStatus");
+
+    public static boolean isEventOutputName(String outputName) {
+        return outputName != null && EVENT_OUTPUT_NAMES.contains(outputName);
+    }
+
+    public static boolean isProjectedEventProfile(String profile) {
+        return PROFILE_DAILY_EVENTS.equals(profile) || PROFILE_MONTHLY_EVENTS.equals(profile);
+    }
+
     private static final List<String> LEGACY_DEFAULT_OUTPUT_NAMES = List.of(
             "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron");
 
@@ -312,6 +336,8 @@ public class TieredArchiveConfig {
         if (!requireParityReceipt)
             throw new IllegalArgumentException(
                     "requireParityReceipt is a mandatory safety invariant and cannot be disabled");
+        if (compactionUnlinkGraceMinutes < 0)
+            throw new IllegalArgumentException("compactionUnlinkGraceMinutes must not be negative");
         if (maximumRowsPerGeneration < 1)
             throw new IllegalArgumentException("maximumRowsPerGeneration must be positive");
         if (maximumUncompressedBytesPerGeneration < 1)

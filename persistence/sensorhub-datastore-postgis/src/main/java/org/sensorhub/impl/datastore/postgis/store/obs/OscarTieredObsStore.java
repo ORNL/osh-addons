@@ -20,6 +20,7 @@ import org.sensorhub.api.datastore.obs.ObsStatsQuery;
 import org.sensorhub.api.feature.FeatureId;
 import org.sensorhub.impl.datastore.postgis.IdProviderType;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveCatalog;
+import org.sensorhub.impl.datastore.postgis.archive.ArchiveCompactionManager;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveExporter;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveGeneration;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveLifecycleManager;
@@ -116,6 +117,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private final ArchiveExporter archiveExporter;
     private final ArchiveLifecycleManager archiveLifecycle;
     private final ParquetArchiveReader archiveReader;
+    private final ArchiveCompactionManager archiveCompaction;
     private final ImmutableObservationStageManager immutableStage;
     private final Cache<String, IDataStreamInfo> decodedOverlaySchemas = CacheBuilder.newBuilder()
             .maximumSize(1024)
@@ -190,6 +192,19 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             this.archiveLifecycle = new ArchiveLifecycleManager(connectionManager::getConnection, archiveCatalog,
                     archiveConfig, dataStoreName);
             this.archiveReader = new ParquetArchiveReader(Path.of(archiveConfig.rootDirectory), archiveConfig);
+            if (archiveConfig.enabled && archiveConfig.rootDirectory != null && !archiveConfig.rootDirectory.isBlank()) {
+                this.archiveCompaction = new ArchiveCompactionManager(
+                        archiveCatalog,
+                        archiveReader,
+                        archiveConfig,
+                        idScope,
+                        dataStoreName,
+                        dataStoreName + "_datastreams",
+                        this::invalidateRetiredGenerationCaches);
+                this.archiveCompaction.drainDeletingGenerations(Instant.now());
+            } else {
+                this.archiveCompaction = null;
+            }
             if (archiveConfig.enabled) {
                 backfillLegacyTombstoneDataStreams(2_000);
             }
@@ -254,6 +269,47 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         return archiveConfig;
     }
 
+    public ParquetArchiveReader getArchiveReader() {
+        return archiveReader;
+    }
+
+    public ArchiveCompactionManager getArchiveCompactionManager() {
+        return archiveCompaction;
+    }
+
+    public ArchiveCompactionManager.CompactionCycleSummary runCompactionCycle(Instant now) {
+        if (archiveCompaction == null)
+            return new ArchiveCompactionManager.CompactionCycleSummary(0, 0, 0, 0);
+        return archiveCompaction.runCompactionCycle(now);
+    }
+
+    public int drainDeletingGenerations(Instant now) {
+        if (archiveCompaction == null)
+            return 0;
+        return archiveCompaction.drainDeletingGenerations(now);
+    }
+
+    private void invalidateRetiredGenerationCaches(Collection<UUID> retiredGenerationIds) {
+        if (retiredGenerationIds == null || retiredGenerationIds.isEmpty())
+            return;
+        Set<UUID> retiredSet = new HashSet<>(retiredGenerationIds);
+        recentColdBaseById.asMap().entrySet().removeIf(
+                entry -> entry.getValue() != null && retiredSet.contains(entry.getValue().generation().id()));
+        mutatedGenSummaryCounts.asMap().keySet().removeIf(
+                key -> retiredSet.contains(key.generationId()));
+        legacyColdLatestCache.invalidateAll();
+        generationStreamSchemaHashes.asMap().keySet().removeIf(key -> {
+            int sep = key.indexOf(':');
+            if (sep <= 0)
+                return false;
+            try {
+                return retiredSet.contains(UUID.fromString(key.substring(0, sep)));
+            } catch (IllegalArgumentException ignored) {
+                return false;
+            }
+        });
+    }
+
     public boolean isParquetPrimary() {
         return archiveConfig.enabled && archiveConfig.isParquetPrimary();
     }
@@ -302,6 +358,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         archiveLifecycle.maintain();
         if (immutableStage != null)
             immutableStage.retireVerifiedPartitions();
+        if (archiveCompaction != null)
+            archiveCompaction.drainDeletingGenerations(Instant.now());
         archiveCatalog.backfillGenerationSummariesBatch(Path.of(archiveConfig.rootDirectory), 100);
         archiveCatalog.migrateLegacyOverlaySchemas(250);
         backfillLegacyTombstoneDataStreams(500);
@@ -1100,6 +1158,10 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         bounds.start(), bounds.end(), null, null, null, dataStreams,
                         minResultTime, maxResultTime),
                 minResultTime);
+        if (!allCandidates.isEmpty() && resolvedFilter.getCQLFilter() != null) {
+            allCandidates = archiveCatalog.pruneOcrCandidates(
+                    allCandidates, dataStreams, resolvedFilter.getCQLFilter());
+        }
         if (allCandidates.isEmpty())
             return new ColdOffsetStream(Stream.empty(), 0L);
 
@@ -1747,6 +1809,10 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 effectiveCandidates = archiveCatalog.pruneZeroMatchSummaryCandidates(
                         effectiveCandidates, dataStreams, summaryExpr, exactEventId);
             }
+        }
+        if (!effectiveCandidates.isEmpty() && !hasLatestSelection(filter) && filter.getCQLFilter() != null) {
+            effectiveCandidates = archiveCatalog.pruneOcrCandidates(
+                    effectiveCandidates, dataStreams, filter.getCQLFilter());
         }
         return streamColdBasesFromPreprunedCandidates(
                 effectiveCandidates, filter, readerLimit, dataStreams, fois, hasMutations, mutationBatchSize);
@@ -3002,12 +3068,16 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     }
 
     private IObsData getColdByPointId(long observationId) {
-        ParquetArchiveReader.ArchivedRow cached = getVerifiedCachedColdBase(observationId);
-        if (cached != null) {
-            if (archiveCatalog.isGenerationQueryVisible(cached.generation().id())) {
-                return toObservation(cached.generation().id(), null, cached.observation());
+        ParquetArchiveReader.ArchivedRow cachedEntry = recentColdBaseById.getIfPresent(observationId);
+        if (cachedEntry != null) {
+            if (!archiveCatalog.isGenerationQueryVisible(cachedEntry.generation().id())) {
+                recentColdBaseById.invalidate(observationId);
+            } else {
+                ParquetArchiveReader.ArchivedRow cached = getVerifiedCachedColdBase(observationId);
+                if (cached != null) {
+                    return toObservation(cached.generation().id(), null, cached.observation());
+                }
             }
-            recentColdBaseById.invalidate(observationId);
         }
         if (ConnectionManager.hasActiveCancellableOperation()) {
             ObsFilter filter = new ObsFilter.Builder()
@@ -4787,14 +4857,22 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         }
                         scannedColdCount = Math.subtractExact(rawCold, mutatedMatchingCold);
                     } else {
-                        Set<Long> parquetMutatedIds = mutatedByGen.isEmpty()
-                                ? Set.of()
-                                : parquetCandidates.stream()
-                                        .flatMap(g -> mutatedByGen.getOrDefault(g.id(), Set.of()).stream())
-                                        .collect(Collectors.toSet());
-                        scannedColdCount = archiveReader.countCql(
-                                parquetCandidates, resolvedFilter, dataStreams, fois,
-                                parquetMutatedIds, mutatedByGen, null);
+                        parquetCandidates = archiveCatalog.pruneOcrCandidates(
+                                parquetCandidates, dataStreams, resolvedFilter.getCQLFilter());
+                        if (!parquetCandidates.isEmpty()) {
+                            Set<Long> parquetMutatedIds = mutatedByGen.isEmpty()
+                                    ? Set.of()
+                                    : parquetCandidates.stream()
+                                            .flatMap(g -> mutatedByGen.getOrDefault(g.id(), Set.of()).stream())
+                                            .collect(Collectors.toSet());
+                            Map<UUID, ParquetArchiveReader.GenerationSummary> summariesByGen =
+                                    archiveCatalog.generationSummaries(
+                                            parquetCandidates.stream().map(ArchiveGeneration::id).toList(),
+                                            dataStreams);
+                            scannedColdCount = archiveReader.countCql(
+                                    parquetCandidates, resolvedFilter, dataStreams, fois,
+                                    parquetMutatedIds, mutatedByGen, summariesByGen);
+                        }
                     }
                 }
                 coldUnmutatedCount = Math.addExact(summarizedColdCount, scannedColdCount);

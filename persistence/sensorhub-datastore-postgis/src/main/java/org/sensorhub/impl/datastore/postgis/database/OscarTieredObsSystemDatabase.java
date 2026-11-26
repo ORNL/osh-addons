@@ -135,6 +135,17 @@ public class OscarTieredObsSystemDatabase extends PostgisObsSystemDatabase {
             store.compactDrainedMutableHotTables();
             store.reindexMutableHotTables();
         }
+        var compactionSummary = store.runCompactionCycle(Instant.now());
+        if (compactionSummary.daysCompacted() > 0 ||
+                compactionSummary.monthsConsolidated() > 0 ||
+                compactionSummary.monthlyGenerationsDefragmented() > 0 ||
+                compactionSummary.deletingGenerationsDrained() > 0) {
+            getLogger().info("OSCAR archive compaction cycle: days={}, months={}, defrag={}, drained={}",
+                    compactionSummary.daysCompacted(),
+                    compactionSummary.monthsConsolidated(),
+                    compactionSummary.monthlyGenerationsDefragmented(),
+                    compactionSummary.deletingGenerationsDrained());
+        }
         if (commandStore != null) {
             int prunedCommands = commandStore.purgeCompletedTransientCommandsBefore(
                     Instant.now().minus(24, ChronoUnit.HOURS));

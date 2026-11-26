@@ -30,6 +30,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
 
 /** Opens a bounded DuckDB connection with an operation-private spill directory. */
@@ -98,6 +99,7 @@ final class DuckDbResourcePolicy {
                 // archive's explicitly ordered writes/reads and can retain a
                 // large extra buffer during near-cap operations.
                 statement.execute("SET preserve_insertion_order=false");
+                statement.execute("SET parquet_metadata_cache=true");
             }
             return new Session(connection, realTemporaryRoot, operationDirectory, permit);
         } catch (Exception | Error error) {
@@ -431,13 +433,32 @@ final class DuckDbResourcePolicy {
      * reserving at least one session for interactive/lifecycle work whenever
      * the effective global cap exceeds one.
      */
+    static final long ANTI_STARVATION_AGING_NANOS = TimeUnit.SECONDS.toNanos(5);
+
+    static void setNanoClockForTesting(LongSupplier clock) {
+        ADMISSION.setNanoClock(clock);
+    }
+
+    static boolean hasInteractiveWaiters() {
+        return ADMISSION.hasInteractiveWaiters();
+    }
+
+    static int waitingCountForTesting() {
+        return ADMISSION.waitingCount();
+    }
+
     private static final class AdmissionController {
         private final ReentrantLock lock = new ReentrantLock(true);
         private final Condition capacityChanged = lock.newCondition();
         private final java.util.LinkedList<AdmissionRequest> waiting = new java.util.LinkedList<>();
         private final TreeMap<Integer, Integer> registeredLimits = new TreeMap<>();
+        private volatile LongSupplier nanoClock = System::nanoTime;
         private int active;
         private int activeBackgroundCount;
+
+        void setNanoClock(LongSupplier clock) {
+            this.nanoClock = clock == null ? System::nanoTime : clock;
+        }
 
         private static boolean isHighPriorityWaiter(String operation) {
             return "point-query".equals(operation)
@@ -450,14 +471,25 @@ final class DuckDbResourcePolicy {
 
         static boolean isBackgroundCountOperation(String operation) {
             return "cold-cql-count".equals(operation)
-                    || "cold-cql-id-count".equals(operation);
+                    || "cold-cql-id-count".equals(operation)
+                    || "archive-compaction".equals(operation)
+                    || "compaction-verify".equals(operation);
         }
 
         private void enqueueRequest(AdmissionRequest request) {
+            long now = request.enqueuedAtNanos();
+            int minInsertAt = 0;
+            int index = 0;
+            for (AdmissionRequest queued : waiting) {
+                if (now - queued.enqueuedAtNanos() >= ANTI_STARVATION_AGING_NANOS) {
+                    minInsertAt = index + 1;
+                }
+                index++;
+            }
             if ("point-query".equals(request.operation())) {
                 int insertAt = 0;
                 for (AdmissionRequest queued : waiting) {
-                    if (!isHighPriorityWaiter(queued.operation())) {
+                    if (insertAt >= minInsertAt && !isHighPriorityWaiter(queued.operation())) {
                         waiting.add(insertAt, request);
                         return;
                     }
@@ -466,7 +498,7 @@ final class DuckDbResourcePolicy {
             } else if (!isBackgroundCountOperation(request.operation())) {
                 int insertAt = 0;
                 for (AdmissionRequest queued : waiting) {
-                    if (isBackgroundCountOperation(queued.operation())) {
+                    if (insertAt >= minInsertAt && isBackgroundCountOperation(queued.operation())) {
                         waiting.add(insertAt, request);
                         return;
                     }
@@ -496,6 +528,28 @@ final class DuckDbResourcePolicy {
             }
         }
 
+        boolean hasInteractiveWaiters() {
+            lock.lock();
+            try {
+                for (AdmissionRequest queued : waiting) {
+                    if (!isBackgroundCountOperation(queued.operation()))
+                        return true;
+                }
+                return false;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        int waitingCount() {
+            lock.lock();
+            try {
+                return waiting.size();
+            } finally {
+                lock.unlock();
+            }
+        }
+
         boolean shouldBackgroundYield(boolean backgroundPermit) {
             if (!backgroundPermit)
                 return false;
@@ -518,7 +572,6 @@ final class DuckDbResourcePolicy {
 
         AdmissionPermit acquire(int limit, int timeoutSeconds, String operation) throws Exception {
             long remaining = TimeUnit.SECONDS.toNanos(timeoutSeconds);
-            AdmissionRequest request = new AdmissionRequest(operation);
             boolean background = isBackgroundCountOperation(operation);
             try {
                 lock.lockInterruptibly();
@@ -528,6 +581,7 @@ final class DuckDbResourcePolicy {
                         "Interrupted while waiting for DuckDB session capacity for operation " +
                                 operation, interrupted);
             }
+            AdmissionRequest request = new AdmissionRequest(operation, nanoClock.getAsLong());
             try {
                 enqueueRequest(request);
                 addLimit(limit);
@@ -593,13 +647,19 @@ final class DuckDbResourcePolicy {
 
     private static final class AdmissionRequest {
         private final String operation;
+        private final long enqueuedAtNanos;
 
-        private AdmissionRequest(String operation) {
+        private AdmissionRequest(String operation, long enqueuedAtNanos) {
             this.operation = operation;
+            this.enqueuedAtNanos = enqueuedAtNanos;
         }
 
         private String operation() {
             return operation;
+        }
+
+        private long enqueuedAtNanos() {
+            return enqueuedAtNanos;
         }
     }
 
