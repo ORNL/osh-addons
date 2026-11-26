@@ -137,14 +137,11 @@ public final class ArchiveCompactionManager {
 
         if (!lastJobDeferredBusy &&
                 maxMonthlyJobs > 0 &&
-                !DuckDbResourcePolicy.hasInteractiveWaiters() &&
-                System.nanoTime() - cycleStartNanos < MAX_COMPACTION_CYCLE_NANOS) {
+                !DuckDbResourcePolicy.hasInteractiveWaiters()) {
             List<ArchiveCatalog.CompactionWindowCandidate> eligibleMonths =
                     catalog.findEligibleUtcMonthsForConsolidation(now, observationTable, maxMonthlyJobs);
             for (ArchiveCatalog.CompactionWindowCandidate month : eligibleMonths) {
-                if (monthsConsolidated > 0 &&
-                        (DuckDbResourcePolicy.hasInteractiveWaiters() ||
-                         System.nanoTime() - cycleStartNanos >= MAX_COMPACTION_CYCLE_NANOS))
+                if (monthsConsolidated > 0 && DuckDbResourcePolicy.hasInteractiveWaiters())
                     break;
                 if (consolidateUtcMonth(month, now))
                     monthsConsolidated++;
@@ -154,15 +151,12 @@ public final class ArchiveCompactionManager {
             int remainingMonthlyBudget = maxMonthlyJobs - monthsConsolidated;
             if (!lastJobDeferredBusy &&
                     remainingMonthlyBudget > 0 &&
-                    !DuckDbResourcePolicy.hasInteractiveWaiters() &&
-                    System.nanoTime() - cycleStartNanos < MAX_COMPACTION_CYCLE_NANOS) {
+                    !DuckDbResourcePolicy.hasInteractiveWaiters()) {
                 List<ArchiveCatalog.CompactionWindowCandidate> defragCandidates =
                         catalog.findEligibleMonthlyGenerationsForDefrag(
                                 now, observationTable, MONTHLY_DEFRAG_OVERLAY_THRESHOLD, remainingMonthlyBudget);
                 for (ArchiveCatalog.CompactionWindowCandidate candidate : defragCandidates) {
-                    if (defragmented > 0 &&
-                            (DuckDbResourcePolicy.hasInteractiveWaiters() ||
-                             System.nanoTime() - cycleStartNanos >= MAX_COMPACTION_CYCLE_NANOS))
+                    if (defragmented > 0 && DuckDbResourcePolicy.hasInteractiveWaiters())
                         break;
                     if (defragmentMonthlyGeneration(candidate, now))
                         defragmented++;
@@ -1411,6 +1405,7 @@ public final class ArchiveCompactionManager {
 
         int finalized = 0;
         List<UUID> retiredIds = new ArrayList<>();
+        Set<Path> allParentDirs = new LinkedHashSet<>();
         for (ArchiveCatalog.DeletingGenerationRecord rec : candidates) {
             if (archiveReader.activePinCount(rec.generationId()) > 0)
                 continue;
@@ -1421,27 +1416,28 @@ public final class ArchiveCompactionManager {
 
             // Unlink physical files BEFORE deleting DELETING catalog rows so filesystem audit stays 100% clean.
             boolean allUnlinked = true;
-            Set<Path> parentDirs = new LinkedHashSet<>();
             for (Path rel : rec.objectRelativePaths()) {
                 try {
                     Path target = resolveSafeRegularDeleteTarget(rel);
                     if (target != null) {
                         if (target.getParent() != null)
-                            parentDirs.add(target.getParent());
+                            allParentDirs.add(target.getParent());
                         Files.deleteIfExists(target);
                     }
-                } catch (IOException ioError) {
+                } catch (IOException | RuntimeException ioError) {
                     allUnlinked = false;
                 }
             }
             if (!allUnlinked)
                 continue;
 
-            pruneEmptyProfileAndDateDirectories(parentDirs);
             if (catalog.finalizeDeletedGeneration(rec.generationId(), rec.jobId(), now)) {
                 retiredIds.add(rec.generationId());
                 finalized++;
             }
+        }
+        if (!allParentDirs.isEmpty()) {
+            pruneEmptyProfileAndDateDirectories(allParentDirs);
         }
         if (!retiredIds.isEmpty() && retiredGenerationHook != null) {
             retiredGenerationHook.accept(retiredIds);
@@ -1498,13 +1494,11 @@ public final class ArchiveCompactionManager {
         try {
             if (!Files.exists(dir, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(dir))
                 return;
-            try (var stream = Files.newDirectoryStream(dir)) {
-                if (stream.iterator().hasNext())
-                    return;
-            }
+            // Use direct rmdir (Files.deleteIfExists) without opening a DirectoryStream so
+            // Windows WSL 2 9p mounts never allocate readdir handles on non-empty directories.
             Files.deleteIfExists(dir);
         } catch (DirectoryNotEmptyException ignored) {
-        } catch (IOException ignored) {
+        } catch (IOException | RuntimeException ignored) {
         }
     }
 
