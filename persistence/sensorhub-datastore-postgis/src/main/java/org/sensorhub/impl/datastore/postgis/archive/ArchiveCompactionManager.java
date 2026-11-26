@@ -789,22 +789,36 @@ public final class ArchiveCompactionManager {
             if (!tempOut.getParent().equals(opDir.normalize()))
                 throw new IllegalStateException("Compaction temporary Parquet path escaped operation directory");
 
+            boolean projected = spec.projectedEventColumns();
             try (Statement ddl = writeSession.connection().createStatement()) {
-                ddl.execute("CREATE TEMP TABLE compaction_part (" +
-                        "id_scope INTEGER NOT NULL, id_value BIGINT NOT NULL, " +
-                        "datastream_scope INTEGER NOT NULL, datastream_id BIGINT NOT NULL, " +
-                        "foi_scope INTEGER, foi_id BIGINT, " +
-                        "phenomenon_time TIMESTAMP, result_time TIMESTAMP, result_json VARCHAR)");
-            }
-
-            List<StagedRow> batch = new ArrayList<>(DUCKDB_INSERT_BATCH_SIZE);
-            for (StagedRow row : partRows) {
-                batch.add(row);
-                if (batch.size() >= DUCKDB_INSERT_BATCH_SIZE) {
-                    flushPendingStagedRows(writeSession.connection(), batch);
+                if (projected) {
+                    ddl.execute("CREATE TEMP TABLE compaction_part (" +
+                            "id_scope INTEGER NOT NULL, id_value BIGINT NOT NULL, " +
+                            "datastream_scope INTEGER NOT NULL, datastream_id BIGINT NOT NULL, " +
+                            "foi_scope INTEGER, foi_id BIGINT, " +
+                            "phenomenon_time TIMESTAMP, result_time TIMESTAMP, result_json VARCHAR, " +
+                            "ocr_norm VARCHAR, occ_obs_id VARCHAR, event_id VARCHAR, " +
+                            "adj_code INTEGER, adj_count INTEGER, " +
+                            "gamma_alarm BOOLEAN, neutron_alarm BOOLEAN, " +
+                            "max_gamma DOUBLE, max_neutron DOUBLE)");
+                } else {
+                    ddl.execute("CREATE TEMP TABLE compaction_part (" +
+                            "id_scope INTEGER NOT NULL, id_value BIGINT NOT NULL, " +
+                            "datastream_scope INTEGER NOT NULL, datastream_id BIGINT NOT NULL, " +
+                            "foi_scope INTEGER, foi_id BIGINT, " +
+                            "phenomenon_time TIMESTAMP, result_time TIMESTAMP, result_json VARCHAR)");
                 }
             }
-            flushPendingStagedRows(writeSession.connection(), batch);
+
+            int batchCap = projected ? 150 : DUCKDB_INSERT_BATCH_SIZE;
+            List<StagedRow> batch = new ArrayList<>(batchCap);
+            for (StagedRow row : partRows) {
+                batch.add(row);
+                if (batch.size() >= batchCap) {
+                    flushPendingStagedRows(writeSession.connection(), batch, projected);
+                }
+            }
+            flushPendingStagedRows(writeSession.connection(), batch, projected);
 
             String copySql = buildV2CopySql(spec, tempOut);
             try (Statement stmt = writeSession.connection().createStatement()) {
@@ -1030,33 +1044,14 @@ public final class ArchiveCompactionManager {
     private String buildV2CopySql(ProfileTargetSpec spec, Path tempOut) {
         String profileLit = ArchiveExporter.sqlLiteral(spec.targetProfile());
         if (spec.projectedEventColumns()) {
+            // Projected scalar columns are pre-extracted once in Java before insertion
+            // so DuckDB never instantiates 29 per-expression 8 MiB yyjson arenas during ORDER BY.
             return "COPY (" +
                     "SELECT id_scope, id_value, datastream_scope, datastream_id, " +
                     "foi_scope, foi_id, phenomenon_time, result_time, result_json, " +
                     "2 AS archive_version, '" + profileLit + "' AS profile, " +
-                    "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.normalizedValue') = 'VARCHAR' " +
-                    "     THEN json_extract_string(result_json, '$.normalizedValue') ELSE NULL END AS ocr_norm, " +
-                    "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.occupancyObsId') = 'VARCHAR' " +
-                    "     THEN json_extract_string(result_json, '$.occupancyObsId') ELSE NULL END AS occ_obs_id, " +
-                    "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.eventId') = 'VARCHAR' " +
-                    "     THEN json_extract_string(result_json, '$.eventId') ELSE NULL END AS event_id, " +
-                    "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.adjudicationCode') IN ('UBIGINT', 'BIGINT', 'DOUBLE') " +
-                    "     THEN TRY_CAST(json_extract(result_json, '$.adjudicationCode') AS INTEGER) ELSE NULL END AS adj_code, " +
-                    "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.adjudicatedIdsCount') IN ('UBIGINT', 'BIGINT', 'DOUBLE') " +
-                    "     THEN TRY_CAST(json_extract(result_json, '$.adjudicatedIdsCount') AS INTEGER) " +
-                    "     WHEN json_type(result_json) = 'OBJECT' " +
-                    "      AND (json_type(result_json, '$.adjudicatedIdsCount') IS NULL OR json_type(result_json, '$.adjudicatedIdsCount') = 'NULL') " +
-                    "      AND json_type(result_json, '$.adjudicatedIds') = 'ARRAY' " +
-                    "     THEN CAST(json_array_length(json_extract(result_json, '$.adjudicatedIds')) AS INTEGER) " +
-                    "     ELSE NULL END AS adj_count, " +
-                    "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.gammaAlarm') = 'BOOLEAN' " +
-                    "     THEN TRY_CAST(json_extract(result_json, '$.gammaAlarm') AS BOOLEAN) ELSE NULL END AS gamma_alarm, " +
-                    "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.neutronAlarm') = 'BOOLEAN' " +
-                    "     THEN TRY_CAST(json_extract(result_json, '$.neutronAlarm') AS BOOLEAN) ELSE NULL END AS neutron_alarm, " +
-                    "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.maxGammaCount') IN ('UBIGINT', 'BIGINT', 'DOUBLE') " +
-                    "     THEN TRY_CAST(json_extract(result_json, '$.maxGammaCount') AS DOUBLE) ELSE NULL END AS max_gamma, " +
-                    "CASE WHEN json_type(result_json) = 'OBJECT' AND json_type(result_json, '$.maxNeutronCount') IN ('UBIGINT', 'BIGINT', 'DOUBLE') " +
-                    "     THEN TRY_CAST(json_extract(result_json, '$.maxNeutronCount') AS DOUBLE) ELSE NULL END AS max_neutron " +
+                    "ocr_norm, occ_obs_id, event_id, adj_code, adj_count, " +
+                    "gamma_alarm, neutron_alarm, max_gamma, max_neutron " +
                     "FROM compaction_part " +
                     "ORDER BY datastream_id, phenomenon_time, result_time, id_value" +
                     ") TO '" + ArchiveExporter.sqlLiteral(tempOut.toString()) + "' (" +
@@ -1077,15 +1072,108 @@ public final class ArchiveCompactionManager {
                 "ROW_GROUP_SIZE " + spec.rowGroupSize() + ")";
     }
 
+    private record ProjectedEventValues(
+            String ocrNorm,
+            String occObsId,
+            String eventId,
+            Integer adjCode,
+            Integer adjCount,
+            Boolean gammaAlarm,
+            Boolean neutronAlarm,
+            Double maxGamma,
+            Double maxNeutron) {
+        static final ProjectedEventValues EMPTY = new ProjectedEventValues(
+                null, null, null, null, null, null, null, null, null);
+
+        static ProjectedEventValues extract(String resultJson) {
+            if (resultJson == null || resultJson.isBlank())
+                return EMPTY;
+            try {
+                JsonElement parsed = JsonParser.parseString(resultJson);
+                if (!parsed.isJsonObject())
+                    return EMPTY;
+                JsonObject obj = parsed.getAsJsonObject();
+                String ocrNorm = extractJsonString(obj, "normalizedValue");
+                String occObsId = extractJsonString(obj, "occupancyObsId");
+                String eventId = extractJsonString(obj, "eventId");
+                Integer adjCode = extractJsonInteger(obj.get("adjudicationCode"));
+                Integer adjCount = extractAdjudicatedCount(obj);
+                Boolean gammaAlarm = extractJsonBoolean(obj, "gammaAlarm");
+                Boolean neutronAlarm = extractJsonBoolean(obj, "neutronAlarm");
+                Double maxGamma = extractJsonDouble(obj.get("maxGammaCount"));
+                Double maxNeutron = extractJsonDouble(obj.get("maxNeutronCount"));
+                return new ProjectedEventValues(
+                        ocrNorm, occObsId, eventId, adjCode, adjCount,
+                        gammaAlarm, neutronAlarm, maxGamma, maxNeutron);
+            } catch (RuntimeException ignored) {
+                return EMPTY;
+            }
+        }
+
+        private static String extractJsonString(JsonObject obj, String key) {
+            JsonElement el = obj.get(key);
+            if (el != null && el.isJsonPrimitive() && el.getAsJsonPrimitive().isString())
+                return el.getAsString();
+            return null;
+        }
+
+        private static Boolean extractJsonBoolean(JsonObject obj, String key) {
+            JsonElement el = obj.get(key);
+            if (el != null && el.isJsonPrimitive() && el.getAsJsonPrimitive().isBoolean())
+                return el.getAsBoolean();
+            return null;
+        }
+
+        private static Integer extractJsonInteger(JsonElement el) {
+            if (el == null || !el.isJsonPrimitive() || !el.getAsJsonPrimitive().isNumber())
+                return null;
+            try {
+                double d = el.getAsDouble();
+                if (!Double.isFinite(d))
+                    return null;
+                long rounded = Math.round(d);
+                if (rounded < Integer.MIN_VALUE || rounded > Integer.MAX_VALUE)
+                    return null;
+                return (int) rounded;
+            } catch (RuntimeException ignored) {
+                return null;
+            }
+        }
+
+        private static Integer extractAdjudicatedCount(JsonObject obj) {
+            JsonElement cnt = obj.get("adjudicatedIdsCount");
+            if (cnt != null && !cnt.isJsonNull()) {
+                return extractJsonInteger(cnt);
+            }
+            JsonElement arr = obj.get("adjudicatedIds");
+            if (arr != null && arr.isJsonArray()) {
+                return arr.getAsJsonArray().size();
+            }
+            return null;
+        }
+
+        private static Double extractJsonDouble(JsonElement el) {
+            if (el == null || !el.isJsonPrimitive() || !el.getAsJsonPrimitive().isNumber())
+                return null;
+            try {
+                double d = el.getAsDouble();
+                return Double.isFinite(d) ? d : null;
+            } catch (RuntimeException ignored) {
+                return null;
+            }
+        }
+    }
+
     private static void flushPendingStagedRows(
-            java.sql.Connection duckConn, List<StagedRow> batch) throws Exception {
+            java.sql.Connection duckConn, List<StagedRow> batch, boolean projected) throws Exception {
         if (batch.isEmpty())
             return;
+        String tuple = projected ? "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" : "(?,?,?,?,?,?,?,?,?)";
         StringBuilder sql = new StringBuilder("INSERT INTO compaction_part VALUES ");
         for (int i = 0; i < batch.size(); i++) {
             if (i > 0)
                 sql.append(',');
-            sql.append("(?,?,?,?,?,?,?,?,?)");
+            sql.append(tuple);
         }
         try (PreparedStatement ps = duckConn.prepareStatement(sql.toString())) {
             int p = 1;
@@ -1110,6 +1198,18 @@ public final class ArchiveCompactionManager {
                 else
                     UtcJdbcTime.setDuckDbInstant(ps, p++, row.resultTime());
                 ps.setString(p++, row.resultJson());
+                if (projected) {
+                    ProjectedEventValues ev = ProjectedEventValues.extract(row.resultJson());
+                    if (ev.ocrNorm() == null) ps.setNull(p++, Types.VARCHAR); else ps.setString(p++, ev.ocrNorm());
+                    if (ev.occObsId() == null) ps.setNull(p++, Types.VARCHAR); else ps.setString(p++, ev.occObsId());
+                    if (ev.eventId() == null) ps.setNull(p++, Types.VARCHAR); else ps.setString(p++, ev.eventId());
+                    if (ev.adjCode() == null) ps.setNull(p++, Types.INTEGER); else ps.setInt(p++, ev.adjCode());
+                    if (ev.adjCount() == null) ps.setNull(p++, Types.INTEGER); else ps.setInt(p++, ev.adjCount());
+                    if (ev.gammaAlarm() == null) ps.setNull(p++, Types.BOOLEAN); else ps.setBoolean(p++, ev.gammaAlarm());
+                    if (ev.neutronAlarm() == null) ps.setNull(p++, Types.BOOLEAN); else ps.setBoolean(p++, ev.neutronAlarm());
+                    if (ev.maxGamma() == null) ps.setNull(p++, Types.DOUBLE); else ps.setDouble(p++, ev.maxGamma());
+                    if (ev.maxNeutron() == null) ps.setNull(p++, Types.DOUBLE); else ps.setDouble(p++, ev.maxNeutron());
+                }
             }
             ps.executeUpdate();
         }
