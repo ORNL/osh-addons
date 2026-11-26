@@ -521,7 +521,7 @@ public final class ParquetArchiveReader {
         return detected;
     }
 
-    private static boolean isPathOn9pMount(Path path) {
+    static boolean isPathOn9pMount(Path path) {
         try {
             return is9pFileSystemType(Files.getFileStore(path).type());
         } catch (Exception ignored) {

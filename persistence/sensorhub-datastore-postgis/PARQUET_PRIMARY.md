@@ -177,6 +177,17 @@ following invariants:
    - Never route high-frequency telemetry streams into `RAW_EVENTS` /
      `DAILY_EVENTS` / `MONTHLY_EVENTS`, and never allocate `ocr_bloom` bytes on
      `RAW_TELEMETRY` (`ocr_bloom` must remain `NULL`).
+5. **Windows 11 + WSL 2 `9p`/`drvfs` Safe Staging:**
+   - On Windows 11 + WSL 2, `/var/lib/oscar/archive` is a Windows NTFS `9p`
+     bind mount while `/var/lib/oscar/duckdb-tmp` is native Linux `ext4`.
+     DuckDB's C++ Parquet reader issues `>= 64 KiB` `pread` syscalls that can
+     fail with `IOException: Cannot allocate memory` (`ENOMEM`) on `9p`.
+     Every code path that passes archive Parquet files to DuckDB (readers,
+     compaction, activation, verification, and summary backfill) **must**
+     detect `ParquetArchiveReader.isPathOn9pMount(...)` and stage files into
+     the local `ext4` `operationDirectory` (or `Local9pParquetCache`) using
+     `ArchiveExporter.stageToLocalDirectory(...)` (16 KiB bounded reads)
+     before calling `read_parquet(...)`.
 
 ## Index Policy
 

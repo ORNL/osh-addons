@@ -2318,23 +2318,14 @@ public final class ArchiveCatalog {
 
         int backfilled = 0;
         boolean transientBusy = false;
-        final int chunkSize = 16;
+        boolean stageFor9p = ParquetArchiveReader.isPathOn9pMount(realRoot);
+        final int chunkSize = stageFor9p ? 8 : 16;
         for (int start = 0; start < readable.size(); start += chunkSize) {
             List<ArchiveGeneration> chunk = readable.subList(start, Math.min(readable.size(), start + chunkSize));
-            Map<String, UUID> genByPathString = new HashMap<>(chunk.size() * 2);
-            Map<Path, UUID> genByNormPath = new HashMap<>(chunk.size() * 2);
             Set<Long> chunkStreams = new HashSet<>();
             boolean chunkNeedNh = false;
             boolean chunkNeedAc = false;
-            StringBuilder fileList = new StringBuilder();
             for (ArchiveGeneration gen : chunk) {
-                Path file = realPathByGen.get(gen.id());
-                String pathStr = file.toString();
-                if (fileList.length() > 0)
-                    fileList.append(',');
-                fileList.append('\'').append(pathStr.replace("'", "''")).append('\'');
-                genByPathString.put(pathStr, gen.id());
-                genByNormPath.put(file.toAbsolutePath().normalize(), gen.id());
                 chunkStreams.addAll(neededStreamsByGen.getOrDefault(gen.id(), Set.of()));
                 if (gensNeedingNh.contains(gen.id()))
                     chunkNeedNh = true;
@@ -2379,28 +2370,48 @@ public final class ArchiveCatalog {
                     : "0::bigint";
 
             Map<UUID, Map<Long, long[]>> countsByGenStream = new HashMap<>(chunk.size() * 2);
-            String duckSql = "SELECT filename, datastream_id, " +
-                    nhExpr + ", " + acGammaExpr + ", " + acNeutronExpr + " " +
-                    "FROM read_parquet([" + fileList + "], filename=true, union_by_name=true) " +
-                    "WHERE datastream_id IN (" + streamList + ") " +
-                    "AND result_json IS NOT NULL " +
-                    "AND (" + String.join(" OR ", whereMatchTerms) + ") " +
-                    "GROUP BY filename, datastream_id";
             try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(
-                    resourceConfig, "summary-backfill");
-                 Statement stmt = duckSession.connection().createStatement();
-                 ResultSet rs = stmt.executeQuery(duckSql)) {
-                while (rs.next()) {
-                    String rawFile = rs.getString(1);
-                    UUID genId = genByPathString.get(rawFile);
-                    if (genId == null && rawFile != null) {
-                        genId = genByNormPath.get(Path.of(rawFile).toAbsolutePath().normalize());
+                    resourceConfig, "summary-backfill")) {
+                Map<String, UUID> genByPathString = new HashMap<>(chunk.size() * 2);
+                Map<Path, UUID> genByNormPath = new HashMap<>(chunk.size() * 2);
+                StringBuilder fileList = new StringBuilder();
+                int idx = 0;
+                for (ArchiveGeneration gen : chunk) {
+                    Path sourceFile = realPathByGen.get(gen.id());
+                    // On Windows WSL 2 9p/drvfs bind mounts, DuckDB C++ pread(>=64 KiB) can fail
+                    // with ENOMEM; stage into the ext4 operationDirectory via 16 KiB bounded reads.
+                    Path readableFile = stageFor9p
+                            ? ArchiveExporter.stageToLocalDirectory(
+                                    sourceFile, duckSession.operationDirectory(), "bf-" + (idx++) + ".parquet")
+                            : sourceFile;
+                    String pathStr = readableFile.toString();
+                    if (fileList.length() > 0)
+                        fileList.append(',');
+                    fileList.append('\'').append(pathStr.replace("'", "''")).append('\'');
+                    genByPathString.put(pathStr, gen.id());
+                    genByNormPath.put(readableFile.toAbsolutePath().normalize(), gen.id());
+                }
+                String duckSql = "SELECT filename, datastream_id, " +
+                        nhExpr + ", " + acGammaExpr + ", " + acNeutronExpr + " " +
+                        "FROM read_parquet([" + fileList + "], filename=true, union_by_name=true) " +
+                        "WHERE datastream_id IN (" + streamList + ") " +
+                        "AND result_json IS NOT NULL " +
+                        "AND (" + String.join(" OR ", whereMatchTerms) + ") " +
+                        "GROUP BY filename, datastream_id";
+                try (Statement stmt = duckSession.connection().createStatement();
+                     ResultSet rs = stmt.executeQuery(duckSql)) {
+                    while (rs.next()) {
+                        String rawFile = rs.getString(1);
+                        UUID genId = genByPathString.get(rawFile);
+                        if (genId == null && rawFile != null) {
+                            genId = genByNormPath.get(Path.of(rawFile).toAbsolutePath().normalize());
+                        }
+                        if (genId == null)
+                            continue;
+                        long dsId = rs.getLong(2);
+                        long[] counts = new long[]{rs.getLong(3), rs.getLong(4), rs.getLong(5)};
+                        countsByGenStream.computeIfAbsent(genId, ignored -> new HashMap<>()).put(dsId, counts);
                     }
-                    if (genId == null)
-                        continue;
-                    long dsId = rs.getLong(2);
-                    long[] counts = new long[]{rs.getLong(3), rs.getLong(4), rs.getLong(5)};
-                    countsByGenStream.computeIfAbsent(genId, ignored -> new HashMap<>()).put(dsId, counts);
                 }
             } catch (java.sql.SQLTransientException busy) {
                 transientBusy = true;
