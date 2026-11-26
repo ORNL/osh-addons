@@ -3,6 +3,8 @@ package org.sensorhub.impl.datastore.postgis.archive;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import org.duckdb.DuckDBAppender;
+import org.duckdb.DuckDBConnection;
 import org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,19 +18,19 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
-import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLTransientException;
 import java.sql.Statement;
-import java.sql.Types;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -40,6 +42,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
@@ -58,7 +61,8 @@ public final class ArchiveCompactionManager {
     private static final int DAILY_EVENTS_ROW_GROUP_SIZE = 8_192;
     private static final int MONTHLY_EVENTS_ROW_GROUP_SIZE = 16_384;
     private static final int DAILY_TELEMETRY_ROW_GROUP_SIZE = 65_536;
-    private static final long MAX_COMPACTED_PART_UNCOMPRESSED_BYTES = 16L * 1024L * 1024L;
+    private static final long MAX_PROJECTED_EVENT_PART_UNCOMPRESSED_BYTES = 16L * 1024L * 1024L;
+    private static final long MAX_COMPACTION_CYCLE_NANOS = TimeUnit.SECONDS.toNanos(40);
     private static final int SOURCE_READ_CHUNK_ROWS = 60_000;
 
     private final ArchiveCatalog catalog;
@@ -109,6 +113,7 @@ public final class ArchiveCompactionManager {
     public CompactionCycleSummary runCompactionCycle(
             Instant now, int maxUtcDays, int maxMonthlyJobs) {
         Objects.requireNonNull(now, "now");
+        long cycleStartNanos = System.nanoTime();
         lastJobDeferredBusy = false;
         int drainedBefore = drainDeletingGenerations(now);
         int daysCompacted = 0;
@@ -119,7 +124,9 @@ public final class ArchiveCompactionManager {
             List<ArchiveCatalog.CompactionWindowCandidate> eligibleDays =
                     catalog.findEligibleUtcDaysForCompaction(now, observationTable, maxUtcDays);
             for (ArchiveCatalog.CompactionWindowCandidate day : eligibleDays) {
-                if (daysCompacted > 0 && DuckDbResourcePolicy.hasInteractiveWaiters())
+                if (daysCompacted > 0 &&
+                        (DuckDbResourcePolicy.hasInteractiveWaiters() ||
+                         System.nanoTime() - cycleStartNanos >= MAX_COMPACTION_CYCLE_NANOS))
                     break;
                 if (compactUtcDay(day, now))
                     daysCompacted++;
@@ -128,11 +135,16 @@ public final class ArchiveCompactionManager {
             }
         }
 
-        if (!lastJobDeferredBusy && maxMonthlyJobs > 0 && !DuckDbResourcePolicy.hasInteractiveWaiters()) {
+        if (!lastJobDeferredBusy &&
+                maxMonthlyJobs > 0 &&
+                !DuckDbResourcePolicy.hasInteractiveWaiters() &&
+                System.nanoTime() - cycleStartNanos < MAX_COMPACTION_CYCLE_NANOS) {
             List<ArchiveCatalog.CompactionWindowCandidate> eligibleMonths =
                     catalog.findEligibleUtcMonthsForConsolidation(now, observationTable, maxMonthlyJobs);
             for (ArchiveCatalog.CompactionWindowCandidate month : eligibleMonths) {
-                if (monthsConsolidated > 0 && DuckDbResourcePolicy.hasInteractiveWaiters())
+                if (monthsConsolidated > 0 &&
+                        (DuckDbResourcePolicy.hasInteractiveWaiters() ||
+                         System.nanoTime() - cycleStartNanos >= MAX_COMPACTION_CYCLE_NANOS))
                     break;
                 if (consolidateUtcMonth(month, now))
                     monthsConsolidated++;
@@ -140,12 +152,17 @@ public final class ArchiveCompactionManager {
                     break;
             }
             int remainingMonthlyBudget = maxMonthlyJobs - monthsConsolidated;
-            if (!lastJobDeferredBusy && remainingMonthlyBudget > 0 && !DuckDbResourcePolicy.hasInteractiveWaiters()) {
+            if (!lastJobDeferredBusy &&
+                    remainingMonthlyBudget > 0 &&
+                    !DuckDbResourcePolicy.hasInteractiveWaiters() &&
+                    System.nanoTime() - cycleStartNanos < MAX_COMPACTION_CYCLE_NANOS) {
                 List<ArchiveCatalog.CompactionWindowCandidate> defragCandidates =
                         catalog.findEligibleMonthlyGenerationsForDefrag(
                                 now, observationTable, MONTHLY_DEFRAG_OVERLAY_THRESHOLD, remainingMonthlyBudget);
                 for (ArchiveCatalog.CompactionWindowCandidate candidate : defragCandidates) {
-                    if (defragmented > 0 && DuckDbResourcePolicy.hasInteractiveWaiters())
+                    if (defragmented > 0 &&
+                            (DuckDbResourcePolicy.hasInteractiveWaiters() ||
+                             System.nanoTime() - cycleStartNanos >= MAX_COMPACTION_CYCLE_NANOS))
                         break;
                     if (defragmentMonthlyGeneration(candidate, now))
                         defragmented++;
@@ -520,9 +537,10 @@ public final class ArchiveCompactionManager {
         if (spec.allowedStreamIds() != null && spec.allowedStreamIds().isEmpty()) {
             return new ProfileBuildResult(0L, List.of(), List.of(), Map.of());
         }
-        long maxBytesPerPart = Math.min(
-                config.effectiveMaximumUncompressedBytesPerGeneration(),
-                MAX_COMPACTED_PART_UNCOMPRESSED_BYTES);
+        long maxBytesPerPart = spec.projectedEventColumns()
+                ? Math.min(config.effectiveMaximumUncompressedBytesPerGeneration(),
+                        MAX_PROJECTED_EVENT_PART_UNCOMPRESSED_BYTES)
+                : config.effectiveMaximumUncompressedBytesPerGeneration();
         long maxRowsPerPart = Math.min(config.maximumRowsPerGeneration, 250_000L);
 
         MultisetRowDigest sourceDigest = new MultisetRowDigest();
@@ -543,6 +561,13 @@ public final class ArchiveCompactionManager {
         Path realRoot = root.toRealPath();
         for (int sIdx = 0; sIdx < sources.size(); sIdx++) {
             ArchiveGeneration src = sources.get(sIdx);
+            if (spec.allowedStreamIds() != null && schemaCatalog.streamIdsByGeneration() != null) {
+                Set<Long> genStreams = schemaCatalog.streamIdsByGeneration().get(src.id());
+                if (genStreams != null && !genStreams.isEmpty() &&
+                        Collections.disjoint(genStreams, spec.allowedStreamIds())) {
+                    continue;
+                }
+            }
             Path srcFile = realRoot.resolve(src.objectPath().normalize()).normalize();
             long offsetInSource = 0L;
             boolean sourceExhausted = false;
@@ -792,7 +817,7 @@ public final class ArchiveCompactionManager {
             boolean projected = spec.projectedEventColumns();
             try (Statement ddl = writeSession.connection().createStatement()) {
                 if (projected) {
-                    ddl.execute("CREATE TEMP TABLE compaction_part (" +
+                    ddl.execute("CREATE TABLE compaction_part (" +
                             "id_scope INTEGER NOT NULL, id_value BIGINT NOT NULL, " +
                             "datastream_scope INTEGER NOT NULL, datastream_id BIGINT NOT NULL, " +
                             "foi_scope INTEGER, foi_id BIGINT, " +
@@ -802,7 +827,7 @@ public final class ArchiveCompactionManager {
                             "gamma_alarm BOOLEAN, neutron_alarm BOOLEAN, " +
                             "max_gamma DOUBLE, max_neutron DOUBLE)");
                 } else {
-                    ddl.execute("CREATE TEMP TABLE compaction_part (" +
+                    ddl.execute("CREATE TABLE compaction_part (" +
                             "id_scope INTEGER NOT NULL, id_value BIGINT NOT NULL, " +
                             "datastream_scope INTEGER NOT NULL, datastream_id BIGINT NOT NULL, " +
                             "foi_scope INTEGER, foi_id BIGINT, " +
@@ -810,15 +835,7 @@ public final class ArchiveCompactionManager {
                 }
             }
 
-            int batchCap = projected ? 150 : DUCKDB_INSERT_BATCH_SIZE;
-            List<StagedRow> batch = new ArrayList<>(batchCap);
-            for (StagedRow row : partRows) {
-                batch.add(row);
-                if (batch.size() >= batchCap) {
-                    flushPendingStagedRows(writeSession.connection(), batch, projected);
-                }
-            }
-            flushPendingStagedRows(writeSession.connection(), batch, projected);
+            appendStagedRowsNative(writeSession.connection(), partRows, projected);
 
             String copySql = buildV2CopySql(spec, tempOut);
             try (Statement stmt = writeSession.connection().createStatement()) {
@@ -1164,56 +1181,50 @@ public final class ArchiveCompactionManager {
         }
     }
 
-    private static void flushPendingStagedRows(
-            java.sql.Connection duckConn, List<StagedRow> batch, boolean projected) throws Exception {
-        if (batch.isEmpty())
+    private static void appendStagedRowsNative(
+            java.sql.Connection duckConn, List<StagedRow> rows, boolean projected) throws Exception {
+        if (rows.isEmpty())
             return;
-        String tuple = projected ? "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" : "(?,?,?,?,?,?,?,?,?)";
-        StringBuilder sql = new StringBuilder("INSERT INTO compaction_part VALUES ");
-        for (int i = 0; i < batch.size(); i++) {
-            if (i > 0)
-                sql.append(',');
-            sql.append(tuple);
-        }
-        try (PreparedStatement ps = duckConn.prepareStatement(sql.toString())) {
-            int p = 1;
-            for (StagedRow row : batch) {
-                ps.setInt(p++, row.idScope());
-                ps.setLong(p++, row.id());
-                ps.setInt(p++, row.dataStreamScope());
-                ps.setLong(p++, row.dataStreamId());
+        DuckDBConnection nativeConn = duckConn.unwrap(DuckDBConnection.class);
+        try (DuckDBAppender appender = nativeConn.createAppender(
+                DuckDBConnection.DEFAULT_SCHEMA, "compaction_part")) {
+            for (StagedRow row : rows) {
+                appender.beginRow();
+                appender.append(row.idScope());
+                appender.append(row.id());
+                appender.append(row.dataStreamScope());
+                appender.append(row.dataStreamId());
                 if (row.foiId() == null) {
-                    ps.setNull(p++, Types.INTEGER);
-                    ps.setNull(p++, Types.BIGINT);
+                    appender.appendNull();
+                    appender.appendNull();
                 } else {
-                    ps.setInt(p++, row.foiScope() != null ? row.foiScope() : row.idScope());
-                    ps.setLong(p++, row.foiId());
+                    appender.append(row.foiScope() != null ? row.foiScope() : row.idScope());
+                    appender.append(row.foiId().longValue());
                 }
                 if (row.phenomenonTime() == null)
-                    ps.setNull(p++, Types.TIMESTAMP);
+                    appender.appendNull();
                 else
-                    UtcJdbcTime.setDuckDbInstant(ps, p++, row.phenomenonTime());
+                    appender.append(LocalDateTime.ofInstant(row.phenomenonTime(), ZoneOffset.UTC));
                 if (row.resultTime() == null)
-                    ps.setNull(p++, Types.TIMESTAMP);
+                    appender.appendNull();
                 else
-                    UtcJdbcTime.setDuckDbInstant(ps, p++, row.resultTime());
-                ps.setString(p++, row.resultJson());
+                    appender.append(LocalDateTime.ofInstant(row.resultTime(), ZoneOffset.UTC));
+                appender.append(row.resultJson());
                 if (projected) {
                     ProjectedEventValues ev = ProjectedEventValues.extract(row.resultJson());
-                    if (ev.ocrNorm() == null) ps.setNull(p++, Types.VARCHAR); else ps.setString(p++, ev.ocrNorm());
-                    if (ev.occObsId() == null) ps.setNull(p++, Types.VARCHAR); else ps.setString(p++, ev.occObsId());
-                    if (ev.eventId() == null) ps.setNull(p++, Types.VARCHAR); else ps.setString(p++, ev.eventId());
-                    if (ev.adjCode() == null) ps.setNull(p++, Types.INTEGER); else ps.setInt(p++, ev.adjCode());
-                    if (ev.adjCount() == null) ps.setNull(p++, Types.INTEGER); else ps.setInt(p++, ev.adjCount());
-                    if (ev.gammaAlarm() == null) ps.setNull(p++, Types.BOOLEAN); else ps.setBoolean(p++, ev.gammaAlarm());
-                    if (ev.neutronAlarm() == null) ps.setNull(p++, Types.BOOLEAN); else ps.setBoolean(p++, ev.neutronAlarm());
-                    if (ev.maxGamma() == null) ps.setNull(p++, Types.DOUBLE); else ps.setDouble(p++, ev.maxGamma());
-                    if (ev.maxNeutron() == null) ps.setNull(p++, Types.DOUBLE); else ps.setDouble(p++, ev.maxNeutron());
+                    appender.append(ev.ocrNorm());
+                    appender.append(ev.occObsId());
+                    appender.append(ev.eventId());
+                    appender.append(ev.adjCode());
+                    appender.append(ev.adjCount());
+                    appender.append(ev.gammaAlarm());
+                    appender.append(ev.neutronAlarm());
+                    appender.append(ev.maxGamma());
+                    appender.append(ev.maxNeutron());
                 }
+                appender.endRow();
             }
-            ps.executeUpdate();
         }
-        batch.clear();
     }
 
     /**

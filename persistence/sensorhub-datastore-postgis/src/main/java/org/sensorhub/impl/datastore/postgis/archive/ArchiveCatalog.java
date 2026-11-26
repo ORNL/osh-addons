@@ -5351,7 +5351,8 @@ public final class ArchiveCatalog {
 
     public record CompactionSchemaCatalog(
             Map<Long, SchemaSnapshot> schemasByStreamId,
-            Map<Long, String> outputNameByStreamId) {}
+            Map<Long, String> outputNameByStreamId,
+            Map<UUID, Set<Long>> streamIdsByGeneration) {}
 
     public record FoldedOverlayCandidate(
             long observationId,
@@ -5723,10 +5724,11 @@ public final class ArchiveCatalog {
     public CompactionSchemaCatalog loadCompactionSchemas(
             Collection<UUID> sourceGenerationIds, String dataStreamTable) {
         if (sourceGenerationIds == null || sourceGenerationIds.isEmpty())
-            return new CompactionSchemaCatalog(Map.of(), Map.of());
+            return new CompactionSchemaCatalog(Map.of(), Map.of(), Map.of());
         Map<Long, SchemaSnapshot> schemasByStream = new HashMap<>();
         Map<Long, String> outputNameByStream = new HashMap<>();
-        String sql = "SELECT s.datastream_id, " +
+        Map<UUID, Set<Long>> streamIdsByGen = new HashMap<>();
+        String sql = "SELECT s.generation_id, s.datastream_id, " +
                 "COALESCE(s.schema_json, blob.schema_json)::text AS schema_text, " +
                 "COALESCE(s.schema_json, blob.schema_json)->>'outputName' AS output_name " +
                 "FROM oscar_archive_schema s " +
@@ -5741,9 +5743,12 @@ public final class ArchiveCatalog {
                 stmt.setArray(1, genArray);
                 try (ResultSet rs = stmt.executeQuery()) {
                     while (rs.next()) {
-                        long dsId = rs.getLong(1);
-                        String schemaText = rs.getString(2);
-                        String outputName = rs.getString(3);
+                        UUID genId = rs.getObject(1, UUID.class);
+                        long dsId = rs.getLong(2);
+                        String schemaText = rs.getString(3);
+                        String outputName = rs.getString(4);
+                        if (genId != null)
+                            streamIdsByGen.computeIfAbsent(genId, ignored -> new HashSet<>()).add(dsId);
                         if (schemaText != null)
                             schemasByStream.putIfAbsent(dsId, new SchemaSnapshot(dsId, schemaText));
                         if (outputName != null && !outputName.isBlank())
@@ -5781,7 +5786,7 @@ public final class ArchiveCatalog {
                 genArray.free();
                 connection.setReadOnly(oldReadOnly);
             }
-            return new CompactionSchemaCatalog(schemasByStream, outputNameByStream);
+            return new CompactionSchemaCatalog(schemasByStream, outputNameByStream, streamIdsByGen);
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot load compaction schema metadata", e);
         }
