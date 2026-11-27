@@ -2293,7 +2293,7 @@ public final class ArchiveCatalog {
                     }
                 }
                 if (reindexArchiveSchema) {
-                    statement.execute("VACUUM (ANALYZE) oscar_archive_schema");
+                    statement.execute("VACUUM (ANALYZE, PARALLEL 0) oscar_archive_schema");
                     statement.execute("REINDEX TABLE CONCURRENTLY oscar_archive_schema");
                 }
                 boolean maintainOverlay = false;
@@ -2311,7 +2311,7 @@ public final class ArchiveCatalog {
                     }
                 }
                 if (maintainOverlay) {
-                    statement.execute("VACUUM (ANALYZE) oscar_obs_overlay");
+                    statement.execute("VACUUM (ANALYZE, PARALLEL 0) oscar_obs_overlay");
                     statement.execute("REINDEX TABLE CONCURRENTLY oscar_obs_overlay");
                 }
                 statement.execute("REINDEX TABLE CONCURRENTLY " + dataStreams);
@@ -7238,7 +7238,7 @@ public final class ArchiveCatalog {
         try {
             connection.setAutoCommit(true);
             try (Statement vacuum = connection.createStatement()) {
-                vacuum.execute("VACUUM (ANALYZE) oscar_obs_overlay");
+                vacuum.execute("VACUUM (ANALYZE, PARALLEL 0) oscar_obs_overlay");
             }
         } catch (SQLException ignored) {
             // Best-effort post-compaction cleanup; nightly reindexMutableTables provides backstop.
