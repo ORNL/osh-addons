@@ -91,14 +91,28 @@ WSL 2), and keeps `oscar_archive_schema` completely free of compaction churn.
   failing closed on any file whose UUID appears in `oscar_archive_generation`.
 - **Metadata acceleration:** `oscar_obs_latest` serves `resultTime=latest` /
   `phenomenonTime=latest` in `< 1 ms`; `oscar_archive_schema` stores 26 exact
-  per-generation, per-datastream summary counters (including
-  `neutron_high_fault_count`, `alarm_category_gamma_count`, and
-  `alarm_category_neutron_count` alongside occupancy, gamma/neutron/combined
-  alarm, adjudication-split, gamma/extended-occupancy fault, tamper, and
-  legacy RS-350 counters) plus selective 256-byte `ocr_bloom` + min/max
-  zone-maps (`NULL` on `RAW_TELEMETRY`, 1-byte sentinel on non-OCR event
-  streams); `oscar_event_locator` indexes `eventId`; and
-  `oscar_archive_id_block` prunes point lookups before opening Parquet.
+  per-generation, per-datastream summary counters in a single-pass zero-bloat
+  `INSERT` (`summary_version = 2`, encoding zero-valued counters sparsely via
+  `NULLIF(count, 0)` into PostgreSQL's 1-bit NULL bitmap so activation creates
+  zero MVCC dead tuples and reduces multi-year catalog heap footprint by ~7×)
+  plus selective 256-byte `ocr_bloom` + min/max zone-maps (`NULL` on
+  `RAW_TELEMETRY`, 1-byte sentinel on non-OCR event streams);
+  `oscar_event_locator` indexes `eventId`; and `oscar_archive_id_block` prunes
+  point lookups before opening Parquet.
+- **Multi-year hygiene & interactive query isolation:**
+  - `ArchiveCatalog.reindexMutableTables()` applies bloat-gated online
+    `VACUUM (ANALYZE)` + `REINDEX TABLE CONCURRENTLY` to both
+    `oscar_archive_schema` and `oscar_obs_overlay` (preventing dead TOAST/index
+    bloat on adjudication/EML overlay updates without full-table locks).
+  - `PostgisCommandStoreImpl.purgeCompletedTransientCommandsBefore(...)` prunes
+    transient non-adjudication commands/statuses in bounded batches (`5,000`
+    rows/cycle) using non-blocking `VACUUM (ANALYZE)` (never `VACUUM (FULL)` on
+    immutable `adjudicationControl` audit tables).
+  - `ParquetArchiveReader.queryOperationName(filter, generations)` routes wide
+    uncompacted `RAW_TELEMETRY` scans (`> 96` generations / `> 48` hours) to
+    `"cold-telemetry-wide-query"` inside `DuckDbResourcePolicy`'s
+    background-capped admission tier so interactive Event Log, Dashboard, and
+    Adjudication queries always retain at least one free DuckDB session permit.
 
 ## Developer Anti-Regression Guide
 
@@ -125,12 +139,17 @@ following invariants:
      `TestArchiveLifecycleInvariants.statisticsAndReportCqlQueriesMapToExactSummaryCountersAndV2Masks`
      proving an exact `SummaryCounterSpec` and summary-mask coverage.
 2. **Adding New Nullable Summary Columns Safely (Zero False Pruning & Fast Upgrades):**
-   - Never use `COALESCE(s.<new_col>, 0)` as `SummaryCounterSpec.upperBoundExpr()`
-     for a nullable column added after initial archive creation: pre-backfill
-     rows with `summary_populated = true` and `<new_col> IS NULL` would evaluate
-     to `0` and be falsely pruned as zero-match generations. Always use
-     `COALESCE(s.<new_col>, COALESCE(s.row_count, 0))` for `upperBoundExpr` and
-     `(s.summary_populated AND s.<new_col> IS NOT NULL)` for `exactReadyExpr`.
+   - Never use bare `COALESCE(s.<new_col>, 0)` as `SummaryCounterSpec.upperBoundExpr()`
+     for a nullable column added after initial archive creation: legacy
+     pre-backfill rows (`summary_version IS NULL`) with `summary_populated = true`
+     and `<new_col> IS NULL` would evaluate to `0` and be falsely pruned as
+     zero-match generations. For compact `summary_version >= 2` rows (where zero
+     counters are stored sparsely as `NULL`), guard both expressions cleanly:
+     `(CASE WHEN COALESCE(s.summary_version, 0) >= 2 THEN COALESCE(s.<new_col>, 0) ELSE COALESCE(s.<new_col>, COALESCE(s.row_count, 0)) END)`
+     for `upperBoundExpr` and
+     `(s.summary_populated AND (COALESCE(s.summary_version, 0) >= 2 OR s.<new_col> IS NOT NULL))`
+     for `exactReadyExpr`, and guard legacy SQL/DuckDB backfill predicates with
+     `COALESCE(s.summary_version, 0) < 2`.
    - **Never run unbounded full-table `UPDATE`s or multi-file DuckDB backfills
      synchronously during `ArchiveCatalog.migrate()` or `OscarTieredObsStore`
      startup (`ModuleRegistry.loadAllModules` enforces a hard `60-second`

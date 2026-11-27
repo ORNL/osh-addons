@@ -896,9 +896,10 @@ public final class JsonCqlEvaluator {
                 catCol = "s.gamma_neutron_alarm_count";
                 splitCol = "s." + adjPrefix + "_gamma_neutron_alarm_count";
             }
-            String upperBound = "COALESCE(" + splitCol + ", LEAST(COALESCE(" + totalAdjCol + ", 0), COALESCE(" + catCol + ", 0)))";
+            String upperBound = "(CASE WHEN COALESCE(s.summary_version, 0) >= 2 THEN COALESCE(" + splitCol + ", 0) " +
+                    "ELSE COALESCE(" + splitCol + ", LEAST(COALESCE(" + totalAdjCol + ", 0), COALESCE(" + catCol + ", 0))) END)";
             String exact = "COALESCE(" + splitCol + ", 0)";
-            String ready = "(s.summary_populated AND " + splitCol + " IS NOT NULL)";
+            String ready = "(s.summary_populated AND (COALESCE(s.summary_version, 0) >= 2 OR " + splitCol + " IS NOT NULL))";
             return Optional.of(new SummaryCounterSpec(upperBound, exact, ready));
         }
 
@@ -919,20 +920,22 @@ public final class JsonCqlEvaluator {
         if (Boolean.TRUE.equals(gamma) && neutron == null) {
             String splitCol1 = "s." + adjPrefix + "_gamma_alarm_count";
             String splitCol2 = "s." + adjPrefix + "_gamma_neutron_alarm_count";
-            String upperBound = "COALESCE(" + splitCol1 + " + " + splitCol2 +
-                    ", LEAST(COALESCE(" + totalAdjCol + ", 0), COALESCE(s.gamma_true_count, 0)))";
+            String upperBound = "(CASE WHEN COALESCE(s.summary_version, 0) >= 2 THEN (COALESCE(" + splitCol1 + ", 0) + COALESCE(" + splitCol2 + ", 0)) " +
+                    "ELSE COALESCE(" + splitCol1 + " + " + splitCol2 +
+                    ", LEAST(COALESCE(" + totalAdjCol + ", 0), COALESCE(s.gamma_true_count, 0))) END)";
             String exact = "(COALESCE(" + splitCol1 + ", 0) + COALESCE(" + splitCol2 + ", 0))";
-            String ready = "(s.summary_populated AND " + splitCol1 + " IS NOT NULL AND " + splitCol2 + " IS NOT NULL)";
+            String ready = "(s.summary_populated AND (COALESCE(s.summary_version, 0) >= 2 OR (" + splitCol1 + " IS NOT NULL AND " + splitCol2 + " IS NOT NULL)))";
             return Optional.of(new SummaryCounterSpec(upperBound, exact, ready));
         }
 
         if (Boolean.TRUE.equals(neutron) && gamma == null) {
             String splitCol1 = "s." + adjPrefix + "_neutron_alarm_count";
             String splitCol2 = "s." + adjPrefix + "_gamma_neutron_alarm_count";
-            String upperBound = "COALESCE(" + splitCol1 + " + " + splitCol2 +
-                    ", LEAST(COALESCE(" + totalAdjCol + ", 0), COALESCE(s.neutron_true_count, 0)))";
+            String upperBound = "(CASE WHEN COALESCE(s.summary_version, 0) >= 2 THEN (COALESCE(" + splitCol1 + ", 0) + COALESCE(" + splitCol2 + ", 0)) " +
+                    "ELSE COALESCE(" + splitCol1 + " + " + splitCol2 +
+                    ", LEAST(COALESCE(" + totalAdjCol + ", 0), COALESCE(s.neutron_true_count, 0))) END)";
             String exact = "(COALESCE(" + splitCol1 + ", 0) + COALESCE(" + splitCol2 + ", 0))";
-            String ready = "(s.summary_populated AND " + splitCol1 + " IS NOT NULL AND " + splitCol2 + " IS NOT NULL)";
+            String ready = "(s.summary_populated AND (COALESCE(s.summary_version, 0) >= 2 OR (" + splitCol1 + " IS NOT NULL AND " + splitCol2 + " IS NOT NULL)))";
             return Optional.of(new SummaryCounterSpec(upperBound, exact, ready));
         }
 
@@ -1049,10 +1052,7 @@ public final class JsonCqlEvaluator {
                         "COALESCE(s.neutron_fault_count, 0)",
                         "COALESCE(s.neutron_fault_count, 0)",
                         "s.summary_populated");
-                case "Fault - Neutron High" -> new SummaryCounterSpec(
-                        "COALESCE(s.neutron_high_fault_count, COALESCE(s.row_count, 0))",
-                        "COALESCE(s.neutron_high_fault_count, 0)",
-                        "(s.summary_populated AND s.neutron_high_fault_count IS NOT NULL)");
+                case "Fault - Neutron High" -> nullableUpgradeCounterSpec("s.neutron_high_fault_count");
                 case "Fault - Extended Occupancy" -> new SummaryCounterSpec(
                         "COALESCE(s.extended_occupancy_fault_count, 0)",
                         "COALESCE(s.extended_occupancy_fault_count, 0)",
@@ -1063,19 +1063,28 @@ public final class JsonCqlEvaluator {
         }
         if ("alarmCategoryCode".equals(propName)) {
             SummaryCounterSpec spec = switch (text) {
-                case "Gamma" -> new SummaryCounterSpec(
-                        "COALESCE(s.alarm_category_gamma_count, COALESCE(s.row_count, 0))",
-                        "COALESCE(s.alarm_category_gamma_count, 0)",
-                        "(s.summary_populated AND s.alarm_category_gamma_count IS NOT NULL)");
-                case "Neutron" -> new SummaryCounterSpec(
-                        "COALESCE(s.alarm_category_neutron_count, COALESCE(s.row_count, 0))",
-                        "COALESCE(s.alarm_category_neutron_count, 0)",
-                        "(s.summary_populated AND s.alarm_category_neutron_count IS NOT NULL)");
+                case "Gamma" -> nullableUpgradeCounterSpec("s.alarm_category_gamma_count");
+                case "Neutron" -> nullableUpgradeCounterSpec("s.alarm_category_neutron_count");
                 default -> null;
             };
             return spec == null ? Optional.empty() : Optional.of(new DisjointStringTerm(propName, text, spec));
         }
         return Optional.empty();
+    }
+
+    /**
+     * Builds a {@link SummaryCounterSpec} for post-upgrade nullable summary columns.
+     * Compact {@code summary_version >= 2} rows store zero-valued counters as SQL {@code NULL}
+     * (1-bit NULL bitmap) and treat {@code NULL} as exact {@code 0}; legacy rows
+     * ({@code summary_version IS NULL}) preserve conservative {@code row_count} upper bounds
+     * and {@code IS NOT NULL} readiness so un-backfilled rows never falsely prune.
+     */
+    private static SummaryCounterSpec nullableUpgradeCounterSpec(String col) {
+        return new SummaryCounterSpec(
+                "(CASE WHEN COALESCE(s.summary_version, 0) >= 2 THEN COALESCE(" + col + ", 0) " +
+                        "ELSE COALESCE(" + col + ", COALESCE(s.row_count, 0)) END)",
+                "COALESCE(" + col + ", 0)",
+                "(s.summary_populated AND (COALESCE(s.summary_version, 0) >= 2 OR " + col + " IS NOT NULL))");
     }
 
     private static Optional<SummaryCounterSpec> disjointStringEqualityOrSummarySpec(Or or) {

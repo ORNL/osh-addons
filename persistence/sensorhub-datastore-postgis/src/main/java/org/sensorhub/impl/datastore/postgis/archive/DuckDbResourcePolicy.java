@@ -49,6 +49,15 @@ final class DuckDbResourcePolicy {
     private DuckDbResourcePolicy() {
     }
 
+    static boolean isBackgroundOperation(String operation) {
+        return "cold-cql-count".equals(operation)
+                || "cold-cql-id-count".equals(operation)
+                || "cold-telemetry-wide-query".equals(operation)
+                || "archive-compaction".equals(operation)
+                || "compaction-verify".equals(operation)
+                || "summary-backfill".equals(operation);
+    }
+
     static Session open(TieredArchiveConfig config, String operation) throws Exception {
         return open(config, operation, false);
     }
@@ -541,11 +550,7 @@ final class DuckDbResourcePolicy {
         }
 
         static boolean isBackgroundCountOperation(String operation) {
-            return "cold-cql-count".equals(operation)
-                    || "cold-cql-id-count".equals(operation)
-                    || "archive-compaction".equals(operation)
-                    || "compaction-verify".equals(operation)
-                    || "summary-backfill".equals(operation);
+            return DuckDbResourcePolicy.isBackgroundOperation(operation);
         }
 
         private void enqueueRequest(AdmissionRequest request) {

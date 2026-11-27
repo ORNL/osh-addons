@@ -878,7 +878,8 @@ public final class ParquetArchiveReader {
         PinnedGenerations pinned = pinGenerationsFor(generations);
         try {
             WindowClusterCursor cursor = new WindowClusterCursor(
-                    steps.iterator(), filter, allowedDataStreams, allowedFois, cursorLimit, cqlMatcher, pinned);
+                    steps.iterator(), filter, allowedDataStreams, allowedFois, cursorLimit, cqlMatcher, pinned,
+                    queryOperationName(filter, generations));
             return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
                             Spliterator.ORDERED | Spliterator.NONNULL), false)
                     .onClose(cursor::close);
@@ -1143,6 +1144,8 @@ public final class ParquetArchiveReader {
         return clusters;
     }
 
+    static final int WIDE_RAW_TELEMETRY_GENERATION_THRESHOLD = 96;
+
     private static String queryOperationName(ObsFilter filter) {
         return filter != null
                 && filter.getInternalIDs() != null
@@ -1150,6 +1153,32 @@ public final class ParquetArchiveReader {
                 && filter.getCQLFilter() == null
                 ? "point-query"
                 : "cold-query";
+    }
+
+    /**
+     * Classifies wide uncompacted {@code RAW_TELEMETRY} scans (&gt; 96 generations,
+     * i.e. &gt; 48 hours of 30-minute raw telemetry files) into the background-capped
+     * DuckDB admission tier ({@code cold-telemetry-wide-query}) so interactive
+     * Event Log, Dashboard, and Adjudication queries always retain at least one
+     * free DuckDB session permit without failing any legitimate wide query.
+     */
+    static String queryOperationName(ObsFilter filter, Collection<ArchiveGeneration> generations) {
+        String base = queryOperationName(filter);
+        if (!"cold-query".equals(base)
+                || generations == null
+                || generations.size() <= WIDE_RAW_TELEMETRY_GENERATION_THRESHOLD) {
+            return base;
+        }
+        int rawTelemetryCount = 0;
+        for (ArchiveGeneration gen : generations) {
+            if (gen != null && TieredArchiveConfig.PROFILE_RAW_TELEMETRY.equals(gen.profile())) {
+                rawTelemetryCount++;
+                if (rawTelemetryCount > WIDE_RAW_TELEMETRY_GENERATION_THRESHOLD) {
+                    return "cold-telemetry-wide-query";
+                }
+            }
+        }
+        return base;
     }
 
     private Stream<ArchivedRow> openRowStream(AuthorizedObjects objects,
@@ -3883,6 +3912,7 @@ public final class ParquetArchiveReader {
         private final boolean nonNullPhenomenonRequired;
         private final boolean nonNullResultTimeRequired;
         private final PinnedGenerations pinnedGenerations;
+        private final String sessionOperationName;
         private final AtomicBoolean closed = new AtomicBoolean();
 
         private DuckDbResourcePolicy.Session sharedSession;
@@ -3903,13 +3933,15 @@ public final class ParquetArchiveReader {
 
         WindowClusterCursor(Iterator<ClusterStep> steps, ObsFilter filter,
                             Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit,
-                            Predicate<String> cqlMatcher, PinnedGenerations pinnedGenerations) {
+                            Predicate<String> cqlMatcher, PinnedGenerations pinnedGenerations,
+                            String sessionOperationName) {
             this.steps = steps;
             this.filter = filter;
             this.allowedDataStreams = allowedDataStreams;
             this.allowedFois = allowedFois;
             this.remaining = limit;
             this.pinnedGenerations = pinnedGenerations;
+            this.sessionOperationName = sessionOperationName != null ? sessionOperationName : queryOperationName(filter);
             boolean hasLatest = (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
                     (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
             this.fallbackCqlMatcher = cqlMatcher;
@@ -4058,7 +4090,7 @@ public final class ParquetArchiveReader {
             AuthorizedObjects stagedObjects = null;
             try {
                 if (sharedSession == null) {
-                    sharedSession = DuckDbResourcePolicy.open(config, queryOperationName(filter));
+                    sharedSession = DuckDbResourcePolicy.open(config, sessionOperationName);
                     openCursors.incrementAndGet();
                     sessionCountedInOpenCursors = true;
                 }
