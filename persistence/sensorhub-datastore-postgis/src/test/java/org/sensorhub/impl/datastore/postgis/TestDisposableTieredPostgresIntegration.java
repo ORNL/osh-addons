@@ -5919,6 +5919,39 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         }
     }
 
+    @Test
+    public void migrateAppliesTightenedAutovacuumReloptionsAndReindexMaintainsSchemaAndOverlay() throws Exception {
+        try (Connection conn = open(); Statement stmt = conn.createStatement()) {
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT COALESCE(array_to_string(reloptions, ','), '') " +
+                            "FROM pg_class WHERE oid = 'oscar_archive_schema'::regclass")) {
+                assertTrue(rs.next());
+                String opts = rs.getString(1);
+                assertTrue("Expected tightened autovacuum scale factor on oscar_archive_schema: " + opts,
+                        opts.contains("autovacuum_vacuum_scale_factor=0.02")
+                                && opts.contains("autovacuum_analyze_scale_factor=0.02"));
+            }
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT COALESCE(array_to_string(c.reloptions, ','), ''), " +
+                            "COALESCE(array_to_string(tc.reloptions, ','), '') " +
+                            "FROM pg_class c LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid " +
+                            "WHERE c.oid = 'oscar_obs_overlay'::regclass")) {
+                assertTrue(rs.next());
+                String mainOpts = rs.getString(1);
+                String toastOpts = rs.getString(2);
+                assertTrue("Expected tightened autovacuum on oscar_obs_overlay: " + mainOpts,
+                        mainOpts.contains("autovacuum_vacuum_scale_factor=0.05")
+                                && mainOpts.contains("autovacuum_analyze_scale_factor=0.05"));
+                assertTrue("Expected tightened TOAST autovacuum on oscar_obs_overlay: " + toastOpts,
+                        toastOpts.contains("autovacuum_vacuum_scale_factor=0.05")
+                                && toastOpts.contains("autovacuum_vacuum_threshold=50"));
+            }
+        }
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        tiered.getArchiveCatalog().reindexMutableTables(
+                tiered.getDatastoreName(), tiered.getDataStreams().getDatastoreName());
+    }
+
     private static String toPostgresPositionalSql(String jdbcSql) {
         StringBuilder out = new StringBuilder();
         int index = 1;
