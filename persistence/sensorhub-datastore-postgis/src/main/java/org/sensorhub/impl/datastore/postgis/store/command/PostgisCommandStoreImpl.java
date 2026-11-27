@@ -583,16 +583,16 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
             } finally {
                 idArray.free();
             }
-            // Non-blocking VACUUM (ANALYZE) reclaims dead tuples for reuse without
-            // acquiring an ACCESS EXCLUSIVE lock on multi-year adjudication tables.
+            // Non-blocking VACUUM (ANALYZE, PARALLEL 0) reclaims dead tuples for reuse without
+            // acquiring ACCESS EXCLUSIVE locks or allocating >64 MiB /dev/shm DSM segments.
             if (deletedCommands >= 50) {
                 boolean oldAutoCommit = connection.getAutoCommit();
                 if (!oldAutoCommit) {
                     connection.setAutoCommit(true);
                 }
                 try (Statement vacuum = connection.createStatement()) {
-                    vacuum.execute("VACUUM (ANALYZE) " + statusTable);
-                    vacuum.execute("VACUUM (ANALYZE) " + commandTable);
+                    vacuum.execute("VACUUM (ANALYZE, PARALLEL 0) " + statusTable);
+                    vacuum.execute("VACUUM (ANALYZE, PARALLEL 0) " + commandTable);
                 } finally {
                     if (!oldAutoCommit) {
                         connection.setAutoCommit(false);
