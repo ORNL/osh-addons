@@ -522,49 +522,77 @@ public class PostgisCommandStoreImpl extends PostgisStore<QueryBuilderCommandSto
         return removed;
     }
 
+    public static final int DEFAULT_TRANSIENT_COMMAND_PURGE_BATCH_LIMIT = 5_000;
+
     /**
      * Prunes transient non-adjudication command and status records (such as
-     * bulk {@code fileControl} N42 uploads and {@code hlsControl} camera stream
-     * toggles) older than {@code cutoff} while preserving all immutable
-     * {@code adjudicationControl} audit records.
+     * bulk {@code fileControl} N42 uploads, {@code hlsControl} camera stream
+     * toggles, report/stats requests, and relay control commands) older than
+     * {@code cutoff} in bounded batches while preserving all immutable
+     * {@code adjudicationControl} audit records and avoiding {@code ACCESS EXCLUSIVE}
+     * locks on the command tables.
      */
     public int purgeCompletedTransientCommandsBefore(java.time.Instant cutoff) {
-        if (cutoff == null || commandStreamStore == null || commandStatusStore == null) {
+        return purgeCompletedTransientCommandsBefore(cutoff, DEFAULT_TRANSIENT_COMMAND_PURGE_BATCH_LIMIT);
+    }
+
+    public int purgeCompletedTransientCommandsBefore(java.time.Instant cutoff, int maxBatchSize) {
+        if (cutoff == null || maxBatchSize <= 0 || commandStreamStore == null || commandStatusStore == null) {
             return 0;
         }
         String commandTable = queryBuilder.getStoreTableName();
         String streamTable = commandStreamStore.getDatastoreName();
         String statusTable = commandStatusStore.getDatastoreName();
-        String deleteStatusSql = "DELETE FROM " + statusTable + " s "
-                + "USING " + commandTable + " c "
-                + "LEFT JOIN " + streamTable + " cs ON cs.id = c." + COMMANDSTREAM_ID + " "
-                + "WHERE s." + ICommandStatusStore.CommandStatusField.COMMAND_ID + " = c.id "
-                + "AND c." + ISSUE_TIME + " < ? "
-                + "AND COALESCE(cs.data->>'controlInputName', '') <> '" + IMMUTABLE_ADJUDICATION_CONTROL_NAME + "'";
-        String deleteCommandSql = "DELETE FROM " + commandTable + " c "
-                + "USING " + streamTable + " cs "
-                + "WHERE cs.id = c." + COMMANDSTREAM_ID + " "
-                + "AND c." + ISSUE_TIME + " < ? "
-                + "AND COALESCE(cs.data->>'controlInputName', '') <> '" + IMMUTABLE_ADJUDICATION_CONTROL_NAME + "'";
+        String selectCandidatesSql = "SELECT c.id FROM " + commandTable + " c "
+                + "WHERE c." + ISSUE_TIME + " < ? "
+                + "AND NOT EXISTS ("
+                + "  SELECT 1 FROM " + streamTable + " cs "
+                + "  WHERE cs.id = c." + COMMANDSTREAM_ID + " "
+                + "  AND cs.data->>'controlInputName' = '" + IMMUTABLE_ADJUDICATION_CONTROL_NAME + "'"
+                + ") ORDER BY c." + ISSUE_TIME + " ASC, c.id ASC LIMIT ?";
+        String deleteStatusSql = "DELETE FROM " + statusTable
+                + " WHERE " + ICommandStatusStore.CommandStatusField.COMMAND_ID + " = ANY (?::bigint[])";
+        String deleteCommandSql = "DELETE FROM " + commandTable
+                + " WHERE id = ANY (?::bigint[])";
         int deletedCommands = 0;
         try (Connection connection = this.connectionManager.getConnection()) {
             Timestamp cutoffTs = Timestamp.from(cutoff);
-            try (PreparedStatement statusStmt = connection.prepareStatement(deleteStatusSql)) {
-                statusStmt.setTimestamp(1, cutoffTs, UTC_LOCAL);
-                statusStmt.executeUpdate();
+            List<Long> candidateIds = new ArrayList<>();
+            try (PreparedStatement selectStmt = connection.prepareStatement(selectCandidatesSql)) {
+                selectStmt.setTimestamp(1, cutoffTs, UTC_LOCAL);
+                selectStmt.setInt(2, maxBatchSize);
+                try (ResultSet rs = selectStmt.executeQuery()) {
+                    while (rs.next()) {
+                        candidateIds.add(rs.getLong(1));
+                    }
+                }
             }
-            try (PreparedStatement cmdStmt = connection.prepareStatement(deleteCommandSql)) {
-                cmdStmt.setTimestamp(1, cutoffTs, UTC_LOCAL);
-                deletedCommands = cmdStmt.executeUpdate();
+            if (candidateIds.isEmpty()) {
+                return 0;
             }
+            java.sql.Array idArray = connection.createArrayOf("bigint", candidateIds.toArray(new Long[0]));
+            try {
+                try (PreparedStatement statusStmt = connection.prepareStatement(deleteStatusSql)) {
+                    statusStmt.setArray(1, idArray);
+                    statusStmt.executeUpdate();
+                }
+                try (PreparedStatement cmdStmt = connection.prepareStatement(deleteCommandSql)) {
+                    cmdStmt.setArray(1, idArray);
+                    deletedCommands = cmdStmt.executeUpdate();
+                }
+            } finally {
+                idArray.free();
+            }
+            // Non-blocking VACUUM (ANALYZE) reclaims dead tuples for reuse without
+            // acquiring an ACCESS EXCLUSIVE lock on multi-year adjudication tables.
             if (deletedCommands >= 50) {
                 boolean oldAutoCommit = connection.getAutoCommit();
                 if (!oldAutoCommit) {
                     connection.setAutoCommit(true);
                 }
                 try (Statement vacuum = connection.createStatement()) {
-                    vacuum.execute("VACUUM (FULL, ANALYZE) " + statusTable);
-                    vacuum.execute("VACUUM (FULL, ANALYZE) " + commandTable);
+                    vacuum.execute("VACUUM (ANALYZE) " + statusTable);
+                    vacuum.execute("VACUUM (ANALYZE) " + commandTable);
                 } finally {
                     if (!oldAutoCommit) {
                         connection.setAutoCommit(false);

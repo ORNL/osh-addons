@@ -1585,7 +1585,7 @@ public class TestMultiTierParquetCompactionIntegration {
         // 3) backfillExtendedSummaryCountersBatch MUST populate all remaining eligible rows with exact counts.
         try (Connection conn = openPg(); Statement stmt = conn.createStatement()) {
             stmt.executeUpdate("UPDATE oscar_archive_schema SET " +
-                    "neutron_high_fault_count = NULL, alarm_category_gamma_count = NULL, alarm_category_neutron_count = NULL");
+                    "summary_version = NULL, neutron_high_fault_count = NULL, alarm_category_gamma_count = NULL, alarm_category_neutron_count = NULL");
         }
         assertEquals(2L, store.countMatchingEntries(neutronHighFilter));
         assertEquals(5L, store.countMatchingEntries(allFaultsFilter));
@@ -1803,6 +1803,7 @@ public class TestMultiTierParquetCompactionIntegration {
         try (Connection c = openPg();
              PreparedStatement ps = c.prepareStatement(
                      "UPDATE oscar_archive_schema SET " +
+                             "summary_version = NULL, " +
                              "unadjudicated_gamma_alarm_count = NULL, " +
                              "unadjudicated_neutron_alarm_count = NULL, " +
                              "unadjudicated_gamma_neutron_alarm_count = NULL, " +
@@ -1877,6 +1878,91 @@ public class TestMultiTierParquetCompactionIntegration {
                 .withCQLFilter("alarmState='Fault - Neutron High'")
                 .build();
         assertEquals(1L, store.countMatchingEntries(neutronHighFault));
+    }
+
+    @Test
+    public void singlePassActivationWritesCompactV2SparseSummariesWithoutDeadTuplesOrBackfillChurn()
+            throws Exception {
+        String table = uniqueTableName("v2compact");
+        Path archiveRoot = temporary.newFolder("archive-v2compact").toPath();
+        Path duckTmp = archiveRoot.resolveSibling("ducktmp-v2compact");
+        TieredArchiveConfig cfg = parquetPrimaryConfig(archiveRoot, duckTmp,
+                List.of("occupancy", "gammaCounts"));
+        OscarTieredObsStore store = openStore(table, cfg);
+        BigId occStream = addEventOccupancyStream(store, 401L, "occupancy");
+        BigId gammaStream = addAlarmStateStream(store, 401L, "gammaCounts",
+                new String[]{"Background", "Fault - Gamma High"});
+
+        Instant winStart = Instant.parse("2026-11-10T00:00:00Z");
+        Instant winEnd = winStart.plus(30, ChronoUnit.MINUTES);
+        Instant ts = winStart.plusSeconds(10);
+        store.add(eventOccupancyObs(occStream, ts, ts, "occ-v2-1", true, false, 150, 2, 0, 0));
+        store.add(alarmStateObs(gammaStream, winStart.plusSeconds(20), "Background"));
+        commitStore(store);
+
+        ArchiveGeneration rawEvGen = store.archiveWindow(winStart, winEnd, TieredArchiveConfig.PROFILE_RAW_EVENTS)
+                .orElseThrow();
+        ArchiveGeneration rawTelGen = store.archiveWindow(winStart, winEnd, TieredArchiveConfig.PROFILE_RAW_TELEMETRY)
+                .orElseThrow();
+
+        try (Connection c = openPg();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT s.datastream_id, s.summary_populated, s.summary_version, s.row_count, " +
+                             "s.gamma_alarm_count, s.neutron_alarm_count, s.neutron_high_fault_count, " +
+                             "s.alarm_category_gamma_count " +
+                             "FROM oscar_archive_schema s WHERE s.generation_id IN (?, ?)")) {
+            ps.setObject(1, rawEvGen.id());
+            ps.setObject(2, rawTelGen.id());
+            int rows = 0;
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    rows++;
+                    long dsId = rs.getLong(1);
+                    assertTrue("summary_populated must be true on birth", rs.getBoolean(2));
+                    assertEquals("summary_version must be 2 on birth",
+                            Short.valueOf((short) 2), rs.getObject(3, Short.class));
+                    assertEquals(1L, rs.getLong(4));
+                    if (dsId == occStream.getIdAsLong()) {
+                        assertEquals("Non-zero gamma_alarm_count stored as exact 1",
+                                Long.valueOf(1L), rs.getObject(5, Long.class));
+                        assertEquals("Zero neutron_alarm_count stored sparsely as SQL NULL",
+                                null, rs.getObject(6, Long.class));
+                        assertEquals("Zero neutron_high_fault_count stored sparsely as SQL NULL",
+                                null, rs.getObject(7, Long.class));
+                        assertEquals("Zero alarm_category_gamma_count stored sparsely as SQL NULL",
+                                null, rs.getObject(8, Long.class));
+                    } else {
+                        assertEquals("Zero gamma_alarm_count on telemetry stream stored sparsely as SQL NULL",
+                                null, rs.getObject(5, Long.class));
+                        assertEquals("Zero neutron_high_fault_count stored sparsely as SQL NULL",
+                                null, rs.getObject(7, Long.class));
+                    }
+                }
+            }
+            assertEquals(2, rows);
+        }
+
+        // Compact V2 NULL zeros must NEVER trigger any legacy upgrade/summary/extended backfill.
+        assertEquals(0, store.getArchiveCatalog().backfillPendingSchemaUpgradeColumnsBatch(16));
+        assertEquals(0, store.getArchiveCatalog().backfillGenerationSummariesBatch(archiveRoot, 16));
+        assertEquals(0, store.getArchiveCatalog().backfillExtendedSummaryCountersBatch(archiveRoot, 16));
+
+        // Exact CQL summary queries must evaluate compact V2 NULL zeros as exact 0 with ZERO DuckDB opens.
+        ObsFilter neutronHighFilter = new ObsFilter.Builder()
+                .withCQLFilter("alarmState = 'Fault - Neutron High'")
+                .build();
+        ObsFilter gammaUnadjFilter = new ObsFilter.Builder()
+                .withCQLFilter("gammaAlarm = true AND neutronAlarm = false AND adjudicatedIdsCount = 0")
+                .build();
+        ObsFilter neutronUnadjFilter = new ObsFilter.Builder()
+                .withCQLFilter("gammaAlarm = false AND neutronAlarm = true AND adjudicatedIdsCount = 0")
+                .build();
+        assertEquals(0L, store.countMatchingEntries(neutronHighFilter));
+        assertEquals(1L, store.countMatchingEntries(gammaUnadjFilter));
+        assertEquals(0L, store.countMatchingEntries(neutronUnadjFilter));
+
+        // Bloat-gated overlay maintenance inside reindexMutableTables completes cleanly.
+        store.getArchiveCatalog().reindexMutableTables(table, table + "_datastreams");
     }
 
     private static BigId addTamperStream(OscarTieredObsStore store, long sysNum) throws Exception {

@@ -269,4 +269,85 @@ public class TestPostgisCommandStore extends AbstractTestCommandStore<PostgisCom
         assertEquals("First immutable adjudication",
                 storedFirstStatus.getResult().getInlineRecords().iterator().next().getStringValue(1));
     }
+
+    @Test
+    public void testBoundedTransientCommandPurgePreservesImmutableAdjudication() throws Exception {
+        SWEHelper fac = new SWEHelper();
+        var adjParam = fac.createRecord().name("adjudicationControl").addField("feedback", fac.createText()).build();
+        var adjStream = new CommandStreamInfo.Builder()
+                .withName("adjudicationControl")
+                .withRecordDescription(adjParam)
+                .withRecordEncoding(new TextEncodingImpl())
+                .withSystem(new FeatureId(bigId(2), "urn:osh:system:lane:test-purge"))
+                .build();
+        var adjCsKey = cmdStore.getCommandStreams().add(adjStream);
+
+        var hlsParam = fac.createRecord().name("ffmpegHlsControl").addField("action", fac.createText()).build();
+        var hlsStream = new CommandStreamInfo.Builder()
+                .withName("ffmpegHlsControl")
+                .withRecordDescription(hlsParam)
+                .withRecordEncoding(new TextEncodingImpl())
+                .withSystem(new FeatureId(bigId(2), "urn:osh:system:lane:test-purge"))
+                .build();
+        var hlsCsKey = cmdStore.getCommandStreams().add(hlsStream);
+
+        Instant oldTime = Instant.parse("2026-10-01T00:00:00Z");
+        Instant freshTime = Instant.parse("2026-11-26T00:00:00Z");
+        Instant cutoff = Instant.parse("2026-11-01T00:00:00Z");
+
+        var adjBlock = adjParam.createDataBlock();
+        adjBlock.setStringValue(0, "Immutable adjudication must survive purge");
+        var adjCmdId = cmdStore.add(new CommandData.Builder()
+                .withCommandStream(adjCsKey.getInternalID())
+                .withSender("operator")
+                .withIssueTime(oldTime)
+                .withParams(adjBlock)
+                .build());
+        var adjStatusId = cmdStore.getStatusReports().add(new CommandStatus.Builder()
+                .withCommand(adjCmdId)
+                .withReportTime(oldTime.plusSeconds(1))
+                .withStatusCode(ICommandStatus.CommandStatusCode.COMPLETED)
+                .build());
+
+        java.util.List<BigId> oldHlsCmds = new java.util.ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            var hlsBlock = hlsParam.createDataBlock();
+            hlsBlock.setStringValue(0, "start-" + i);
+            var id = cmdStore.add(new CommandData.Builder()
+                    .withCommandStream(hlsCsKey.getInternalID())
+                    .withSender("viewer")
+                    .withIssueTime(oldTime.plusSeconds(i * 10L))
+                    .withParams(hlsBlock)
+                    .build());
+            cmdStore.getStatusReports().add(new CommandStatus.Builder()
+                    .withCommand(id)
+                    .withReportTime(oldTime.plusSeconds(i * 10L + 1L))
+                    .withStatusCode(ICommandStatus.CommandStatusCode.COMPLETED)
+                    .build());
+            oldHlsCmds.add(id);
+        }
+        var freshBlock = hlsParam.createDataBlock();
+        freshBlock.setStringValue(0, "keep-fresh");
+        var freshHlsId = cmdStore.add(new CommandData.Builder()
+                .withCommandStream(hlsCsKey.getInternalID())
+                .withSender("viewer")
+                .withIssueTime(freshTime)
+                .withParams(freshBlock)
+                .build());
+
+        // Bounded batch of 2 deletes only 2 old transient commands
+        assertEquals(2, cmdStore.purgeCompletedTransientCommandsBefore(cutoff, 2));
+        // Second bounded batch of 10 deletes the remaining 3 old transient commands
+        assertEquals(3, cmdStore.purgeCompletedTransientCommandsBefore(cutoff, 10));
+        // Third call converges cleanly to 0
+        assertEquals(0, cmdStore.purgeCompletedTransientCommandsBefore(cutoff, 10));
+
+        // Immutable adjudication and recent transient command remain untouched
+        assertNotNull(cmdStore.get(adjCmdId));
+        assertNotNull(cmdStore.getStatusReports().get(adjStatusId));
+        assertNotNull(cmdStore.get(freshHlsId));
+        for (BigId removedId : oldHlsCmds) {
+            assertNull(cmdStore.get(removedId));
+        }
+    }
 }

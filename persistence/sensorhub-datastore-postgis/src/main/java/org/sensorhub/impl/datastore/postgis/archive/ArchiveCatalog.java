@@ -59,9 +59,14 @@ public final class ArchiveCatalog {
     static final long MAX_BACKUP_ARCHIVE_GENERATIONS = 1_000_000L;
     static final long MAX_BACKUP_ARCHIVE_GENERATION_INVENTORY_BYTES = 37_000_000L;
     static final int SUMMARY_GENERATION_BATCH_SIZE = 2_048;
+    static final short SCHEMA_SUMMARY_VERSION_COMPACT = 2;
     static final long SCHEMA_REINDEX_SMALL_TABLE_BYTES = 256L * 1024L * 1024L;
     static final long SCHEMA_REINDEX_MIN_DEAD_TUPLES = 50_000L;
     static final double SCHEMA_REINDEX_MIN_DEAD_RATIO = 0.10d;
+    static final long OVERLAY_REINDEX_MIN_DEAD_TUPLES = 250L;
+    static final double OVERLAY_REINDEX_MIN_DEAD_RATIO = 0.20d;
+    static final long OVERLAY_REINDEX_MIN_BLOAT_BYTES = 8L * 1024L * 1024L;
+    static final long OVERLAY_REINDEX_BYTES_PER_LIVE_ROW = 8_192L;
     private static final long MIGRATION_LOCK = 0x4f5343415253544fL;
 
     private final SqlConnectionProvider connections;
@@ -345,6 +350,7 @@ public final class ArchiveCatalog {
                         "schema_sha256 text REFERENCES oscar_archive_schema_blob(schema_sha256)");
                 statement.execute("ALTER TABLE oscar_archive_schema ALTER COLUMN schema_json DROP NOT NULL");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS summary_populated boolean NOT NULL DEFAULT false");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS summary_version smallint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS row_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS gamma_alarm_count bigint");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS neutron_alarm_count bigint");
@@ -427,7 +433,7 @@ public final class ArchiveCatalog {
                             "  WHEN COALESCE(gamma_alarm_count, 0) = 0 AND COALESCE(neutron_alarm_count, 0) = 0 THEN COALESCE(adjudicated_alarm_count, 0) " +
                             "  WHEN COALESCE(gamma_neutron_alarm_count, 0) = 0 THEN 0 " +
                             "  ELSE NULL END " +
-                            "WHERE summary_populated AND (" +
+                            "WHERE summary_populated AND COALESCE(summary_version, 0) < 2 AND (" +
                             "  COALESCE(any_alarm_count, 0) = 0 OR " +
                             "  COALESCE(unadjudicated_alarm_count, 0) = 0 OR " +
                             "  COALESCE(adjudicated_alarm_count, 0) = 0 OR " +
@@ -463,7 +469,7 @@ public final class ArchiveCatalog {
                     // immediately summary-ready without scanning Parquet files.
                     statement.execute("UPDATE oscar_archive_schema " +
                             "SET neutron_high_fault_count = 0 " +
-                            "WHERE summary_populated AND neutron_high_fault_count IS NULL AND (" +
+                            "WHERE summary_populated AND COALESCE(summary_version, 0) < 2 AND neutron_high_fault_count IS NULL AND (" +
                             "  COALESCE(row_count, 0) = 0 OR schema_sha256 IN (" +
                             "    SELECT schema_sha256 FROM oscar_archive_schema_blob " +
                             "    WHERE position('alarmState' in schema_json::text) = 0 " +
@@ -475,7 +481,7 @@ public final class ArchiveCatalog {
                     statement.execute("UPDATE oscar_archive_schema " +
                             "SET alarm_category_gamma_count = COALESCE(alarm_category_gamma_count, 0), " +
                             "    alarm_category_neutron_count = COALESCE(alarm_category_neutron_count, 0) " +
-                            "WHERE summary_populated " +
+                            "WHERE summary_populated AND COALESCE(summary_version, 0) < 2 " +
                             "  AND (alarm_category_gamma_count IS NULL OR alarm_category_neutron_count IS NULL) " +
                             "  AND (" +
                             "    COALESCE(row_count, 0) = 0 OR schema_sha256 IN (" +
@@ -1176,28 +1182,8 @@ public final class ArchiveCatalog {
                     statement.setLong(3, generation.maximumId());
                     statement.executeUpdate();
                 }
-                try (PreparedStatement blobStatement = connection.prepareStatement(
-                        "INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
-                                "VALUES (?, ?::jsonb) ON CONFLICT (schema_sha256) DO NOTHING");
-                     PreparedStatement statement = connection.prepareStatement(
-                        "INSERT INTO oscar_archive_schema(generation_id, datastream_id, schema_sha256) VALUES (?, ?, ?)")) {
-                    Set<String> insertedBlobs = new HashSet<>();
-                    for (SchemaSnapshot schema : schemas) {
-                        String schemaHash = sha256Hex(schema.json());
-                        if (insertedBlobs.add(schemaHash)) {
-                            blobStatement.setString(1, schemaHash);
-                            blobStatement.setString(2, schema.json());
-                            blobStatement.addBatch();
-                        }
-                        statement.setObject(1, generation.id());
-                        statement.setLong(2, schema.dataStreamId());
-                        statement.setString(3, schemaHash);
-                        statement.addBatch();
-                    }
-                    blobStatement.executeBatch();
-                    statement.executeBatch();
-                }
-                populateGenerationSummariesAndLatest(connection, generation, resultTimeBounds.ocrByStream());
+                insertGenerationSchemasWithSummariesAndLatest(
+                        connection, generation, schemas, resultTimeBounds.ocrByStream());
                 try (PreparedStatement statement = connection.prepareStatement(
                         "UPDATE oscar_archive_job SET state='ACTIVE', updated_at=now() " +
                                 "WHERE id=? AND store_key=? AND id_scope=?")) {
@@ -1414,72 +1400,180 @@ public final class ArchiveCatalog {
         return new ResultTimeBounds(minResultTime, maxResultTime, ocrSnapshots);
     }
 
+    private static final String ACTIVATION_SUMMARY_AGG_SUBQUERY =
+            "SELECT datastream_id, " +
+            "count(*)::bigint AS row_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb)::bigint AS gamma_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb)::bigint AS neutron_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb)::bigint AS gamma_neutron_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb)::bigint AS non_alarm_occupancy_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb)::bigint AS gamma_true_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'neutronAlarm' = 'true'::jsonb)::bigint AS neutron_true_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb))::bigint AS any_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb) AND " +
+            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') = '0')))::bigint AS unadjudicated_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb) AND " +
+            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') <> '0')))::bigint AS adjudicated_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb AND " +
+            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') = '0')))::bigint AS unadjudicated_gamma_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " +
+            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') = '0')))::bigint AS unadjudicated_neutron_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " +
+            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') = '0')))::bigint AS unadjudicated_gamma_neutron_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb AND " +
+            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') <> '0')))::bigint AS adjudicated_gamma_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " +
+            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') <> '0')))::bigint AS adjudicated_neutron_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " +
+            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') <> '0')))::bigint AS adjudicated_gamma_neutron_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma High\"'::jsonb)::bigint AS gamma_high_fault_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma Low\"'::jsonb)::bigint AS gamma_low_fault_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Neutron\"'::jsonb)::bigint AS neutron_fault_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Neutron High\"'::jsonb)::bigint AS neutron_high_fault_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Extended Occupancy\"'::jsonb)::bigint AS extended_occupancy_fault_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'tamperStatus' = 'true'::jsonb)::bigint AS tamper_true_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Gamma%')::bigint AS rs350_gamma_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Neutron%')::bigint AS rs350_neutron_alarm_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmCategoryCode' = '\"Gamma\"'::jsonb)::bigint AS alarm_category_gamma_count, " +
+            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmCategoryCode' = '\"Neutron\"'::jsonb)::bigint AS alarm_category_neutron_count " +
+            "FROM oscar_archive_activation_row GROUP BY datastream_id";
+
+    /**
+     * Inserts {@code oscar_archive_schema} rows for a newly activated generation
+     * in a single SQL {@code INSERT ... SELECT} pass with compact sparse-zero
+     * {@code summary_version = 2} counters ({@code NULLIF(count, 0)}) and inline
+     * OCR Bloom summaries so activation creates zero MVCC dead tuples.
+     */
+    private void insertGenerationSchemasWithSummariesAndLatest(
+            Connection connection,
+            ArchiveGeneration generation,
+            List<SchemaSnapshot> schemas,
+            Map<Long, OcrBloomFilter.Snapshot> ocrByStream) throws SQLException {
+        try (Statement createStage = connection.createStatement()) {
+            createStage.execute("CREATE TEMP TABLE oscar_archive_schema_stage (" +
+                    "datastream_id bigint PRIMARY KEY, schema_sha256 text NOT NULL, " +
+                    "ocr_bloom bytea, ocr_min_norm text, ocr_max_norm text) ON COMMIT DROP");
+        }
+        try (PreparedStatement blobStatement = connection.prepareStatement(
+                "INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
+                        "VALUES (?, ?::jsonb) ON CONFLICT (schema_sha256) DO NOTHING");
+             PreparedStatement stageStatement = connection.prepareStatement(
+                "INSERT INTO oscar_archive_schema_stage(datastream_id, schema_sha256, ocr_bloom, ocr_min_norm, ocr_max_norm) " +
+                        "VALUES (?, ?, ?, ?, ?)")) {
+            Set<String> insertedBlobs = new HashSet<>();
+            for (SchemaSnapshot schema : schemas) {
+                String schemaHash = sha256Hex(schema.json());
+                if (insertedBlobs.add(schemaHash)) {
+                    blobStatement.setString(1, schemaHash);
+                    blobStatement.setString(2, schema.json());
+                    blobStatement.addBatch();
+                }
+                stageStatement.setLong(1, schema.dataStreamId());
+                stageStatement.setString(2, schemaHash);
+                OcrBloomFilter.Snapshot snap = ocrByStream != null ? ocrByStream.get(schema.dataStreamId()) : null;
+                if (snap == null) {
+                    stageStatement.setNull(3, Types.BINARY);
+                    stageStatement.setNull(4, Types.VARCHAR);
+                    stageStatement.setNull(5, Types.VARCHAR);
+                } else {
+                    stageStatement.setBytes(3, snap.bloomBytes());
+                    if (snap.minNorm() == null)
+                        stageStatement.setNull(4, Types.VARCHAR);
+                    else
+                        stageStatement.setString(4, snap.minNorm());
+                    if (snap.maxNorm() == null)
+                        stageStatement.setNull(5, Types.VARCHAR);
+                    else
+                        stageStatement.setString(5, snap.maxNorm());
+                }
+                stageStatement.addBatch();
+            }
+            blobStatement.executeBatch();
+            stageStatement.executeBatch();
+        }
+        String singlePassInsertSql = "INSERT INTO oscar_archive_schema(" +
+                "generation_id, datastream_id, schema_sha256, summary_populated, summary_version, row_count, " +
+                "gamma_alarm_count, neutron_alarm_count, gamma_neutron_alarm_count, non_alarm_occupancy_count, " +
+                "gamma_true_count, neutron_true_count, any_alarm_count, " +
+                "unadjudicated_alarm_count, adjudicated_alarm_count, " +
+                "unadjudicated_gamma_alarm_count, unadjudicated_neutron_alarm_count, unadjudicated_gamma_neutron_alarm_count, " +
+                "adjudicated_gamma_alarm_count, adjudicated_neutron_alarm_count, adjudicated_gamma_neutron_alarm_count, " +
+                "gamma_high_fault_count, gamma_low_fault_count, neutron_fault_count, neutron_high_fault_count, extended_occupancy_fault_count, " +
+                "tamper_true_count, rs350_gamma_alarm_count, rs350_neutron_alarm_count, " +
+                "alarm_category_gamma_count, alarm_category_neutron_count, " +
+                "ocr_bloom, ocr_min_norm, ocr_max_norm) " +
+                "SELECT ?, st.datastream_id, st.schema_sha256, true, " + SCHEMA_SUMMARY_VERSION_COMPACT + "::smallint, " +
+                "COALESCE(agg.row_count, 0), " +
+                "NULLIF(agg.gamma_alarm_count, 0), " +
+                "NULLIF(agg.neutron_alarm_count, 0), " +
+                "NULLIF(agg.gamma_neutron_alarm_count, 0), " +
+                "NULLIF(agg.non_alarm_occupancy_count, 0), " +
+                "NULLIF(agg.gamma_true_count, 0), " +
+                "NULLIF(agg.neutron_true_count, 0), " +
+                "NULLIF(agg.any_alarm_count, 0), " +
+                "NULLIF(agg.unadjudicated_alarm_count, 0), " +
+                "NULLIF(agg.adjudicated_alarm_count, 0), " +
+                "NULLIF(agg.unadjudicated_gamma_alarm_count, 0), " +
+                "NULLIF(agg.unadjudicated_neutron_alarm_count, 0), " +
+                "NULLIF(agg.unadjudicated_gamma_neutron_alarm_count, 0), " +
+                "NULLIF(agg.adjudicated_gamma_alarm_count, 0), " +
+                "NULLIF(agg.adjudicated_neutron_alarm_count, 0), " +
+                "NULLIF(agg.adjudicated_gamma_neutron_alarm_count, 0), " +
+                "NULLIF(agg.gamma_high_fault_count, 0), " +
+                "NULLIF(agg.gamma_low_fault_count, 0), " +
+                "NULLIF(agg.neutron_fault_count, 0), " +
+                "NULLIF(agg.neutron_high_fault_count, 0), " +
+                "NULLIF(agg.extended_occupancy_fault_count, 0), " +
+                "NULLIF(agg.tamper_true_count, 0), " +
+                "NULLIF(agg.rs350_gamma_alarm_count, 0), " +
+                "NULLIF(agg.rs350_neutron_alarm_count, 0), " +
+                "NULLIF(agg.alarm_category_gamma_count, 0), " +
+                "NULLIF(agg.alarm_category_neutron_count, 0), " +
+                "st.ocr_bloom, st.ocr_min_norm, st.ocr_max_norm " +
+                "FROM oscar_archive_schema_stage st " +
+                "LEFT JOIN (" + ACTIVATION_SUMMARY_AGG_SUBQUERY + ") agg ON agg.datastream_id = st.datastream_id";
+        try (PreparedStatement insertStmt = connection.prepareStatement(singlePassInsertSql)) {
+            insertStmt.setObject(1, generation.id());
+            insertStmt.executeUpdate();
+        }
+        upsertGenerationLocatorsAndLatest(connection, generation);
+    }
+
     private void populateGenerationSummariesAndLatest(
             Connection connection,
             ArchiveGeneration generation,
             Map<Long, OcrBloomFilter.Snapshot> ocrByStream) throws SQLException {
-        String isUnadjudicatedJson = "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0) " +
-                "OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') = '0'))";
-        String isAdjudicatedJson = "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0) " +
-                "OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') <> '0'))";
         String updateSummarySql = "UPDATE oscar_archive_schema s SET " +
                 "summary_populated = true, " +
+                "summary_version = " + SCHEMA_SUMMARY_VERSION_COMPACT + "::smallint, " +
                 "row_count = agg.row_count, " +
-                "gamma_alarm_count = agg.gamma_alarm_count, " +
-                "neutron_alarm_count = agg.neutron_alarm_count, " +
-                "gamma_neutron_alarm_count = agg.gamma_neutron_alarm_count, " +
-                "non_alarm_occupancy_count = agg.non_alarm_occupancy_count, " +
-                "gamma_true_count = agg.gamma_true_count, " +
-                "neutron_true_count = agg.neutron_true_count, " +
-                "any_alarm_count = agg.any_alarm_count, " +
-                "unadjudicated_alarm_count = agg.unadjudicated_alarm_count, " +
-                "adjudicated_alarm_count = agg.adjudicated_alarm_count, " +
-                "unadjudicated_gamma_alarm_count = agg.unadjudicated_gamma_alarm_count, " +
-                "unadjudicated_neutron_alarm_count = agg.unadjudicated_neutron_alarm_count, " +
-                "unadjudicated_gamma_neutron_alarm_count = agg.unadjudicated_gamma_neutron_alarm_count, " +
-                "adjudicated_gamma_alarm_count = agg.adjudicated_gamma_alarm_count, " +
-                "adjudicated_neutron_alarm_count = agg.adjudicated_neutron_alarm_count, " +
-                "adjudicated_gamma_neutron_alarm_count = agg.adjudicated_gamma_neutron_alarm_count, " +
-                "gamma_high_fault_count = agg.gamma_high_fault_count, " +
-                "gamma_low_fault_count = agg.gamma_low_fault_count, " +
-                "neutron_fault_count = agg.neutron_fault_count, " +
-                "neutron_high_fault_count = agg.neutron_high_fault_count, " +
-                "extended_occupancy_fault_count = agg.extended_occupancy_fault_count, " +
-                "tamper_true_count = agg.tamper_true_count, " +
-                "rs350_gamma_alarm_count = agg.rs350_gamma_alarm_count, " +
-                "rs350_neutron_alarm_count = agg.rs350_neutron_alarm_count, " +
-                "alarm_category_gamma_count = agg.alarm_category_gamma_count, " +
-                "alarm_category_neutron_count = agg.alarm_category_neutron_count " +
-                "FROM (" +
-                "SELECT datastream_id, " +
-                "count(*)::bigint AS row_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb)::bigint AS gamma_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb)::bigint AS neutron_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb)::bigint AS gamma_neutron_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb)::bigint AS non_alarm_occupancy_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb)::bigint AS gamma_true_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'neutronAlarm' = 'true'::jsonb)::bigint AS neutron_true_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb))::bigint AS any_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb) AND " + isUnadjudicatedJson + ")::bigint AS unadjudicated_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb) AND " + isAdjudicatedJson + ")::bigint AS adjudicated_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb AND " + isUnadjudicatedJson + ")::bigint AS unadjudicated_gamma_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " + isUnadjudicatedJson + ")::bigint AS unadjudicated_neutron_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " + isUnadjudicatedJson + ")::bigint AS unadjudicated_gamma_neutron_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb AND " + isAdjudicatedJson + ")::bigint AS adjudicated_gamma_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " + isAdjudicatedJson + ")::bigint AS adjudicated_neutron_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " + isAdjudicatedJson + ")::bigint AS adjudicated_gamma_neutron_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma High\"'::jsonb)::bigint AS gamma_high_fault_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma Low\"'::jsonb)::bigint AS gamma_low_fault_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Neutron\"'::jsonb)::bigint AS neutron_fault_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Neutron High\"'::jsonb)::bigint AS neutron_high_fault_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Extended Occupancy\"'::jsonb)::bigint AS extended_occupancy_fault_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'tamperStatus' = 'true'::jsonb)::bigint AS tamper_true_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Gamma%')::bigint AS rs350_gamma_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Neutron%')::bigint AS rs350_neutron_alarm_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmCategoryCode' = '\"Gamma\"'::jsonb)::bigint AS alarm_category_gamma_count, " +
-                "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmCategoryCode' = '\"Neutron\"'::jsonb)::bigint AS alarm_category_neutron_count " +
-                "FROM oscar_archive_activation_row GROUP BY datastream_id" +
-                ") agg WHERE s.generation_id = ? AND s.datastream_id = agg.datastream_id";
+                "gamma_alarm_count = NULLIF(agg.gamma_alarm_count, 0), " +
+                "neutron_alarm_count = NULLIF(agg.neutron_alarm_count, 0), " +
+                "gamma_neutron_alarm_count = NULLIF(agg.gamma_neutron_alarm_count, 0), " +
+                "non_alarm_occupancy_count = NULLIF(agg.non_alarm_occupancy_count, 0), " +
+                "gamma_true_count = NULLIF(agg.gamma_true_count, 0), " +
+                "neutron_true_count = NULLIF(agg.neutron_true_count, 0), " +
+                "any_alarm_count = NULLIF(agg.any_alarm_count, 0), " +
+                "unadjudicated_alarm_count = NULLIF(agg.unadjudicated_alarm_count, 0), " +
+                "adjudicated_alarm_count = NULLIF(agg.adjudicated_alarm_count, 0), " +
+                "unadjudicated_gamma_alarm_count = NULLIF(agg.unadjudicated_gamma_alarm_count, 0), " +
+                "unadjudicated_neutron_alarm_count = NULLIF(agg.unadjudicated_neutron_alarm_count, 0), " +
+                "unadjudicated_gamma_neutron_alarm_count = NULLIF(agg.unadjudicated_gamma_neutron_alarm_count, 0), " +
+                "adjudicated_gamma_alarm_count = NULLIF(agg.adjudicated_gamma_alarm_count, 0), " +
+                "adjudicated_neutron_alarm_count = NULLIF(agg.adjudicated_neutron_alarm_count, 0), " +
+                "adjudicated_gamma_neutron_alarm_count = NULLIF(agg.adjudicated_gamma_neutron_alarm_count, 0), " +
+                "gamma_high_fault_count = NULLIF(agg.gamma_high_fault_count, 0), " +
+                "gamma_low_fault_count = NULLIF(agg.gamma_low_fault_count, 0), " +
+                "neutron_fault_count = NULLIF(agg.neutron_fault_count, 0), " +
+                "neutron_high_fault_count = NULLIF(agg.neutron_high_fault_count, 0), " +
+                "extended_occupancy_fault_count = NULLIF(agg.extended_occupancy_fault_count, 0), " +
+                "tamper_true_count = NULLIF(agg.tamper_true_count, 0), " +
+                "rs350_gamma_alarm_count = NULLIF(agg.rs350_gamma_alarm_count, 0), " +
+                "rs350_neutron_alarm_count = NULLIF(agg.rs350_neutron_alarm_count, 0), " +
+                "alarm_category_gamma_count = NULLIF(agg.alarm_category_gamma_count, 0), " +
+                "alarm_category_neutron_count = NULLIF(agg.alarm_category_neutron_count, 0) " +
+                "FROM (" + ACTIVATION_SUMMARY_AGG_SUBQUERY + ") agg " +
+                "WHERE s.generation_id = ? AND s.datastream_id = agg.datastream_id";
         try (PreparedStatement statement = connection.prepareStatement(updateSummarySql)) {
             statement.setObject(1, generation.id());
             statement.executeUpdate();
@@ -1506,6 +1600,12 @@ public final class ArchiveCatalog {
                 updateOcr.executeBatch();
             }
         }
+        upsertGenerationLocatorsAndLatest(connection, generation);
+    }
+
+    private void upsertGenerationLocatorsAndLatest(
+            Connection connection,
+            ArchiveGeneration generation) throws SQLException {
 
         String insertLocatorSql = "INSERT INTO oscar_event_locator(" +
                 "store_key, id_scope, public_id, observation_id, generation_id, state, updated_at) " +
@@ -2141,6 +2241,18 @@ public final class ArchiveCatalog {
         return liveTuples > 0L && (double) deadTuples >= liveTuples * SCHEMA_REINDEX_MIN_DEAD_RATIO;
     }
 
+    static boolean shouldMaintainOverlayTable(long totalBytes, long deadTuples, long liveTuples) {
+        if (deadTuples >= OVERLAY_REINDEX_MIN_DEAD_TUPLES)
+            return true;
+        if (liveTuples > 0L && (double) deadTuples >= liveTuples * OVERLAY_REINDEX_MIN_DEAD_RATIO)
+            return true;
+        if (totalBytes >= OVERLAY_REINDEX_MIN_BLOAT_BYTES) {
+            long expectedBytes = Math.max(4L * 1024L * 1024L, liveTuples * OVERLAY_REINDEX_BYTES_PER_LIVE_ROW);
+            return totalBytes > expectedBytes;
+        }
+        return false;
+    }
+
     /**
      * Rebuilds B-tree indexes online on the mutable observation parent table
      * and its companion datastream metadata table so multi-year DELETE/UPDATE
@@ -2149,7 +2261,9 @@ public final class ArchiveCatalog {
      * <p>Reindexing {@code oscar_archive_schema} is bloat-gated once the table
      * exceeds {@code 256 MiB} so multi-year append-only {@code RAW_TELEMETRY}
      * archives do not pay multi-gigabyte nightly B-tree rebuilds while still
-     * reclaiming dead pages after large compactions or purges.</p>
+     * reclaiming dead pages after large compactions or purges. Maintenance on
+     * {@code oscar_obs_overlay} is likewise bloat-gated to reclaim dead TOAST
+     * and index pages left by repeated adjudication/EML overlay updates.</p>
      */
     public void reindexMutableTables(String observationTable, String dataStreamTable) {
         String observations = safeIdentifier(observationTable);
@@ -2177,6 +2291,21 @@ public final class ArchiveCatalog {
                 }
                 if (reindexArchiveSchema)
                     statement.execute("REINDEX TABLE CONCURRENTLY oscar_archive_schema");
+                boolean maintainOverlay = false;
+                try (ResultSet overlayStats = statement.executeQuery(
+                        "SELECT COALESCE(pg_total_relation_size('oscar_obs_overlay'::regclass), 0), " +
+                                "COALESCE(s.n_dead_tup, 0), COALESCE(s.n_live_tup, 0) " +
+                                "FROM pg_stat_user_tables s " +
+                                "WHERE s.relid = 'oscar_obs_overlay'::regclass")) {
+                    if (overlayStats.next()) {
+                        maintainOverlay = shouldMaintainOverlayTable(
+                                overlayStats.getLong(1), overlayStats.getLong(2), overlayStats.getLong(3));
+                    }
+                }
+                if (maintainOverlay) {
+                    statement.execute("VACUUM (ANALYZE) oscar_obs_overlay");
+                    statement.execute("REINDEX TABLE CONCURRENTLY oscar_obs_overlay");
+                }
                 statement.execute("REINDEX TABLE CONCURRENTLY " + dataStreams);
             } finally {
                 if (!oldAutoCommit)
@@ -2291,7 +2420,7 @@ public final class ArchiveCatalog {
                     "AND EXISTS (" +
                     "  SELECT 1 FROM oscar_archive_schema s WHERE s.generation_id = g.id AND (" +
                     "    s.schema_json IS NOT NULL " +
-                    "    OR (s.summary_populated AND (" +
+                    "    OR (s.summary_populated AND COALESCE(s.summary_version, 0) < 2 AND (" +
                     "      ((s.unadjudicated_gamma_alarm_count IS NULL " +
                     "        OR s.unadjudicated_neutron_alarm_count IS NULL " +
                     "        OR s.unadjudicated_gamma_neutron_alarm_count IS NULL) " +
@@ -2403,7 +2532,7 @@ public final class ArchiveCatalog {
                                     "  WHEN alarm_category_neutron_count IS NOT NULL THEN alarm_category_neutron_count " +
                                     "  WHEN COALESCE(row_count, 0) = 0 OR schema_sha256 = ANY (?::text[]) THEN 0 " +
                                     "  ELSE NULL END " +
-                                    "WHERE generation_id = ANY (?::uuid[]) AND summary_populated AND (" +
+                                    "WHERE generation_id = ANY (?::uuid[]) AND summary_populated AND COALESCE(summary_version, 0) < 2 AND (" +
                                     "  ((unadjudicated_gamma_alarm_count IS NULL OR unadjudicated_neutron_alarm_count IS NULL OR unadjudicated_gamma_neutron_alarm_count IS NULL) " +
                                     "   AND (COALESCE(any_alarm_count, 0) = 0 OR COALESCE(unadjudicated_alarm_count, 0) = 0 OR COALESCE(adjudicated_alarm_count, 0) = 0 " +
                                     "     OR (COALESCE(neutron_alarm_count, 0) = 0 AND COALESCE(gamma_neutron_alarm_count, 0) = 0) " +
@@ -2476,7 +2605,7 @@ public final class ArchiveCatalog {
                 "FROM oscar_archive_generation g " +
                 "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
                 "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
-                "WHERE s.generation_id=g.id AND (NOT s.summary_populated OR s.unadjudicated_gamma_alarm_count IS NULL)) " +
+                "WHERE s.generation_id=g.id AND (NOT s.summary_populated OR (COALESCE(s.summary_version, 0) < 2 AND s.unadjudicated_gamma_alarm_count IS NULL))) " +
                 "ORDER BY g.window_end DESC, g.id LIMIT ?";
         try (Connection connection = connections.open();
              PreparedStatement statement = connection.prepareStatement(sql)) {
@@ -2507,7 +2636,7 @@ public final class ArchiveCatalog {
                             "adjudicated_gamma_neutron_alarm_count = COALESCE(s.adjudicated_gamma_neutron_alarm_count, 0) " +
                             "FROM oscar_archive_generation g, " + safeIdentifier(storeKey + "_datastreams") + " d, oscar_obs_latest l " +
                             "WHERE g.id = s.generation_id AND g.id = ANY (?::uuid[]) AND g.store_key=? AND g.id_scope=? " +
-                            "AND (NOT s.summary_populated OR s.unadjudicated_gamma_alarm_count IS NULL) " +
+                            "AND (NOT s.summary_populated OR (COALESCE(s.summary_version, 0) < 2 AND s.unadjudicated_gamma_alarm_count IS NULL)) " +
                             "AND d.id = s.datastream_id " +
                             "AND l.store_key = g.store_key AND l.id_scope = g.id_scope AND l.datastream_id = s.datastream_id " +
                             "AND l.phenomenon_time >= g.window_end " +
@@ -2531,7 +2660,7 @@ public final class ArchiveCatalog {
             try (PreparedStatement recheck = connection.prepareStatement(
                     "SELECT DISTINCT generation_id FROM oscar_archive_schema " +
                             "WHERE generation_id = ANY (?::uuid[]) " +
-                            "AND (NOT summary_populated OR unadjudicated_gamma_alarm_count IS NULL)")) {
+                            "AND (NOT summary_populated OR (COALESCE(summary_version, 0) < 2 AND unadjudicated_gamma_alarm_count IS NULL))")) {
                 recheck.setArray(1, genArray);
                 Set<UUID> remaining = new HashSet<>();
                 try (ResultSet rs = recheck.executeQuery()) {
@@ -2606,7 +2735,7 @@ public final class ArchiveCatalog {
                 "FROM oscar_archive_generation g " +
                 "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
                 "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
-                "WHERE s.generation_id=g.id AND s.summary_populated " +
+                "WHERE s.generation_id=g.id AND s.summary_populated AND COALESCE(s.summary_version, 0) < 2 " +
                 "AND (s.neutron_high_fault_count IS NULL OR s.alarm_category_gamma_count IS NULL " +
                 "OR s.alarm_category_neutron_count IS NULL)) " +
                 "ORDER BY g.window_end DESC, g.id LIMIT ?";
@@ -2633,7 +2762,7 @@ public final class ArchiveCatalog {
                             "(neutron_high_fault_count IS NULL) AS need_nh, " +
                             "(alarm_category_gamma_count IS NULL OR alarm_category_neutron_count IS NULL) AS need_ac " +
                             "FROM oscar_archive_schema " +
-                            "WHERE generation_id = ANY (?::uuid[]) AND summary_populated " +
+                            "WHERE generation_id = ANY (?::uuid[]) AND summary_populated AND COALESCE(summary_version, 0) < 2 " +
                             "AND (neutron_high_fault_count IS NULL OR alarm_category_gamma_count IS NULL " +
                             "OR alarm_category_neutron_count IS NULL)")) {
                 streamsStmt.setArray(1, genArray);
@@ -7082,6 +7211,13 @@ public final class ArchiveCatalog {
         }
     }
 
+    private static void setNullablePositiveLong(PreparedStatement stmt, int idx, long value) throws SQLException {
+        if (value <= 0L)
+            stmt.setNull(idx, Types.BIGINT);
+        else
+            stmt.setLong(idx, value);
+    }
+
     private void insertCompactedGenerationSchemas(
             Connection connection,
             ArchiveGeneration generation,
@@ -7092,7 +7228,7 @@ public final class ArchiveCatalog {
                         "VALUES (?, ?::jsonb) ON CONFLICT (schema_sha256) DO NOTHING");
              PreparedStatement schemaStmt = connection.prepareStatement(
                 "INSERT INTO oscar_archive_schema(" +
-                        "generation_id, datastream_id, schema_sha256, summary_populated, row_count, " +
+                        "generation_id, datastream_id, schema_sha256, summary_populated, summary_version, row_count, " +
                         "gamma_alarm_count, neutron_alarm_count, gamma_neutron_alarm_count, non_alarm_occupancy_count, " +
                         "gamma_true_count, neutron_true_count, any_alarm_count, " +
                         "unadjudicated_alarm_count, adjudicated_alarm_count, " +
@@ -7102,7 +7238,7 @@ public final class ArchiveCatalog {
                         "tamper_true_count, rs350_gamma_alarm_count, rs350_neutron_alarm_count, " +
                         "alarm_category_gamma_count, alarm_category_neutron_count, " +
                         "ocr_bloom, ocr_min_norm, ocr_max_norm) " +
-                        "VALUES (?, ?, ?, true, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+                        "VALUES (?, ?, ?, true, " + SCHEMA_SUMMARY_VERSION_COMPACT + "::smallint, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
             Set<String> insertedBlobs = new HashSet<>();
             for (SchemaSnapshot schema : schemas) {
                 StreamSummaryCounters stats = summaries.get(schema.dataStreamId());
@@ -7119,31 +7255,31 @@ public final class ArchiveCatalog {
                 schemaStmt.setLong(p++, schema.dataStreamId());
                 schemaStmt.setString(p++, schemaHash);
                 schemaStmt.setLong(p++, stats.rowCount());
-                schemaStmt.setLong(p++, stats.gammaAlarmCount());
-                schemaStmt.setLong(p++, stats.neutronAlarmCount());
-                schemaStmt.setLong(p++, stats.gammaNeutronAlarmCount());
-                schemaStmt.setLong(p++, stats.nonAlarmOccupancyCount());
-                schemaStmt.setLong(p++, stats.gammaTrueCount());
-                schemaStmt.setLong(p++, stats.neutronTrueCount());
-                schemaStmt.setLong(p++, stats.anyAlarmCount());
-                schemaStmt.setLong(p++, stats.unadjudicatedAlarmCount());
-                schemaStmt.setLong(p++, stats.adjudicatedAlarmCount());
-                schemaStmt.setLong(p++, stats.unadjudicatedGammaAlarmCount());
-                schemaStmt.setLong(p++, stats.unadjudicatedNeutronAlarmCount());
-                schemaStmt.setLong(p++, stats.unadjudicatedGammaNeutronAlarmCount());
-                schemaStmt.setLong(p++, stats.adjudicatedGammaAlarmCount());
-                schemaStmt.setLong(p++, stats.adjudicatedNeutronAlarmCount());
-                schemaStmt.setLong(p++, stats.adjudicatedGammaNeutronAlarmCount());
-                schemaStmt.setLong(p++, stats.gammaHighFaultCount());
-                schemaStmt.setLong(p++, stats.gammaLowFaultCount());
-                schemaStmt.setLong(p++, stats.neutronFaultCount());
-                schemaStmt.setLong(p++, stats.neutronHighFaultCount());
-                schemaStmt.setLong(p++, stats.extendedOccupancyFaultCount());
-                schemaStmt.setLong(p++, stats.tamperTrueCount());
-                schemaStmt.setLong(p++, stats.rs350GammaAlarmCount());
-                schemaStmt.setLong(p++, stats.rs350NeutronAlarmCount());
-                schemaStmt.setLong(p++, stats.alarmCategoryGammaCount());
-                schemaStmt.setLong(p++, stats.alarmCategoryNeutronCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.gammaAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.neutronAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.gammaNeutronAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.nonAlarmOccupancyCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.gammaTrueCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.neutronTrueCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.anyAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.unadjudicatedAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.adjudicatedAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.unadjudicatedGammaAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.unadjudicatedNeutronAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.unadjudicatedGammaNeutronAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.adjudicatedGammaAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.adjudicatedNeutronAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.adjudicatedGammaNeutronAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.gammaHighFaultCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.gammaLowFaultCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.neutronFaultCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.neutronHighFaultCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.extendedOccupancyFaultCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.tamperTrueCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.rs350GammaAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.rs350NeutronAlarmCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.alarmCategoryGammaCount());
+                setNullablePositiveLong(schemaStmt, p++, stats.alarmCategoryNeutronCount());
                 OcrBloomFilter.Snapshot ocr = stats.ocrSnapshot();
                 schemaStmt.setBytes(p++, ocr != null ? ocr.bloomBytes() : OcrBloomFilter.EMPTY_INDEXED_SENTINEL);
                 if (ocr == null || ocr.minNorm() == null)

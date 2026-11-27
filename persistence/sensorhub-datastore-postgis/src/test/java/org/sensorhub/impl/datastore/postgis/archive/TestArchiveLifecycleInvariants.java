@@ -952,27 +952,28 @@ public class TestArchiveLifecycleInvariants {
                     org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.supportsSummaryMaskEvaluation(filter));
         }
 
-        // Nullable v2 counters must NEVER use COALESCE(col, 0) as upperBoundExpr (which would
-        // falsely prune pre-backfill generations as zero-match), and must guard exactReadyExpr on IS NOT NULL.
+        // Nullable v2 counters must NEVER use bare COALESCE(col, 0) as upperBoundExpr on legacy
+        // pre-v2 rows (which would falsely prune pre-backfill generations as zero-match), while
+        // compact summary_version >= 2 rows store zero counters as SQL NULL and evaluate exact 0.
         var nhFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
                 .withCQLFilter("alarmState = 'Fault - Neutron High'").build().getCQLFilter();
         var nhSpec = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.summaryCounterSpec(nhFilter).orElseThrow();
-        assertEquals("COALESCE(s.neutron_high_fault_count, COALESCE(s.row_count, 0))", nhSpec.upperBoundExpr());
+        assertEquals("(CASE WHEN COALESCE(s.summary_version, 0) >= 2 THEN COALESCE(s.neutron_high_fault_count, 0) ELSE COALESCE(s.neutron_high_fault_count, COALESCE(s.row_count, 0)) END)", nhSpec.upperBoundExpr());
         assertEquals("COALESCE(s.neutron_high_fault_count, 0)", nhSpec.exactExpr());
-        assertEquals("(s.summary_populated AND s.neutron_high_fault_count IS NOT NULL)", nhSpec.exactReadyExpr());
+        assertEquals("(s.summary_populated AND (COALESCE(s.summary_version, 0) >= 2 OR s.neutron_high_fault_count IS NOT NULL))", nhSpec.exactReadyExpr());
 
         var faultOrFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
                 .withCQLFilter("alarmState = 'Fault - Neutron High' OR alarmState = 'Fault - Gamma Low' OR alarmState = 'Fault - Gamma High' OR alarmState = 'Fault - Extended Occupancy'")
                 .build().getCQLFilter();
         var faultOrSpec = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.summaryCounterSpec(faultOrFilter).orElseThrow();
-        assertTrue(faultOrSpec.upperBoundExpr().contains("COALESCE(s.neutron_high_fault_count, COALESCE(s.row_count, 0))"));
-        assertEquals("(s.summary_populated AND s.neutron_high_fault_count IS NOT NULL)", faultOrSpec.exactReadyExpr());
+        assertTrue(faultOrSpec.upperBoundExpr().contains("ELSE COALESCE(s.neutron_high_fault_count, COALESCE(s.row_count, 0)) END"));
+        assertEquals("(s.summary_populated AND (COALESCE(s.summary_version, 0) >= 2 OR s.neutron_high_fault_count IS NOT NULL))", faultOrSpec.exactReadyExpr());
 
         var rsGammaFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
                 .withCQLFilter("alarmCategoryCode = 'Gamma'").build().getCQLFilter();
         var rsGammaSpec = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.summaryCounterSpec(rsGammaFilter).orElseThrow();
-        assertEquals("COALESCE(s.alarm_category_gamma_count, COALESCE(s.row_count, 0))", rsGammaSpec.upperBoundExpr());
-        assertEquals("(s.summary_populated AND s.alarm_category_gamma_count IS NOT NULL)", rsGammaSpec.exactReadyExpr());
+        assertEquals("(CASE WHEN COALESCE(s.summary_version, 0) >= 2 THEN COALESCE(s.alarm_category_gamma_count, 0) ELSE COALESCE(s.alarm_category_gamma_count, COALESCE(s.row_count, 0)) END)", rsGammaSpec.upperBoundExpr());
+        assertEquals("(s.summary_populated AND (COALESCE(s.summary_version, 0) >= 2 OR s.alarm_category_gamma_count IS NOT NULL))", rsGammaSpec.exactReadyExpr());
 
         // V2 bitmask evaluation & legacy V1 bitmask backward safety
         int nhMask = org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator.computeSummaryMask(
@@ -1057,5 +1058,56 @@ public class TestArchiveLifecycleInvariants {
                 TieredArchiveConfig.EVENT_QUERY_PROFILES);
         assertFalse(TieredArchiveConfig.EVENT_QUERY_PROFILES.contains(TieredArchiveConfig.PROFILE_RAW_TELEMETRY));
         assertFalse(TieredArchiveConfig.EVENT_QUERY_PROFILES.contains(TieredArchiveConfig.PROFILE_DAILY_TELEMETRY));
+
+        // Bloat-gated oscar_obs_overlay maintenance thresholds
+        assertFalse("Clean small overlay table skips maintenance",
+                ArchiveCatalog.shouldMaintainOverlayTable(2L * 1024L * 1024L, 10L, 400L));
+        assertTrue("Overlay table with >= 250 dead tuples triggers maintenance",
+                ArchiveCatalog.shouldMaintainOverlayTable(2L * 1024L * 1024L, 250L, 2_000L));
+        assertTrue("Overlay table with >= 20% dead tuple ratio triggers maintenance",
+                ArchiveCatalog.shouldMaintainOverlayTable(1024L * 1024L, 20L, 100L));
+        assertTrue("Overlay table with heavy TOAST/index bloat (e.g. 46 MiB for 429 live rows) triggers maintenance even at 0 dead tuples",
+                ArchiveCatalog.shouldMaintainOverlayTable(46L * 1024L * 1024L, 0L, 429L));
+        assertFalse("Proportionally sized large overlay table with low dead tuples skips maintenance",
+                ArchiveCatalog.shouldMaintainOverlayTable(12L * 1024L * 1024L, 0L, 2_000L));
+
+        // Wide uncompacted RAW_TELEMETRY DuckDB scans (> 96 generations) must route to the
+        // background-capped admission tier so interactive queries keep a guaranteed DuckDB permit.
+        assertTrue(DuckDbResourcePolicy.isBackgroundOperation("cold-telemetry-wide-query"));
+        var wideColdFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder().build();
+        var pointIdFilter = new org.sensorhub.api.datastore.obs.ObsFilter.Builder()
+                .withInternalIDs(org.sensorhub.api.common.BigId.fromLong(1, 42L))
+                .build();
+        List<ArchiveGeneration> ninetySixRaw = new ArrayList<>();
+        java.time.Instant baseTime = java.time.Instant.parse("2026-11-01T00:00:00Z");
+        for (int i = 0; i < ParquetArchiveReader.WIDE_RAW_TELEMETRY_GENERATION_THRESHOLD; i++) {
+            ninetySixRaw.add(new ArchiveGeneration(
+                    UUID.randomUUID(), TieredArchiveConfig.PROFILE_RAW_TELEMETRY,
+                    baseTime.plusSeconds(i * 1800L), baseTime.plusSeconds((i + 1) * 1800L),
+                    Path.of("raw-" + i + ".parquet"), "0".repeat(64),
+                    10L, i * 10L + 1L, (i + 1) * 10L, "SEALED", true, null, null));
+        }
+        assertEquals("96 RAW_TELEMETRY generations stay on interactive cold-query tier",
+                "cold-query", ParquetArchiveReader.queryOperationName(wideColdFilter, ninetySixRaw));
+        List<ArchiveGeneration> ninetySevenRaw = new ArrayList<>(ninetySixRaw);
+        ninetySevenRaw.add(new ArchiveGeneration(
+                UUID.randomUUID(), TieredArchiveConfig.PROFILE_RAW_TELEMETRY,
+                baseTime.plusSeconds(96 * 1800L), baseTime.plusSeconds(97 * 1800L),
+                Path.of("raw-96.parquet"), "0".repeat(64),
+                10L, 961L, 970L, "SEALED", true, null, null));
+        assertEquals("97 RAW_TELEMETRY generations route to background-capped cold-telemetry-wide-query tier",
+                "cold-telemetry-wide-query", ParquetArchiveReader.queryOperationName(wideColdFilter, ninetySevenRaw));
+        assertEquals("Point-ID queries remain high-priority point-query regardless of generation count",
+                "point-query", ParquetArchiveReader.queryOperationName(pointIdFilter, ninetySevenRaw));
+        List<ArchiveGeneration> hundredDailyEvents = new ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            hundredDailyEvents.add(new ArchiveGeneration(
+                    UUID.randomUUID(), TieredArchiveConfig.PROFILE_DAILY_EVENTS,
+                    baseTime.plusSeconds(i * 86400L), baseTime.plusSeconds((i + 1) * 86400L),
+                    Path.of("ev-" + i + ".parquet"), "0".repeat(64),
+                    10L, i * 10L + 1L, (i + 1) * 10L, "SEALED", true, null, null));
+        }
+        assertEquals("Compacted event profiles stay on interactive cold-query tier",
+                "cold-query", ParquetArchiveReader.queryOperationName(wideColdFilter, hundredDailyEvents));
     }
 }
