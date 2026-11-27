@@ -960,6 +960,62 @@ public class TestDuckDbResourcePolicy {
         return Long.parseLong(textSetting(statement, name));
     }
 
+    @Test
+    public void backgroundOperationDoesNotConsumeLastPermitWhileArchiveExportIsActive() throws Exception {
+        Path temporaryRoot = temporary.newFolder("export-boundary-isolation").toPath();
+        TieredArchiveConfig config = config(temporaryRoot);
+        config.duckDbMaximumConcurrentSessions = 2;
+        config.duckDbSessionAcquireTimeoutSeconds = 1;
+
+        assertTrue(DuckDbResourcePolicy.isLifecycleOperation("export"));
+        assertTrue(DuckDbResourcePolicy.isLifecycleOperation("export-verify"));
+        assertTrue(DuckDbResourcePolicy.isLifecycleOperation("parity-verify"));
+        assertTrue(DuckDbResourcePolicy.isLifecycleOperation("hot-delete"));
+
+        try (DuckDbResourcePolicy.Session exportSession = DuckDbResourcePolicy.openFileBacked(config, "export")) {
+            // While an export holds permit #1, a background count or wide telemetry scan
+            // must NOT take permit #2, leaving it reserved for interactive queries.
+            SQLTransientException bgBlocked = assertThrows(SQLTransientException.class,
+                    () -> DuckDbResourcePolicy.open(config, "cold-cql-count"));
+            assertTrue(bgBlocked.getMessage().contains("capacity is busy"));
+
+            CountDownLatch bgStarted = new CountDownLatch(1);
+            CountDownLatch bgDone = new CountDownLatch(1);
+            AtomicReference<Throwable> bgError = new AtomicReference<>();
+            TieredArchiveConfig longerWait = config(temporaryRoot);
+            longerWait.duckDbMaximumConcurrentSessions = 2;
+            longerWait.duckDbSessionAcquireTimeoutSeconds = 5;
+
+            Thread bgThread = new Thread(() -> {
+                bgStarted.countDown();
+                try (DuckDbResourcePolicy.Session bg =
+                             DuckDbResourcePolicy.open(longerWait, "cold-telemetry-wide-query")) {
+                    assertTrue(Files.isDirectory(bg.operationDirectory()));
+                } catch (Throwable err) {
+                    bgError.set(err);
+                } finally {
+                    bgDone.countDown();
+                }
+            }, "queued-bg-during-export");
+            bgThread.setDaemon(true);
+            bgThread.start();
+            assertTrue(bgStarted.await(2, TimeUnit.SECONDS));
+            Thread.sleep(75L);
+
+            long queryStart = System.nanoTime();
+            try (DuckDbResourcePolicy.Session interactiveQuery =
+                         DuckDbResourcePolicy.open(longerWait, "cold-query")) {
+                long acquireMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - queryStart);
+                assertTrue("Interactive cold-query must acquire reserved permit immediately during export, took "
+                        + acquireMs + " ms", acquireMs < 750L);
+            }
+            exportSession.close();
+            assertTrue("Background query must proceed immediately after export closes",
+                    bgDone.await(5, TimeUnit.SECONDS));
+            assertNull("Queued background query should succeed after export closes", bgError.get());
+        }
+    }
+
     private static long byteSetting(Statement statement, String name) throws Exception {
         String value = textSetting(statement, name).trim().toUpperCase(java.util.Locale.ROOT);
         long multiplier = 1;

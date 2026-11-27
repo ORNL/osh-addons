@@ -58,6 +58,14 @@ final class DuckDbResourcePolicy {
                 || "summary-backfill".equals(operation);
     }
 
+    static boolean isLifecycleOperation(String operation) {
+        return "archive-export".equals(operation)
+                || "export".equals(operation)
+                || "export-verify".equals(operation)
+                || "parity-verify".equals(operation)
+                || "hot-delete".equals(operation);
+    }
+
     static Session open(TieredArchiveConfig config, String operation) throws Exception {
         return open(config, operation, false);
     }
@@ -535,18 +543,14 @@ final class DuckDbResourcePolicy {
         private volatile LongSupplier nanoClock = System::nanoTime;
         private int active;
         private int activeBackgroundCount;
+        private int activeLifecycleCount;
 
         void setNanoClock(LongSupplier clock) {
             this.nanoClock = clock == null ? System::nanoTime : clock;
         }
 
         private static boolean isHighPriorityWaiter(String operation) {
-            return "point-query".equals(operation)
-                    || "archive-export".equals(operation)
-                    || "parity-verify".equals(operation)
-                    || "hot-delete".equals(operation)
-                    || "export".equals(operation)
-                    || "export-verify".equals(operation);
+            return "point-query".equals(operation) || DuckDbResourcePolicy.isLifecycleOperation(operation);
         }
 
         static boolean isBackgroundCountOperation(String operation) {
@@ -590,7 +594,8 @@ final class DuckDbResourcePolicy {
                 return null;
             int backgroundCap = Math.max(1, globalCap - 1);
             for (AdmissionRequest queued : waiting) {
-                if (!isBackgroundCountOperation(queued.operation()) || activeBackgroundCount < backgroundCap)
+                if (!isBackgroundCountOperation(queued.operation())
+                        || (activeBackgroundCount + activeLifecycleCount) < backgroundCap)
                     return queued;
             }
             return null;
@@ -650,6 +655,7 @@ final class DuckDbResourcePolicy {
         AdmissionPermit acquire(int limit, int timeoutSeconds, String operation) throws Exception {
             long remaining = TimeUnit.SECONDS.toNanos(timeoutSeconds);
             boolean background = isBackgroundCountOperation(operation);
+            boolean lifecycle = DuckDbResourcePolicy.isLifecycleOperation(operation);
             try {
                 lock.lockInterruptibly();
             } catch (InterruptedException interrupted) {
@@ -677,8 +683,10 @@ final class DuckDbResourcePolicy {
                 active++;
                 if (background)
                     activeBackgroundCount++;
+                if (lifecycle)
+                    activeLifecycleCount++;
                 capacityChanged.signalAll();
-                return new AdmissionPermit(this, limit, background);
+                return new AdmissionPermit(this, limit, background, lifecycle);
             } catch (InterruptedException interrupted) {
                 waiting.remove(request);
                 removeLimit(limit);
@@ -692,14 +700,18 @@ final class DuckDbResourcePolicy {
             }
         }
 
-        private void release(int limit, boolean background) {
+        private void release(int limit, boolean background, boolean lifecycle) {
             lock.lock();
             try {
-                if (active <= 0 || (background && activeBackgroundCount <= 0))
+                if (active <= 0
+                        || (background && activeBackgroundCount <= 0)
+                        || (lifecycle && activeLifecycleCount <= 0))
                     throw new IllegalStateException("DuckDB admission permit released without an active session");
                 active--;
                 if (background)
                     activeBackgroundCount--;
+                if (lifecycle)
+                    activeLifecycleCount--;
                 removeLimit(limit);
                 capacityChanged.signalAll();
             } finally {
@@ -744,12 +756,14 @@ final class DuckDbResourcePolicy {
         private final AdmissionController controller;
         private final int limit;
         private final boolean background;
+        private final boolean lifecycle;
         private boolean closed;
 
-        private AdmissionPermit(AdmissionController controller, int limit, boolean background) {
+        private AdmissionPermit(AdmissionController controller, int limit, boolean background, boolean lifecycle) {
             this.controller = controller;
             this.limit = limit;
             this.background = background;
+            this.lifecycle = lifecycle;
         }
 
         boolean shouldYield() {
@@ -773,7 +787,7 @@ final class DuckDbResourcePolicy {
             if (closed)
                 return;
             closed = true;
-            controller.release(limit, background);
+            controller.release(limit, background, lifecycle);
         }
     }
 }

@@ -67,6 +67,7 @@ public final class ArchiveCatalog {
     static final double OVERLAY_REINDEX_MIN_DEAD_RATIO = 0.20d;
     static final long OVERLAY_REINDEX_MIN_BLOAT_BYTES = 8L * 1024L * 1024L;
     static final long OVERLAY_REINDEX_BYTES_PER_LIVE_ROW = 8_192L;
+    static final int OVERLAY_POST_COMPACTION_VACUUM_MIN_DELETED = 50;
     private static final long MIGRATION_LOCK = 0x4f5343415253544fL;
 
     private final SqlConnectionProvider connections;
@@ -763,6 +764,8 @@ public final class ArchiveCatalog {
                         " FROM oscar_deletion_plan plan WHERE ledger.plan_id=plan.id " +
                         "AND ledger.store_key='legacy' AND ledger.id_scope=-1 " +
                         "AND plan.store_key='" + storeKey + "' AND plan.id_scope=" + idScope);
+
+                ensureAutovacuumReloptions(statement);
 
                 try (PreparedStatement insert = connection.prepareStatement(
                         "INSERT INTO oscar_storage_schema_version(version, checksum) VALUES (?, ?) ON CONFLICT (version) DO NOTHING")) {
@@ -2289,13 +2292,18 @@ public final class ArchiveCatalog {
                                 stats.getLong(1), stats.getLong(2), stats.getLong(3));
                     }
                 }
-                if (reindexArchiveSchema)
+                if (reindexArchiveSchema) {
+                    statement.execute("VACUUM (ANALYZE) oscar_archive_schema");
                     statement.execute("REINDEX TABLE CONCURRENTLY oscar_archive_schema");
+                }
                 boolean maintainOverlay = false;
                 try (ResultSet overlayStats = statement.executeQuery(
                         "SELECT COALESCE(pg_total_relation_size('oscar_obs_overlay'::regclass), 0), " +
-                                "COALESCE(s.n_dead_tup, 0), COALESCE(s.n_live_tup, 0) " +
+                                "COALESCE(s.n_dead_tup, 0) + COALESCE(t.n_dead_tup, 0), " +
+                                "COALESCE(s.n_live_tup, 0) " +
                                 "FROM pg_stat_user_tables s " +
+                                "JOIN pg_class c ON c.oid = s.relid " +
+                                "LEFT JOIN pg_stat_all_tables t ON t.relid = c.reltoastrelid " +
                                 "WHERE s.relid = 'oscar_obs_overlay'::regclass")) {
                     if (overlayStats.next()) {
                         maintainOverlay = shouldMaintainOverlayTable(
@@ -7168,12 +7176,16 @@ public final class ArchiveCatalog {
                     }
 
                     connection.commit();
+                    if (overlaysToDelete.size() >= OVERLAY_POST_COMPACTION_VACUUM_MIN_DELETED) {
+                        vacuumOverlayBestEffort(connection);
+                    }
                     return true;
                 } finally {
                     srcArray.free();
                 }
             } catch (Exception e) {
-                connection.rollback();
+                if (!connection.getAutoCommit())
+                    connection.rollback();
                 throw e;
             } finally {
                 connection.setAutoCommit(oldAutoCommit);
@@ -7182,6 +7194,54 @@ public final class ArchiveCatalog {
             throw e;
         } catch (Exception e) {
             throw new IllegalStateException("Cannot atomically swap compacted archive generations", e);
+        }
+    }
+
+    private static void ensureAutovacuumReloptions(Statement statement) throws SQLException {
+        ensureTableReloptions(statement, "oscar_archive_schema",
+                "autovacuum_vacuum_scale_factor=0.02",
+                "autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02");
+        ensureTableReloptions(statement, "oscar_obs_overlay",
+                "autovacuum_vacuum_scale_factor=0.05",
+                "autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.05, " +
+                        "toast.autovacuum_vacuum_scale_factor = 0.05, toast.autovacuum_vacuum_threshold = 50");
+        ensureTableReloptions(statement, "oscar_obs_stage_owner",
+                "autovacuum_vacuum_scale_factor=0.02",
+                "autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02");
+    }
+
+    private static void ensureTableReloptions(
+            Statement statement, String tableName, String expectedMarker, String setClause) throws SQLException {
+        String safeTable = safeIdentifier(tableName);
+        boolean exists = false;
+        boolean configured = false;
+        try (ResultSet rs = statement.executeQuery(
+                "SELECT COALESCE(array_to_string(c.reloptions, ','), '') || ',' || " +
+                        "COALESCE(array_to_string(tc.reloptions, ','), '') " +
+                        "FROM pg_class c " +
+                        "LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid " +
+                        "WHERE c.oid = to_regclass('" + safeTable + "')")) {
+            if (rs.next()) {
+                exists = true;
+                String current = rs.getString(1);
+                if (current != null && current.contains(expectedMarker)) {
+                    configured = !setClause.contains("toast.") || current.contains("autovacuum_vacuum_threshold=50");
+                }
+            }
+        }
+        if (exists && !configured) {
+            statement.execute("ALTER TABLE " + safeTable + " SET (" + setClause + ")");
+        }
+    }
+
+    private static void vacuumOverlayBestEffort(Connection connection) {
+        try {
+            connection.setAutoCommit(true);
+            try (Statement vacuum = connection.createStatement()) {
+                vacuum.execute("VACUUM (ANALYZE) oscar_obs_overlay");
+            }
+        } catch (SQLException ignored) {
+            // Best-effort post-compaction cleanup; nightly reindexMutableTables provides backstop.
         }
     }
 
