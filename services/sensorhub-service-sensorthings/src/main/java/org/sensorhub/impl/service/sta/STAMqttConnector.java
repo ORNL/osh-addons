@@ -15,7 +15,6 @@ Copyright (C) 2021 Sensia Software LLC. All Rights Reserved.
 package org.sensorhub.impl.service.sta;
 
 import java.nio.ByteBuffer;
-import java.security.AccessControlException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Flow.Subscriber;
@@ -214,7 +213,7 @@ public class STAMqttConnector implements IMqttHandler
         if (!resp.isSuccessful())
         {
             if (resp.getCode() == 403 || service.getSecurityHandler().getPermissionError() != null)
-                throw new AccessControlException("");
+                throw new SecurityException("");
             else if (resp.getCode() == 404)
                 throw new InvalidTopicException(resp.getMessage());
             else if (resp.getCode() == 400)

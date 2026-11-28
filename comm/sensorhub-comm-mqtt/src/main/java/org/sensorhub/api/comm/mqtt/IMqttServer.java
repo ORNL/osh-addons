@@ -49,7 +49,7 @@ public interface IMqttServer
          * @param correlData Correlation data or null if not present
          * @throws InvalidTopicException if the topic is invalid
          * @throws InvalidPayloadException if the payload is invalid
-         * @throws AccessControlException if the user is not allowed to publish to the topic
+         * @throws SecurityException if the user is not allowed to publish to the topic
          * @throws MqttException for all other errors
          */
         void onPublish(String userID, String topic, ByteBuffer payload, ByteBuffer correlData) throws MqttException;
@@ -61,7 +61,7 @@ public interface IMqttServer
          * @param topic Topic the user wants to subscribe to
          * @param server MQTT server where subscribe request was received
          * @throws InvalidTopicException if the topic is invalid
-         * @throws AccessControlException if the user is not allowed to subscribe to the topic
+         * @throws SecurityException if the user is not allowed to subscribe to the topic
          * @throws MqttException for all other errors
          */
         void onSubscribe(String userID, String topic, IMqttServer server) throws MqttException;
@@ -73,7 +73,7 @@ public interface IMqttServer
          * @param topic Topic the user wants to unsubscribe from
          * @param server MQTT server where unsubscribe request was received
          * @throws InvalidTopicException if the topic is invalid
-         * @throws AccessControlException if the user is not allowed to unsubscribe from the topic
+         * @throws SecurityException if the user is not allowed to unsubscribe from the topic
          * @throws MqttException for all other errors
          */
         void onUnsubscribe(String userID, String topic, IMqttServer server) throws MqttException;

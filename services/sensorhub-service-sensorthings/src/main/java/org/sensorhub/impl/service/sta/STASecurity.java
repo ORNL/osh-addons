@@ -14,7 +14,6 @@ Copyright (C) 2012-2016 Sensia Software LLC. All Rights Reserved.
 
 package org.sensorhub.impl.service.sta;
 
-import java.security.AccessControlException;
 import org.sensorhub.api.security.IPermission;
 import org.sensorhub.impl.module.ModuleSecurity;
 import org.sensorhub.impl.security.ItemPermission;
@@ -138,7 +137,7 @@ public class STASecurity extends ModuleSecurity
             authError.set(null);
             super.checkPermission(perm);
         }
-        catch (AccessControlException e)
+        catch (SecurityException e)
         {
             authError.set(e);
             throw e;

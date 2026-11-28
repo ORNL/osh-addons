@@ -1,5 +1,5 @@
 plugins {
-  id "biz.aQute.bnd" version "7.0.0" apply false
+  id "biz.aQute.bnd" version "7.5.0" apply false
 }
 
 apply from: gradle.oshCoreDir + '/common.gradle'
@@ -66,15 +66,10 @@ task osgiIndex(type: aQute.bnd.gradle.Index) {
 
 task osgiIndexOnline(type: Copy) {
   dependsOn osgiIndex
-  from "$buildDir/osgi/index.xml"
-  into "$buildDir/osgi"
+  from layout.buildDirectory.file('osgi/index.xml')
+  into layout.buildDirectory.dir('osgi')
   rename 'index.xml','index_online.xml'
   filter { line -> line.replaceAll('value=".*/build/libs/', 'value="') }
-  doLast {
-    exec {
-      commandLine 'kubectl', 'cp', "$buildDir/osgi/index_online.xml", 'osh-addons-69497bf779-4q65x:/opt/osh-node/data/addons/index.xml'
-    }
-  }
 }
 
 apply from: gradle.oshCoreDir + '/release.gradle'

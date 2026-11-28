@@ -14,7 +14,6 @@ Copyright (C) 2019 Sensia Software LLC. All Rights Reserved.
 
 package org.sensorhub.impl.service.sta;
 
-import java.security.AccessControlException;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
@@ -296,7 +295,7 @@ public class SensorEntityHandler implements IResourceHandler<Sensor>
         
         // if subscribe failed, it means topic was not available
         if (!ok)
-            throw new AccessControlException("Resource unavailable: " + path);
+            throw new SecurityException("Resource unavailable: " + path);
     }
 
 

@@ -14,7 +14,6 @@ Copyright (C) 2021 Sensia Software LLC. All Rights Reserved.
 
 package org.sensorhub.impl.service.hivemq;
 
-import java.security.AccessControlException;
 import java.time.Duration;
 import org.sensorhub.api.comm.mqtt.InvalidTopicException;
 import org.sensorhub.api.security.ISecurityManager;
@@ -74,7 +73,7 @@ public class OshSubscribeHandler implements SubscribeInboundInterceptor, Subscri
                 else
                     subscribeOut.failAuthorization(SubackReasonCode.TOPIC_FILTER_INVALID);
             }
-            catch (AccessControlException e)
+            catch (SecurityException e)
             {
                 log.debug("Not authorized: {}", e.getMessage());
                 subscribeOut.failAuthorization(SubackReasonCode.NOT_AUTHORIZED);

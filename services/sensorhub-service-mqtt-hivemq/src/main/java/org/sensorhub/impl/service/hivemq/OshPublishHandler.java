@@ -14,7 +14,6 @@ Copyright (C) 2021 Sensia Software LLC. All Rights Reserved.
 
 package org.sensorhub.impl.service.hivemq;
 
-import java.security.AccessControlException;
 import java.time.Duration;
 import org.sensorhub.api.comm.mqtt.ImplSpecificException;
 import org.sensorhub.api.comm.mqtt.InvalidPayloadException;
@@ -88,7 +87,7 @@ public class OshPublishHandler implements PublishInboundInterceptor
                     reasonCode = AckReasonCode.TOPIC_NAME_INVALID;
                 }
             }
-            catch (AccessControlException e)
+            catch (SecurityException e)
             {
                 log.debug("Not authorized: {}", e.getMessage());
                 reasonCode = AckReasonCode.NOT_AUTHORIZED;
