@@ -5788,7 +5788,9 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertTrue("Expected deep offset cluster skip to decode <= 40 archived payloads, got " + fastDecoded,
                 fastDecoded <= 40L);
 
-        // Verify LazyArchivedObsData on direct .skip(210) also avoids decoding skipped payloads!
+        // Verify LazyArchivedObsData on direct .skip(210) avoids decoding any skipped cold payloads
+        // (rows 210..225 fall in grace-retained window w=1 where hot PG wins over cold, so 0 archived
+        // payloads are decoded even though cold windows w=4 and w=2 were traversed and skipped!).
         long skipDecodeBefore = tiered.getDecodedArchivedResultCountForTesting();
         List<Map.Entry<BigId, IObsData>> baselinePage;
         try (var s = tiered.selectEntries(deepPageFilter).skip(210)) {
@@ -5797,8 +5799,45 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         for (var e : baselinePage)
             assertNotNull(e.getValue().getResult());
         long skipDecoded = tiered.getDecodedArchivedResultCountForTesting() - skipDecodeBefore;
-        assertEquals("LazyArchivedObsData should decode only the 16 post-skip payloads", 16L, skipDecoded);
+        assertEquals("Grace-retained window w=1 should decode 0 archived payloads across skipped cold windows",
+                0L, skipDecoded);
         assertEntriesEqual(baselinePage, fastPage, true);
+
+        // Verify a pure-cold deep offset (offset 260 -> window w=0, purged from PostgreSQL) decodes
+        // ONLY the 16 post-skip LazyArchivedObsData payloads without decoding skipped cold windows w=4 and w=2.
+        ObsFilter coldOnlyPageFilter = new ObsFilter.Builder()
+                .withDataStreams(streamA, streamB)
+                .withPhenomenonTime()
+                .withRange(base.minusSeconds(60), liveBase.plus(1, ChronoUnit.HOURS))
+                .descendingOrder(true)
+                .done()
+                .withCQLFilter(gammaCql)
+                .withLimit(260 + 16)
+                .build();
+        long coldFastBefore = tiered.getDecodedArchivedResultCountForTesting();
+        List<Map.Entry<BigId, IObsData>> coldFastPage;
+        try (var s = tiered.selectEntries(coldOnlyPageFilter, null, 260)) {
+            coldFastPage = s.toList();
+        }
+        assertEquals(16, coldFastPage.size());
+        for (var e : coldFastPage)
+            assertNotNull(e.getValue().getResult());
+        long coldFastDecoded = tiered.getDecodedArchivedResultCountForTesting() - coldFastBefore;
+        assertTrue("Expected cold-only deep offset skip to decode <= 40 archived payloads, got " + coldFastDecoded,
+                coldFastDecoded <= 40L);
+
+        long coldSkipBefore = tiered.getDecodedArchivedResultCountForTesting();
+        List<Map.Entry<BigId, IObsData>> coldBaselinePage;
+        try (var s = tiered.selectEntries(coldOnlyPageFilter).skip(260)) {
+            coldBaselinePage = s.toList();
+        }
+        assertEquals(16, coldBaselinePage.size());
+        for (var e : coldBaselinePage)
+            assertNotNull(e.getValue().getResult());
+        long coldSkipDecoded = tiered.getDecodedArchivedResultCountForTesting() - coldSkipBefore;
+        assertEquals("LazyArchivedObsData should decode only the 16 post-skip cold payloads in w=0",
+                16L, coldSkipDecoded);
+        assertEntriesEqual(coldBaselinePage, coldFastPage, true);
 
         // Now apply mutations across archived windows: tombstone one alarm, flip one alarm to false via overlay,
         // and update another alarm's value/timestamp via overlay!

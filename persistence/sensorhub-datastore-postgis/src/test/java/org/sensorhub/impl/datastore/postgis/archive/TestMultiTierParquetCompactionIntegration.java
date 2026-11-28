@@ -2139,6 +2139,266 @@ public class TestMultiTierParquetCompactionIntegration {
         assertEquals(2L, store.countMatchingEntries(new ObsFilter.Builder().withDataStreams(gammaStream).build()));
     }
 
+    @Test
+    public void streamingExportSinglePassCountersSpatialEnvelopesAndBboxPruningSurviveCompactionAndOverlays()
+            throws Exception {
+        Path archiveRoot = temporary.newFolder("spatial-archive").toPath();
+        Path spillRoot = archiveRoot.resolveSibling("spatial-spill");
+        String table = uniqueTableName("spatial_stream");
+
+        TieredArchiveConfig config = parquetPrimaryConfig(archiveRoot, spillRoot,
+                List.of("occupancy", "alarm", "location", "gammaCounts"));
+        config.compactionUnlinkGraceMinutes = 15;
+        OscarTieredObsStore store = openStore(table, config);
+
+        BigId fixedOccStream = addEventOccupancyStream(store, 501L, "occupancy");
+        BigId mobileOakRidgeStream = addMobileLocationStream(store, 502L, "alarm");
+        BigId mobilePacificStream = addMobileLocationStream(store, 503L, "alarm");
+        BigId mobileTrackTelStream = addMobileLocationStream(store, 505L, "location");
+        BigId fixedTelStream = addTelemetryStream(store, 504L, "gammaCounts");
+
+        Instant dayD = Instant.parse("2026-09-10T00:00:00Z");
+        Instant now = Instant.parse("2026-09-13T12:00:00Z");
+
+        // Hour 0: Oak Ridge mobile detector patrol + fixed portal occupancy + telemetry (1 Hz location + fixed gammaCounts)
+        Instant h0 = dayD;
+        store.add(eventOccupancyObs(fixedOccStream, h0.plusSeconds(10), h0.plusSeconds(10),
+                "fixed-occ-1", true, false, 300, 1, 0, 0));
+        store.add(mobileLocationObs(mobileOakRidgeStream, h0.plusSeconds(20),
+                35.9200, -84.3300, 260.0, true, false));
+        BigId oakRidgeLatestId = store.add(mobileLocationObs(mobileOakRidgeStream, h0.plusSeconds(40),
+                35.9450, -84.2950, 272.5, false, false));
+        store.add(mobileLocationObs(mobileTrackTelStream, h0.plusSeconds(45),
+                48.8566, 2.3522, 35.0, false, false));
+        store.add(telemetryObs(fixedTelStream, h0.plusSeconds(50), h0.plusSeconds(50), 115.0, 1.0));
+        commitStore(store);
+
+        ArchiveGeneration h0Events = store.archiveWindow(
+                h0, h0.plus(1, ChronoUnit.HOURS), TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
+        ArchiveGeneration h0Tel = store.archiveWindow(
+                h0, h0.plus(1, ChronoUnit.HOURS), TieredArchiveConfig.PROFILE_RAW_TELEMETRY).orElseThrow();
+
+        // Hour 1: Antimeridian / Pacific Rim mobile patrol crossing +/-180 deg longitude
+        Instant h1 = dayD.plus(1, ChronoUnit.HOURS);
+        store.add(mobileLocationObs(mobilePacificStream, h1.plusSeconds(10),
+                -18.1416, 178.4419, 14.0, false, true));
+        BigId pacificLatestId = store.add(mobileLocationObs(mobilePacificStream, h1.plusSeconds(30),
+                -17.9000, -179.2500, 22.0, false, false));
+        commitStore(store);
+
+        ArchiveGeneration h1Events = store.archiveWindow(
+                h1, h1.plus(1, ChronoUnit.HOURS), TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
+
+        // 1. Verify exact spatial bounds & compact sparse-zero summary counters on oscar_archive_schema
+        try (Connection conn = openPg();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT datastream_id, summary_version, row_count, gamma_alarm_count, neutron_alarm_count, " +
+                             "min_lat, max_lat, min_lon, max_lon " +
+                             "FROM oscar_archive_schema WHERE generation_id = ?")) {
+            stmt.setObject(1, h0Events.id());
+            Map<Long, double[]> boundsByDs = new HashMap<>();
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    long dsId = rs.getLong(1);
+                    assertEquals(2, rs.getShort(2));
+                    if (dsId == fixedOccStream.getIdAsLong()) {
+                        assertEquals(1L, rs.getLong(3));
+                        assertEquals(1L, rs.getLong(4));
+                        assertNull(rs.getObject(5)); // sparse zero -> NULL
+                        assertNull(rs.getObject(6)); // fixed portal has NULL spatial bounds
+                    } else if (dsId == mobileOakRidgeStream.getIdAsLong()) {
+                        assertEquals(2L, rs.getLong(3));
+                        assertEquals(1L, rs.getLong(4));
+                        boundsByDs.put(dsId, new double[]{
+                                rs.getDouble(6), rs.getDouble(7), rs.getDouble(8), rs.getDouble(9)});
+                    }
+                }
+            }
+            double[] oakBounds = boundsByDs.get(mobileOakRidgeStream.getIdAsLong());
+            assertNotNull(oakBounds);
+            assertEquals(35.9200, oakBounds[0], 1e-6);
+            assertEquals(35.9450, oakBounds[1], 1e-6);
+            assertEquals(-84.3300, oakBounds[2], 1e-6);
+            assertEquals(-84.2950, oakBounds[3], 1e-6);
+        }
+
+        // Fixed telemetry stream must have NULL spatial bounds while 1 Hz mobile location telemetry carries Paris bounds
+        try (Connection conn = openPg();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT datastream_id, min_lat, max_lat, min_lon, max_lon FROM oscar_archive_schema WHERE generation_id = ?")) {
+            stmt.setObject(1, h0Tel.id());
+            int telRows = 0;
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    telRows++;
+                    long dsId = rs.getLong(1);
+                    if (dsId == fixedTelStream.getIdAsLong()) {
+                        assertNull(rs.getObject(2));
+                        assertNull(rs.getObject(3));
+                        assertNull(rs.getObject(4));
+                        assertNull(rs.getObject(5));
+                    } else if (dsId == mobileTrackTelStream.getIdAsLong()) {
+                        assertEquals(48.8566, rs.getDouble(2), 1e-6);
+                        assertEquals(48.8566, rs.getDouble(3), 1e-6);
+                        assertEquals(2.3522, rs.getDouble(4), 1e-6);
+                        assertEquals(2.3522, rs.getDouble(5), 1e-6);
+                    }
+                }
+            }
+            assertEquals(2, telRows);
+        }
+
+        // 2. Verify catalog-only bbox pruning (0 DuckDB opens!)
+        ArchiveCatalog catalog = store.getArchiveCatalog();
+        List<ArchiveGeneration> oakHits = catalog.listGenerationsIntersectingBbox(
+                null, dayD, dayD.plus(1, ChronoUnit.DAYS), 35.90, 35.96, -84.35, -84.25);
+        assertEquals(List.of(h0Events.id()), oakHits.stream().map(ArchiveGeneration::id).toList());
+
+        // Paris bbox matches RAW_TELEMETRY mobile track generation directly
+        List<ArchiveGeneration> parisHits = catalog.listGenerationsIntersectingBbox(
+                null, dayD, dayD.plus(1, ChronoUnit.DAYS), 48.80, 48.90, 2.30, 2.40);
+        assertEquals(List.of(h0Tel.id()), parisHits.stream().map(ArchiveGeneration::id).toList());
+
+        // Non-intersecting Tokyo box returns empty
+        assertTrue(catalog.listGenerationsIntersectingBbox(
+                null, dayD, dayD.plus(1, ChronoUnit.DAYS), 35.60, 35.80, 139.60, 139.85).isEmpty());
+
+        // Fixed non-spatial stream is pruned even inside matching Oak Ridge bbox
+        assertTrue(catalog.listGenerationsIntersectingBbox(
+                Set.of(fixedOccStream.getIdAsLong(), fixedTelStream.getIdAsLong()),
+                dayD, dayD.plus(1, ChronoUnit.DAYS), 35.90, 35.96, -84.35, -84.25).isEmpty());
+
+        // Antimeridian-crossing bbox (175 E to 175 W) matches Pacific generation and prunes Oak Ridge
+        List<ArchiveGeneration> pacificHits = catalog.listGenerationsIntersectingBbox(
+                null, dayD, dayD.plus(1, ChronoUnit.DAYS), -20.0, -15.0, 175.0, -175.0);
+        assertEquals(List.of(h1Events.id()), pacificHits.stream().map(ArchiveGeneration::id).toList());
+
+        // 3. Verify oscar_obs_latest spatial positions + overlay update + compaction propagation
+        List<ArchiveCatalog.LatestSpatialPosition> allLatest =
+                catalog.selectLatestSpatialPositions(null, null, null, null, null);
+        assertEquals(3, allLatest.size());
+        Map<Long, ArchiveCatalog.LatestSpatialPosition> latestByDs = new HashMap<>();
+        for (ArchiveCatalog.LatestSpatialPosition p : allLatest) {
+            latestByDs.put(p.dataStreamId(), p);
+        }
+        ArchiveCatalog.LatestSpatialPosition oakPos = latestByDs.get(mobileOakRidgeStream.getIdAsLong());
+        assertNotNull(oakPos);
+        assertEquals(oakRidgeLatestId.getIdAsLong(), oakPos.observationId());
+        assertEquals(35.9450, oakPos.lat(), 1e-6);
+        assertEquals(-84.2950, oakPos.lon(), 1e-6);
+        assertEquals(272.5, oakPos.alt(), 1e-6);
+
+        // Antimeridian bbox filter on selectLatestSpatialPositions returns only Pacific unit
+        List<ArchiveCatalog.LatestSpatialPosition> pacLatest =
+                catalog.selectLatestSpatialPositions(null, -20.0, -15.0, 175.0, -175.0);
+        assertEquals(1, pacLatest.size());
+        assertEquals(mobilePacificStream.getIdAsLong(), pacLatest.get(0).dataStreamId());
+        assertEquals(pacificLatestId.getIdAsLong(), pacLatest.get(0).observationId());
+
+        // Overlay correction on latest archived mobile observation updates latest_lat/lon/alt immediately
+        store.put(oakRidgeLatestId, mobileLocationObs(mobileOakRidgeStream, h0.plusSeconds(40),
+                35.9511, -84.2888, 281.0, false, false));
+        commitStore(store);
+        List<ArchiveCatalog.LatestSpatialPosition> afterOverlay = catalog.selectLatestSpatialPositions(
+                Set.of(mobileOakRidgeStream.getIdAsLong()), null, null, null, null);
+        assertEquals(1, afterOverlay.size());
+        assertEquals(35.9511, afterOverlay.get(0).lat(), 1e-6);
+        assertEquals(-84.2888, afterOverlay.get(0).lon(), 1e-6);
+        assertEquals(281.0, afterOverlay.get(0).alt(), 1e-6);
+
+        // 4. Compact RAW_EVENTS -> DAILY_EVENTS and confirm spatial envelopes & latest positions survive intact
+        store.maintainArchiveLifecycle();
+        try (Connection conn = openPg();
+             PreparedStatement backdateGen = conn.prepareStatement(
+                     "UPDATE oscar_archive_generation SET activated_at = ? WHERE store_key = ?");
+             PreparedStatement backdateOv = conn.prepareStatement(
+                     "UPDATE oscar_obs_overlay SET updated_at = ? WHERE store_key = ?")) {
+            UtcJdbcTime.setInstant(backdateGen, 1, now.minus(3, ChronoUnit.HOURS));
+            backdateGen.setString(2, table);
+            backdateGen.executeUpdate();
+            UtcJdbcTime.setInstant(backdateOv, 1, now.minus(3, ChronoUnit.HOURS));
+            backdateOv.setString(2, table);
+            backdateOv.executeUpdate();
+        }
+        ArchiveCompactionManager.CompactionCycleSummary compactSummary = store.runCompactionCycle(now);
+        assertEquals(1, compactSummary.daysCompacted());
+        List<ArchiveGeneration> postCompactOak = catalog.listGenerationsIntersectingBbox(
+                null, dayD, dayD.plus(1, ChronoUnit.DAYS), 35.90, 35.96, -84.35, -84.25);
+        assertEquals(1, postCompactOak.size());
+        assertEquals(TieredArchiveConfig.PROFILE_DAILY_EVENTS, postCompactOak.get(0).profile());
+
+        // Also confirm the compacted DAILY_EVENTS bounds reflect the folded overlay coordinate (35.9511, -84.2888)!
+        try (Connection conn = openPg();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT min_lat, max_lat, min_lon, max_lon FROM oscar_archive_schema " +
+                             "WHERE generation_id = ? AND datastream_id = ?")) {
+            stmt.setObject(1, postCompactOak.get(0).id());
+            stmt.setLong(2, mobileOakRidgeStream.getIdAsLong());
+            try (ResultSet rs = stmt.executeQuery()) {
+                assertTrue(rs.next());
+                assertEquals(35.9200, rs.getDouble(1), 1e-6);
+                assertEquals(35.9511, rs.getDouble(2), 1e-6);
+                assertEquals(-84.3300, rs.getDouble(3), 1e-6);
+                assertEquals(-84.2888, rs.getDouble(4), 1e-6);
+            }
+        }
+
+        List<ArchiveGeneration> postCompactPac = catalog.listGenerationsIntersectingBbox(
+                null, dayD, dayD.plus(1, ChronoUnit.DAYS), -20.0, -15.0, 175.0, -175.0);
+        assertEquals(1, postCompactPac.size());
+        assertEquals(TieredArchiveConfig.PROFILE_DAILY_EVENTS, postCompactPac.get(0).profile());
+
+        // Tombstoning Pacific latest observation removes it from selectLatestSpatialPositions
+        store.remove(pacificLatestId);
+        commitStore(store);
+        assertTrue(catalog.selectLatestSpatialPositions(
+                Set.of(mobilePacificStream.getIdAsLong()), null, null, null, null).isEmpty());
+    }
+
+    private static BigId addMobileLocationStream(OscarTieredObsStore store, long sysNum, String outputName)
+            throws Exception {
+        SWEHelper swe = new SWEHelper();
+        DataRecord rec = swe.createRecord().name(outputName)
+                .addField("latitude", swe.createQuantity().build())
+                .addField("longitude", swe.createQuantity().build())
+                .addField("altitude", swe.createQuantity().build())
+                .addField("gammaAlarm", swe.createBoolean().build())
+                .addField("neutronAlarm", swe.createBoolean().build())
+                .build();
+        DataStreamInfo info = new DataStreamInfo.Builder()
+                .withName(outputName)
+                .withSystem(new FeatureId(BigId.fromLong(ID_SCOPE, sysNum), "urn:oscar:test:mobile:" + sysNum))
+                .withRecordDescription(rec)
+                .withRecordEncoding(new TextEncodingImpl())
+                .build();
+        return store.getDataStreams().add(info).getInternalID();
+    }
+
+    private static IObsData mobileLocationObs(
+            BigId stream, Instant time, double lat, double lon, double alt,
+            boolean gammaAlarm, boolean neutronAlarm) {
+        SWEHelper swe = new SWEHelper();
+        DataRecord rec = swe.createRecord().name("mobileLocation")
+                .addField("latitude", swe.createQuantity().build())
+                .addField("longitude", swe.createQuantity().build())
+                .addField("altitude", swe.createQuantity().build())
+                .addField("gammaAlarm", swe.createBoolean().build())
+                .addField("neutronAlarm", swe.createBoolean().build())
+                .build();
+        DataBlock block = rec.createDataBlock();
+        block.setDoubleValue(0, lat);
+        block.setDoubleValue(1, lon);
+        block.setDoubleValue(2, alt);
+        block.setBooleanValue(3, gammaAlarm);
+        block.setBooleanValue(4, neutronAlarm);
+        return new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(time)
+                .withResultTime(time)
+                .withResult(block)
+                .build();
+    }
+
     private static BigId addTamperStream(OscarTieredObsStore store, long sysNum) throws Exception {
         SWEHelper swe = new SWEHelper();
         DataRecord rec = swe.createRecord().name("tamper")

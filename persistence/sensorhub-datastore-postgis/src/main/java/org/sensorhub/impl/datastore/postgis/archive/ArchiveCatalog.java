@@ -387,6 +387,10 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_bloom bytea");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_min_norm text");
                 statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS ocr_max_norm text");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS min_lat double precision");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS max_lat double precision");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS min_lon double precision");
+                statement.execute("ALTER TABLE oscar_archive_schema ADD COLUMN IF NOT EXISTS max_lon double precision");
                 // ModuleRegistry.loadAllModules enforces a 60-second datastore startup timeout.
                 // On real multi-day/multi-year deployments (> 64 generations), defer multi-million-row
                 // oscar_archive_schema backfills to bounded newest-first committed batches on
@@ -477,8 +481,12 @@ public final class ArchiveCatalog {
                         "observation_id bigint NOT NULL, foi_id bigint, " +
                         "phenomenon_time timestamptz, result_time timestamptz, " +
                         "result_json jsonb NOT NULL, schema_json jsonb NOT NULL, profile text NOT NULL, " +
+                        "latest_lat double precision, latest_lon double precision, latest_alt double precision, " +
                         "updated_at timestamptz NOT NULL DEFAULT now(), " +
                         "PRIMARY KEY(store_key, id_scope, datastream_id))");
+                statement.execute("ALTER TABLE oscar_obs_latest ADD COLUMN IF NOT EXISTS latest_lat double precision");
+                statement.execute("ALTER TABLE oscar_obs_latest ADD COLUMN IF NOT EXISTS latest_lon double precision");
+                statement.execute("ALTER TABLE oscar_obs_latest ADD COLUMN IF NOT EXISTS latest_alt double precision");
                 if (tinyArchiveForInlineBackfill) {
                     statement.execute("INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
                             "SELECT DISTINCT encode(sha256(convert_to(schema_json::text, 'UTF8')), 'hex'), schema_json " +
@@ -1117,9 +1125,9 @@ public final class ArchiveCatalog {
             try {
                 String observations = safeIdentifier(observationTable);
                 String dataStreams = safeIdentifier(dataStreamTable);
-                ResultTimeBounds resultTimeBounds = stageExportedRows(connection, parquetPath, generation);
-                Instant maxResultTime = resultTimeBounds.maxResultTime();
-                Instant minResultTime = resultTimeBounds.minResultTime();
+                StagedExportSummary staged = stageExportedRows(connection, parquetPath, generation, true);
+                Instant maxResultTime = staged.maxResultTime();
+                Instant minResultTime = staged.minResultTime();
                 // Staging does not touch mutable PostgreSQL rows.  Acquire the
                 // exclusive store lock only for the activation transaction's
                 // critical section so ordinary ingestion is not blocked by
@@ -1208,7 +1216,7 @@ public final class ArchiveCatalog {
                     statement.executeUpdate();
                 }
                 insertGenerationSchemasWithSummariesAndLatest(
-                        connection, generation, schemas, resultTimeBounds.ocrByStream());
+                        connection, generation, schemas, staged);
                 try (PreparedStatement statement = connection.prepareStatement(
                         "UPDATE oscar_archive_job SET state='ACTIVE', updated_at=now() " +
                                 "WHERE id=? AND store_key=? AND id_scope=?")) {
@@ -1314,24 +1322,32 @@ public final class ArchiveCatalog {
         return union.append(") o").toString();
     }
 
-    private record ResultTimeBounds(
+    private record StagedExportSummary(
             Instant minResultTime,
             Instant maxResultTime,
-            Map<Long, OcrBloomFilter.Snapshot> ocrByStream) {}
+            Map<Long, StreamSummaryCounters> streamSummaries,
+            List<StreamLatestCandidate> latestByStream,
+            List<EventLocatorCandidate> eventLocators) {}
 
     /**
-     * Streams the immutable export back into a transaction-local relation.
-     * Activation can then compare every mutable source value instead of
-     * treating a coarse ID/time range and a matching count as row ownership.
-     * Keeping the ledger in PostgreSQL also lets the final UPDATE lock and
-     * recheck each live tuple atomically under normal READ COMMITTED rules.
+     * Streams the immutable export from DuckDB in a single pass, computing all
+     * 26 per-stream summary counters, OCR Bloom sketches, event-UUID locators,
+     * latest-observation candidates, and optional WGS-84 spatial envelopes in
+     * memory. When {@code stageTempTable} is {@code true}, also populates the
+     * transaction-local {@code oscar_archive_activation_row} relation so
+     * activation can compare every mutable source value atomically under normal
+     * READ COMMITTED rules without issuing secondary 255k-row PostgreSQL
+     * aggregation scans or temp-disk sorts.
      */
-    private ResultTimeBounds stageExportedRows(Connection postgres, Path parquetPath,
-                                               ArchiveGeneration generation) throws Exception {
-        try (Statement create = postgres.createStatement()) {
-            create.execute("CREATE TEMP TABLE oscar_archive_activation_row (" +
-                    "observation_id bigint PRIMARY KEY, datastream_id bigint NOT NULL, foi_id bigint, " +
-                    "phenomenon_time timestamp, result_time timestamp, result_json jsonb) ON COMMIT DROP");
+    private StagedExportSummary stageExportedRows(Connection postgres, Path parquetPath,
+                                                  ArchiveGeneration generation,
+                                                  boolean stageTempTable) throws Exception {
+        if (stageTempTable) {
+            try (Statement create = postgres.createStatement()) {
+                create.execute("CREATE TEMP TABLE oscar_archive_activation_row (" +
+                        "observation_id bigint PRIMARY KEY, datastream_id bigint NOT NULL, foi_id bigint, " +
+                        "phenomenon_time timestamp, result_time timestamp, result_json jsonb) ON COMMIT DROP");
+            }
         }
 
         String insert = "INSERT INTO oscar_archive_activation_row(" +
@@ -1342,7 +1358,10 @@ public final class ArchiveCatalog {
         long maximumId = Long.MIN_VALUE;
         Instant maxResultTime = generation.maxResultTime();
         Instant minResultTime = generation.minResultTime();
-        Map<Long, OcrBloomFilter.Accumulator> ocrAccumulators = new HashMap<>();
+        boolean trackOcr = !TieredArchiveConfig.PROFILE_RAW_TELEMETRY.equals(generation.profile());
+        Map<Long, ArchiveStreamStatsAccumulator> accumulators = new HashMap<>();
+        Map<Long, StreamLatestCandidate> latestByStream = new HashMap<>();
+        Map<String, Long> eventLocatorMap = new HashMap<>();
         try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(
                 resourceConfig, "activation-stage")) {
             Path localParquet = ArchiveExporter.stageToLocalDirectory(
@@ -1351,9 +1370,10 @@ public final class ArchiveCatalog {
             String select = "SELECT id_scope, id_value, datastream_scope, datastream_id, foi_scope, foi_id, " +
                     "phenomenon_time, result_time, result_json, archive_version, profile " +
                     "FROM read_parquet('" + parquet + "')";
+            PreparedStatement stage = stageTempTable ? postgres.prepareStatement(insert) : null;
             try (Statement read = duckSession.connection().createStatement();
                  ResultSet rows = read.executeQuery(select);
-                 PreparedStatement stage = postgres.prepareStatement(insert)) {
+                 PreparedStatement stageCloseable = stage) {
                 while (rows.next()) {
                     int exportedIdScope = rows.getInt(1);
                     long observationId = rows.getLong(2);
@@ -1369,22 +1389,8 @@ public final class ArchiveCatalog {
                             archiveVersion != expectedArchiveVersion || !generation.profile().equals(profile))
                         throw new IllegalStateException("Archive activation ledger metadata does not match its generation");
 
-                    stage.setLong(1, observationId);
-                    stage.setLong(2, dataStreamId);
-                    if (foiId == null)
-                        stage.setNull(3, Types.BIGINT);
-                    else
-                        stage.setLong(3, foiId);
-                    var phenomenonTime = UtcJdbcTime.getDuckDbInstant(rows, 7);
-                    if (phenomenonTime == null)
-                        stage.setNull(4, Types.TIMESTAMP);
-                    else
-                        UtcJdbcTime.setInstant(stage, 4, phenomenonTime);
-                    var resultTime = UtcJdbcTime.getDuckDbInstant(rows, 8);
-                    if (resultTime == null)
-                        stage.setNull(5, Types.TIMESTAMP);
-                    else
-                        UtcJdbcTime.setInstant(stage, 5, resultTime);
+                    Instant phenomenonTime = UtcJdbcTime.getDuckDbInstant(rows, 7);
+                    Instant resultTime = UtcJdbcTime.getDuckDbInstant(rows, 8);
                     Instant candidateResultTime = resultTime != null ? resultTime : phenomenonTime;
                     if (candidateResultTime != null) {
                         if (maxResultTime == null || candidateResultTime.isAfter(maxResultTime))
@@ -1393,98 +1399,115 @@ public final class ArchiveCatalog {
                             minResultTime = candidateResultTime;
                     }
                     String resultJson = rows.getString(9);
-                    if (!TieredArchiveConfig.PROFILE_RAW_TELEMETRY.equals(generation.profile())) {
-                        ocrAccumulators.computeIfAbsent(dataStreamId, ignored -> new OcrBloomFilter.Accumulator())
-                                .addFromResultJson(resultJson);
+
+                    ArchiveStreamStatsAccumulator acc = accumulators.computeIfAbsent(
+                            dataStreamId, ignored -> new ArchiveStreamStatsAccumulator());
+                    acc.observeRow(observationId, resultJson, eventLocatorMap, trackOcr);
+                    if (resultJson != null) {
+                        latestByStream.merge(
+                                dataStreamId,
+                                new StreamLatestCandidate(
+                                        dataStreamId,
+                                        observationId,
+                                        foiId,
+                                        phenomenonTime,
+                                        resultTime,
+                                        resultJson),
+                                ArchiveStreamStatsAccumulator::pickNewerLatest);
                     }
-                    if (resultJson == null)
-                        stage.setNull(6, Types.VARCHAR);
-                    else
-                        stage.setString(6, resultJson);
-                    stage.addBatch();
+
+                    if (stageCloseable != null) {
+                        stageCloseable.setLong(1, observationId);
+                        stageCloseable.setLong(2, dataStreamId);
+                        if (foiId == null)
+                            stageCloseable.setNull(3, Types.BIGINT);
+                        else
+                            stageCloseable.setLong(3, foiId);
+                        if (phenomenonTime == null)
+                            stageCloseable.setNull(4, Types.TIMESTAMP);
+                        else
+                            UtcJdbcTime.setInstant(stageCloseable, 4, phenomenonTime);
+                        if (resultTime == null)
+                            stageCloseable.setNull(5, Types.TIMESTAMP);
+                        else
+                            UtcJdbcTime.setInstant(stageCloseable, 5, resultTime);
+                        if (resultJson == null)
+                            stageCloseable.setNull(6, Types.VARCHAR);
+                        else
+                            stageCloseable.setString(6, resultJson);
+                        stageCloseable.addBatch();
+                    }
 
                     count++;
                     minimumId = Math.min(minimumId, observationId);
                     maximumId = Math.max(maximumId, observationId);
-                    if (count % 5_000 == 0)
-                        stage.executeBatch();
+                    if (stageCloseable != null && count % 5_000 == 0)
+                        stageCloseable.executeBatch();
                 }
-                stage.executeBatch();
+                if (stageCloseable != null)
+                    stageCloseable.executeBatch();
             }
         }
         if (count != generation.rowCount() || minimumId != generation.minimumId() ||
                 maximumId != generation.maximumId())
             throw new IllegalStateException("Archive activation ledger count/range does not match its generation");
-        try (Statement analyze = postgres.createStatement()) {
-            analyze.execute("ANALYZE oscar_archive_activation_row");
+        if (stageTempTable) {
+            try (Statement analyze = postgres.createStatement()) {
+                analyze.execute("ANALYZE oscar_archive_activation_row");
+            }
         }
-        Map<Long, OcrBloomFilter.Snapshot> ocrSnapshots = new HashMap<>(ocrAccumulators.size() * 2);
-        for (Map.Entry<Long, OcrBloomFilter.Accumulator> entry : ocrAccumulators.entrySet()) {
-            ocrSnapshots.put(entry.getKey(), entry.getValue().finish());
+        Map<Long, StreamSummaryCounters> summaries = new HashMap<>(accumulators.size() * 2);
+        for (Map.Entry<Long, ArchiveStreamStatsAccumulator> entry : accumulators.entrySet()) {
+            summaries.put(entry.getKey(), entry.getValue().finish());
         }
-        return new ResultTimeBounds(minResultTime, maxResultTime, ocrSnapshots);
+        List<EventLocatorCandidate> locators = eventLocatorMap.entrySet().stream()
+                .map(e -> new EventLocatorCandidate(e.getKey(), e.getValue()))
+                .toList();
+        return new StagedExportSummary(
+                minResultTime,
+                maxResultTime,
+                summaries,
+                new ArrayList<>(latestByStream.values()),
+                locators);
     }
 
-    private static final String ACTIVATION_SUMMARY_AGG_SUBQUERY =
-            "SELECT datastream_id, " +
-            "count(*)::bigint AS row_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb)::bigint AS gamma_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb)::bigint AS neutron_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb)::bigint AS gamma_neutron_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb)::bigint AS non_alarm_occupancy_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb)::bigint AS gamma_true_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'neutronAlarm' = 'true'::jsonb)::bigint AS neutron_true_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb))::bigint AS any_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb) AND " +
-            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') = '0')))::bigint AS unadjudicated_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND (result_json->'gammaAlarm' = 'true'::jsonb OR result_json->'neutronAlarm' = 'true'::jsonb) AND " +
-            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') <> '0')))::bigint AS adjudicated_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb AND " +
-            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') = '0')))::bigint AS unadjudicated_gamma_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " +
-            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') = '0')))::bigint AS unadjudicated_neutron_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " +
-            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') = 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') = '0')))::bigint AS unadjudicated_gamma_neutron_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'false'::jsonb AND " +
-            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') <> '0')))::bigint AS adjudicated_gamma_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'false'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " +
-            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') <> '0')))::bigint AS adjudicated_neutron_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'gammaAlarm' = 'true'::jsonb AND result_json->'neutronAlarm' = 'true'::jsonb AND " +
-            "((jsonb_typeof(result_json->'adjudicatedIds') = 'array' AND jsonb_array_length(result_json->'adjudicatedIds') > 0) OR (result_json->'adjudicatedIds' IS NULL AND COALESCE(result_json->>'adjudicatedIdsCount', '0') <> '0')))::bigint AS adjudicated_gamma_neutron_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma High\"'::jsonb)::bigint AS gamma_high_fault_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Gamma Low\"'::jsonb)::bigint AS gamma_low_fault_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Neutron\"'::jsonb)::bigint AS neutron_fault_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Neutron High\"'::jsonb)::bigint AS neutron_high_fault_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmState' = '\"Fault - Extended Occupancy\"'::jsonb)::bigint AS extended_occupancy_fault_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'tamperStatus' = 'true'::jsonb)::bigint AS tamper_true_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Gamma%')::bigint AS rs350_gamma_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND jsonb_typeof(result_json->'derivedData'->'alarmCategory') = 'string' AND result_json->'derivedData'->>'alarmCategory' LIKE '%Neutron%')::bigint AS rs350_neutron_alarm_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmCategoryCode' = '\"Gamma\"'::jsonb)::bigint AS alarm_category_gamma_count, " +
-            "count(*) FILTER (WHERE jsonb_typeof(result_json) = 'object' AND result_json->'alarmCategoryCode' = '\"Neutron\"'::jsonb)::bigint AS alarm_category_neutron_count " +
-            "FROM oscar_archive_activation_row GROUP BY datastream_id";
+    private static void setNullableDouble(PreparedStatement stmt, int idx, Double value) throws SQLException {
+        if (value == null || !Double.isFinite(value))
+            stmt.setNull(idx, Types.DOUBLE);
+        else
+            stmt.setDouble(idx, value);
+    }
 
     /**
      * Inserts {@code oscar_archive_schema} rows for a newly activated generation
-     * in a single SQL {@code INSERT ... SELECT} pass with compact sparse-zero
-     * {@code summary_version = 2} counters ({@code NULLIF(count, 0)}) and inline
-     * OCR Bloom summaries so activation creates zero MVCC dead tuples.
+     * directly from streaming export accumulators with compact sparse-zero
+     * {@code summary_version = 2} counters, OCR Bloom sketches, and optional
+     * WGS-84 spatial bounds — creating zero MVCC dead tuples and zero
+     * PostgreSQL temporary-table scans or sorts.
      */
     private void insertGenerationSchemasWithSummariesAndLatest(
             Connection connection,
             ArchiveGeneration generation,
             List<SchemaSnapshot> schemas,
-            Map<Long, OcrBloomFilter.Snapshot> ocrByStream) throws SQLException {
-        try (Statement createStage = connection.createStatement()) {
-            createStage.execute("CREATE TEMP TABLE oscar_archive_schema_stage (" +
-                    "datastream_id bigint PRIMARY KEY, schema_sha256 text NOT NULL, " +
-                    "ocr_bloom bytea, ocr_min_norm text, ocr_max_norm text) ON COMMIT DROP");
-        }
+            StagedExportSummary staged) throws SQLException {
+        boolean isRawTelemetry = TieredArchiveConfig.PROFILE_RAW_TELEMETRY.equals(generation.profile());
         try (PreparedStatement blobStatement = connection.prepareStatement(
                 "INSERT INTO oscar_archive_schema_blob(schema_sha256, schema_json) " +
                         "VALUES (?, ?::jsonb) ON CONFLICT (schema_sha256) DO NOTHING");
-             PreparedStatement stageStatement = connection.prepareStatement(
-                "INSERT INTO oscar_archive_schema_stage(datastream_id, schema_sha256, ocr_bloom, ocr_min_norm, ocr_max_norm) " +
-                        "VALUES (?, ?, ?, ?, ?)")) {
+             PreparedStatement schemaStmt = connection.prepareStatement(
+                "INSERT INTO oscar_archive_schema(" +
+                        "generation_id, datastream_id, schema_sha256, summary_populated, summary_version, row_count, " +
+                        "gamma_alarm_count, neutron_alarm_count, gamma_neutron_alarm_count, non_alarm_occupancy_count, " +
+                        "gamma_true_count, neutron_true_count, any_alarm_count, " +
+                        "unadjudicated_alarm_count, adjudicated_alarm_count, " +
+                        "unadjudicated_gamma_alarm_count, unadjudicated_neutron_alarm_count, unadjudicated_gamma_neutron_alarm_count, " +
+                        "adjudicated_gamma_alarm_count, adjudicated_neutron_alarm_count, adjudicated_gamma_neutron_alarm_count, " +
+                        "gamma_high_fault_count, gamma_low_fault_count, neutron_fault_count, neutron_high_fault_count, extended_occupancy_fault_count, " +
+                        "tamper_true_count, rs350_gamma_alarm_count, rs350_neutron_alarm_count, " +
+                        "alarm_category_gamma_count, alarm_category_neutron_count, " +
+                        "ocr_bloom, ocr_min_norm, ocr_max_norm, min_lat, max_lat, min_lon, max_lon) " +
+                        "VALUES (?, ?, ?, true, " + SCHEMA_SUMMARY_VERSION_COMPACT + "::smallint, " +
+                        "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
             Set<String> insertedBlobs = new HashSet<>();
             for (SchemaSnapshot schema : schemas) {
                 String schemaHash = sha256Hex(schema.json());
@@ -1493,215 +1516,260 @@ public final class ArchiveCatalog {
                     blobStatement.setString(2, schema.json());
                     blobStatement.addBatch();
                 }
-                stageStatement.setLong(1, schema.dataStreamId());
-                stageStatement.setString(2, schemaHash);
-                OcrBloomFilter.Snapshot snap = ocrByStream != null ? ocrByStream.get(schema.dataStreamId()) : null;
-                if (snap == null) {
-                    stageStatement.setNull(3, Types.BINARY);
-                    stageStatement.setNull(4, Types.VARCHAR);
-                    stageStatement.setNull(5, Types.VARCHAR);
-                } else {
-                    stageStatement.setBytes(3, snap.bloomBytes());
-                    if (snap.minNorm() == null)
-                        stageStatement.setNull(4, Types.VARCHAR);
-                    else
-                        stageStatement.setString(4, snap.minNorm());
-                    if (snap.maxNorm() == null)
-                        stageStatement.setNull(5, Types.VARCHAR);
-                    else
-                        stageStatement.setString(5, snap.maxNorm());
-                }
-                stageStatement.addBatch();
+                StreamSummaryCounters stats = staged.streamSummaries().get(schema.dataStreamId());
+                bindSchemaSummaryInsert(schemaStmt, generation.id(), schema.dataStreamId(), schemaHash,
+                        stats, isRawTelemetry, true);
+                schemaStmt.addBatch();
             }
             blobStatement.executeBatch();
-            stageStatement.executeBatch();
+            schemaStmt.executeBatch();
         }
-        String singlePassInsertSql = "INSERT INTO oscar_archive_schema(" +
-                "generation_id, datastream_id, schema_sha256, summary_populated, summary_version, row_count, " +
-                "gamma_alarm_count, neutron_alarm_count, gamma_neutron_alarm_count, non_alarm_occupancy_count, " +
-                "gamma_true_count, neutron_true_count, any_alarm_count, " +
-                "unadjudicated_alarm_count, adjudicated_alarm_count, " +
-                "unadjudicated_gamma_alarm_count, unadjudicated_neutron_alarm_count, unadjudicated_gamma_neutron_alarm_count, " +
-                "adjudicated_gamma_alarm_count, adjudicated_neutron_alarm_count, adjudicated_gamma_neutron_alarm_count, " +
-                "gamma_high_fault_count, gamma_low_fault_count, neutron_fault_count, neutron_high_fault_count, extended_occupancy_fault_count, " +
-                "tamper_true_count, rs350_gamma_alarm_count, rs350_neutron_alarm_count, " +
-                "alarm_category_gamma_count, alarm_category_neutron_count, " +
-                "ocr_bloom, ocr_min_norm, ocr_max_norm) " +
-                "SELECT ?, st.datastream_id, st.schema_sha256, true, " + SCHEMA_SUMMARY_VERSION_COMPACT + "::smallint, " +
-                "COALESCE(agg.row_count, 0), " +
-                "NULLIF(agg.gamma_alarm_count, 0), " +
-                "NULLIF(agg.neutron_alarm_count, 0), " +
-                "NULLIF(agg.gamma_neutron_alarm_count, 0), " +
-                "NULLIF(agg.non_alarm_occupancy_count, 0), " +
-                "NULLIF(agg.gamma_true_count, 0), " +
-                "NULLIF(agg.neutron_true_count, 0), " +
-                "NULLIF(agg.any_alarm_count, 0), " +
-                "NULLIF(agg.unadjudicated_alarm_count, 0), " +
-                "NULLIF(agg.adjudicated_alarm_count, 0), " +
-                "NULLIF(agg.unadjudicated_gamma_alarm_count, 0), " +
-                "NULLIF(agg.unadjudicated_neutron_alarm_count, 0), " +
-                "NULLIF(agg.unadjudicated_gamma_neutron_alarm_count, 0), " +
-                "NULLIF(agg.adjudicated_gamma_alarm_count, 0), " +
-                "NULLIF(agg.adjudicated_neutron_alarm_count, 0), " +
-                "NULLIF(agg.adjudicated_gamma_neutron_alarm_count, 0), " +
-                "NULLIF(agg.gamma_high_fault_count, 0), " +
-                "NULLIF(agg.gamma_low_fault_count, 0), " +
-                "NULLIF(agg.neutron_fault_count, 0), " +
-                "NULLIF(agg.neutron_high_fault_count, 0), " +
-                "NULLIF(agg.extended_occupancy_fault_count, 0), " +
-                "NULLIF(agg.tamper_true_count, 0), " +
-                "NULLIF(agg.rs350_gamma_alarm_count, 0), " +
-                "NULLIF(agg.rs350_neutron_alarm_count, 0), " +
-                "NULLIF(agg.alarm_category_gamma_count, 0), " +
-                "NULLIF(agg.alarm_category_neutron_count, 0), " +
-                "st.ocr_bloom, st.ocr_min_norm, st.ocr_max_norm " +
-                "FROM oscar_archive_schema_stage st " +
-                "LEFT JOIN (" + ACTIVATION_SUMMARY_AGG_SUBQUERY + ") agg ON agg.datastream_id = st.datastream_id";
-        try (PreparedStatement insertStmt = connection.prepareStatement(singlePassInsertSql)) {
-            insertStmt.setObject(1, generation.id());
-            insertStmt.executeUpdate();
+        Map<Long, String> schemaByDs = new HashMap<>(schemas.size() * 2);
+        for (SchemaSnapshot s : schemas) {
+            schemaByDs.put(s.dataStreamId(), s.json());
         }
-        upsertGenerationLocatorsAndLatest(connection, generation);
+        upsertStreamingLocatorsAndLatest(connection, generation, schemaByDs,
+                staged.latestByStream(), staged.eventLocators());
+    }
+
+    private static void bindSchemaSummaryInsert(
+            PreparedStatement schemaStmt,
+            UUID generationId,
+            long dataStreamId,
+            String schemaHash,
+            StreamSummaryCounters stats,
+            boolean omitOcrBloom,
+            boolean useEmptyOcrSentinel) throws SQLException {
+        int p = 1;
+        schemaStmt.setObject(p++, generationId);
+        schemaStmt.setLong(p++, dataStreamId);
+        schemaStmt.setString(p++, schemaHash);
+        schemaStmt.setLong(p++, stats != null ? stats.rowCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.gammaAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.neutronAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.gammaNeutronAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.nonAlarmOccupancyCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.gammaTrueCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.neutronTrueCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.anyAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.unadjudicatedAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.adjudicatedAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.unadjudicatedGammaAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.unadjudicatedNeutronAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.unadjudicatedGammaNeutronAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.adjudicatedGammaAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.adjudicatedNeutronAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.adjudicatedGammaNeutronAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.gammaHighFaultCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.gammaLowFaultCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.neutronFaultCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.neutronHighFaultCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.extendedOccupancyFaultCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.tamperTrueCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.rs350GammaAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.rs350NeutronAlarmCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.alarmCategoryGammaCount() : 0L);
+        setNullablePositiveLong(schemaStmt, p++, stats != null ? stats.alarmCategoryNeutronCount() : 0L);
+        OcrBloomFilter.Snapshot ocr = (!omitOcrBloom && stats != null) ? stats.ocrSnapshot() : null;
+        if (ocr != null) {
+            schemaStmt.setBytes(p++, ocr.bloomBytes());
+            if (ocr.minNorm() == null)
+                schemaStmt.setNull(p++, Types.VARCHAR);
+            else
+                schemaStmt.setString(p++, ocr.minNorm());
+            if (ocr.maxNorm() == null)
+                schemaStmt.setNull(p++, Types.VARCHAR);
+            else
+                schemaStmt.setString(p++, ocr.maxNorm());
+        } else {
+            if (useEmptyOcrSentinel && !omitOcrBloom)
+                schemaStmt.setBytes(p++, OcrBloomFilter.EMPTY_INDEXED_SENTINEL);
+            else
+                schemaStmt.setNull(p++, Types.BINARY);
+            schemaStmt.setNull(p++, Types.VARCHAR);
+            schemaStmt.setNull(p++, Types.VARCHAR);
+        }
+        SpatialEnvelopeExtractor.SpatialBounds bounds = stats != null ? stats.spatialBounds() : null;
+        setNullableDouble(schemaStmt, p++, bounds != null ? bounds.minLat() : null);
+        setNullableDouble(schemaStmt, p++, bounds != null ? bounds.maxLat() : null);
+        setNullableDouble(schemaStmt, p++, bounds != null ? bounds.minLon() : null);
+        setNullableDouble(schemaStmt, p, bounds != null ? bounds.maxLon() : null);
     }
 
     private void populateGenerationSummariesAndLatest(
             Connection connection,
             ArchiveGeneration generation,
-            Map<Long, OcrBloomFilter.Snapshot> ocrByStream) throws SQLException {
-        String updateSummarySql = "UPDATE oscar_archive_schema s SET " +
-                "summary_populated = true, " +
-                "summary_version = " + SCHEMA_SUMMARY_VERSION_COMPACT + "::smallint, " +
-                "row_count = agg.row_count, " +
-                "gamma_alarm_count = NULLIF(agg.gamma_alarm_count, 0), " +
-                "neutron_alarm_count = NULLIF(agg.neutron_alarm_count, 0), " +
-                "gamma_neutron_alarm_count = NULLIF(agg.gamma_neutron_alarm_count, 0), " +
-                "non_alarm_occupancy_count = NULLIF(agg.non_alarm_occupancy_count, 0), " +
-                "gamma_true_count = NULLIF(agg.gamma_true_count, 0), " +
-                "neutron_true_count = NULLIF(agg.neutron_true_count, 0), " +
-                "any_alarm_count = NULLIF(agg.any_alarm_count, 0), " +
-                "unadjudicated_alarm_count = NULLIF(agg.unadjudicated_alarm_count, 0), " +
-                "adjudicated_alarm_count = NULLIF(agg.adjudicated_alarm_count, 0), " +
-                "unadjudicated_gamma_alarm_count = NULLIF(agg.unadjudicated_gamma_alarm_count, 0), " +
-                "unadjudicated_neutron_alarm_count = NULLIF(agg.unadjudicated_neutron_alarm_count, 0), " +
-                "unadjudicated_gamma_neutron_alarm_count = NULLIF(agg.unadjudicated_gamma_neutron_alarm_count, 0), " +
-                "adjudicated_gamma_alarm_count = NULLIF(agg.adjudicated_gamma_alarm_count, 0), " +
-                "adjudicated_neutron_alarm_count = NULLIF(agg.adjudicated_neutron_alarm_count, 0), " +
-                "adjudicated_gamma_neutron_alarm_count = NULLIF(agg.adjudicated_gamma_neutron_alarm_count, 0), " +
-                "gamma_high_fault_count = NULLIF(agg.gamma_high_fault_count, 0), " +
-                "gamma_low_fault_count = NULLIF(agg.gamma_low_fault_count, 0), " +
-                "neutron_fault_count = NULLIF(agg.neutron_fault_count, 0), " +
-                "neutron_high_fault_count = NULLIF(agg.neutron_high_fault_count, 0), " +
-                "extended_occupancy_fault_count = NULLIF(agg.extended_occupancy_fault_count, 0), " +
-                "tamper_true_count = NULLIF(agg.tamper_true_count, 0), " +
-                "rs350_gamma_alarm_count = NULLIF(agg.rs350_gamma_alarm_count, 0), " +
-                "rs350_neutron_alarm_count = NULLIF(agg.rs350_neutron_alarm_count, 0), " +
-                "alarm_category_gamma_count = NULLIF(agg.alarm_category_gamma_count, 0), " +
-                "alarm_category_neutron_count = NULLIF(agg.alarm_category_neutron_count, 0) " +
-                "FROM (" + ACTIVATION_SUMMARY_AGG_SUBQUERY + ") agg " +
-                "WHERE s.generation_id = ? AND s.datastream_id = agg.datastream_id";
-        try (PreparedStatement statement = connection.prepareStatement(updateSummarySql)) {
-            statement.setObject(1, generation.id());
-            statement.executeUpdate();
-        }
-        if (ocrByStream != null && !ocrByStream.isEmpty()) {
-            try (PreparedStatement updateOcr = connection.prepareStatement(
-                    "UPDATE oscar_archive_schema SET ocr_bloom = ?, ocr_min_norm = ?, ocr_max_norm = ? " +
-                            "WHERE generation_id = ? AND datastream_id = ?")) {
-                for (Map.Entry<Long, OcrBloomFilter.Snapshot> entry : ocrByStream.entrySet()) {
-                    OcrBloomFilter.Snapshot snap = entry.getValue();
-                    updateOcr.setBytes(1, snap.bloomBytes());
-                    if (snap.minNorm() == null)
-                        updateOcr.setNull(2, Types.VARCHAR);
-                    else
-                        updateOcr.setString(2, snap.minNorm());
-                    if (snap.maxNorm() == null)
-                        updateOcr.setNull(3, Types.VARCHAR);
-                    else
-                        updateOcr.setString(3, snap.maxNorm());
-                    updateOcr.setObject(4, generation.id());
-                    updateOcr.setLong(5, entry.getKey());
-                    updateOcr.addBatch();
+            StagedExportSummary staged) throws SQLException {
+        boolean isRawTelemetry = TieredArchiveConfig.PROFILE_RAW_TELEMETRY.equals(generation.profile());
+        Map<Long, String> schemaByDs = new HashMap<>();
+        try (PreparedStatement loadSchemas = connection.prepareStatement(
+                "SELECT s.datastream_id, COALESCE(s.schema_json, blob.schema_json)::text " +
+                        "FROM oscar_archive_schema s " +
+                        "LEFT JOIN oscar_archive_schema_blob blob ON blob.schema_sha256 = s.schema_sha256 " +
+                        "WHERE s.generation_id = ?")) {
+            loadSchemas.setObject(1, generation.id());
+            try (ResultSet rs = loadSchemas.executeQuery()) {
+                while (rs.next()) {
+                    String json = rs.getString(2);
+                    if (json != null)
+                        schemaByDs.put(rs.getLong(1), json);
                 }
-                updateOcr.executeBatch();
             }
         }
-        upsertGenerationLocatorsAndLatest(connection, generation);
+        String updateSummarySql = "UPDATE oscar_archive_schema SET " +
+                "summary_populated = true, " +
+                "summary_version = " + SCHEMA_SUMMARY_VERSION_COMPACT + "::smallint, " +
+                "row_count = ?, " +
+                "gamma_alarm_count = ?, neutron_alarm_count = ?, gamma_neutron_alarm_count = ?, non_alarm_occupancy_count = ?, " +
+                "gamma_true_count = ?, neutron_true_count = ?, any_alarm_count = ?, " +
+                "unadjudicated_alarm_count = ?, adjudicated_alarm_count = ?, " +
+                "unadjudicated_gamma_alarm_count = ?, unadjudicated_neutron_alarm_count = ?, unadjudicated_gamma_neutron_alarm_count = ?, " +
+                "adjudicated_gamma_alarm_count = ?, adjudicated_neutron_alarm_count = ?, adjudicated_gamma_neutron_alarm_count = ?, " +
+                "gamma_high_fault_count = ?, gamma_low_fault_count = ?, neutron_fault_count = ?, neutron_high_fault_count = ?, extended_occupancy_fault_count = ?, " +
+                "tamper_true_count = ?, rs350_gamma_alarm_count = ?, rs350_neutron_alarm_count = ?, " +
+                "alarm_category_gamma_count = ?, alarm_category_neutron_count = ?, " +
+                "ocr_bloom = ?, ocr_min_norm = ?, ocr_max_norm = ?, " +
+                "min_lat = ?, max_lat = ?, min_lon = ?, max_lon = ? " +
+                "WHERE generation_id = ? AND datastream_id = ?";
+        try (PreparedStatement updateStmt = connection.prepareStatement(updateSummarySql)) {
+            for (Map.Entry<Long, StreamSummaryCounters> entry : staged.streamSummaries().entrySet()) {
+                StreamSummaryCounters stats = entry.getValue();
+                int p = 1;
+                updateStmt.setLong(p++, stats.rowCount());
+                setNullablePositiveLong(updateStmt, p++, stats.gammaAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.neutronAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.gammaNeutronAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.nonAlarmOccupancyCount());
+                setNullablePositiveLong(updateStmt, p++, stats.gammaTrueCount());
+                setNullablePositiveLong(updateStmt, p++, stats.neutronTrueCount());
+                setNullablePositiveLong(updateStmt, p++, stats.anyAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.unadjudicatedAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.adjudicatedAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.unadjudicatedGammaAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.unadjudicatedNeutronAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.unadjudicatedGammaNeutronAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.adjudicatedGammaAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.adjudicatedNeutronAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.adjudicatedGammaNeutronAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.gammaHighFaultCount());
+                setNullablePositiveLong(updateStmt, p++, stats.gammaLowFaultCount());
+                setNullablePositiveLong(updateStmt, p++, stats.neutronFaultCount());
+                setNullablePositiveLong(updateStmt, p++, stats.neutronHighFaultCount());
+                setNullablePositiveLong(updateStmt, p++, stats.extendedOccupancyFaultCount());
+                setNullablePositiveLong(updateStmt, p++, stats.tamperTrueCount());
+                setNullablePositiveLong(updateStmt, p++, stats.rs350GammaAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.rs350NeutronAlarmCount());
+                setNullablePositiveLong(updateStmt, p++, stats.alarmCategoryGammaCount());
+                setNullablePositiveLong(updateStmt, p++, stats.alarmCategoryNeutronCount());
+                OcrBloomFilter.Snapshot ocr = !isRawTelemetry ? stats.ocrSnapshot() : null;
+                if (ocr != null) {
+                    updateStmt.setBytes(p++, ocr.bloomBytes());
+                    if (ocr.minNorm() == null) updateStmt.setNull(p++, Types.VARCHAR); else updateStmt.setString(p++, ocr.minNorm());
+                    if (ocr.maxNorm() == null) updateStmt.setNull(p++, Types.VARCHAR); else updateStmt.setString(p++, ocr.maxNorm());
+                } else {
+                    if (!isRawTelemetry)
+                        updateStmt.setBytes(p++, OcrBloomFilter.EMPTY_INDEXED_SENTINEL);
+                    else
+                        updateStmt.setNull(p++, Types.BINARY);
+                    updateStmt.setNull(p++, Types.VARCHAR);
+                    updateStmt.setNull(p++, Types.VARCHAR);
+                }
+                SpatialEnvelopeExtractor.SpatialBounds bounds = stats.spatialBounds();
+                setNullableDouble(updateStmt, p++, bounds != null ? bounds.minLat() : null);
+                setNullableDouble(updateStmt, p++, bounds != null ? bounds.maxLat() : null);
+                setNullableDouble(updateStmt, p++, bounds != null ? bounds.minLon() : null);
+                setNullableDouble(updateStmt, p++, bounds != null ? bounds.maxLon() : null);
+                updateStmt.setObject(p++, generation.id());
+                updateStmt.setLong(p, entry.getKey());
+                updateStmt.addBatch();
+            }
+            updateStmt.executeBatch();
+        }
+        upsertStreamingLocatorsAndLatest(connection, generation, schemaByDs,
+                staged.latestByStream(), staged.eventLocators());
     }
 
-    private void upsertGenerationLocatorsAndLatest(
+    private void upsertStreamingLocatorsAndLatest(
             Connection connection,
-            ArchiveGeneration generation) throws SQLException {
-
-        String insertLocatorSql = "INSERT INTO oscar_event_locator(" +
-                "store_key, id_scope, public_id, observation_id, generation_id, state, updated_at) " +
-                "SELECT DISTINCT ON (exported.result_json->>'eventId') " +
-                "?, ?, exported.result_json->>'eventId', exported.observation_id, ?, 'ACTIVE', now() " +
-                "FROM oscar_archive_activation_row exported " +
-                "WHERE jsonb_typeof(exported.result_json) = 'object' " +
-                "AND jsonb_typeof(exported.result_json->'eventId') = 'string' " +
-                "AND length(exported.result_json->>'eventId') BETWEEN 1 AND 256 " +
-                "ORDER BY exported.result_json->>'eventId', exported.observation_id DESC " +
-                "ON CONFLICT (store_key, id_scope, public_id) DO UPDATE SET " +
-                "observation_id = EXCLUDED.observation_id, " +
-                "generation_id = EXCLUDED.generation_id, " +
-                "state = 'ACTIVE', " +
-                "updated_at = now()";
-        try (PreparedStatement statement = connection.prepareStatement(insertLocatorSql)) {
-            statement.setString(1, storeKey);
-            statement.setInt(2, idScope);
-            statement.setObject(3, generation.id());
-            statement.executeUpdate();
+            ArchiveGeneration generation,
+            Map<Long, String> schemaByDs,
+            List<StreamLatestCandidate> latestCandidates,
+            List<EventLocatorCandidate> eventLocators) throws SQLException {
+        if (eventLocators != null && !eventLocators.isEmpty()) {
+            try (PreparedStatement locStmt = connection.prepareStatement(
+                    "INSERT INTO oscar_event_locator(" +
+                            "store_key, id_scope, public_id, observation_id, generation_id, state, updated_at) " +
+                            "VALUES (?, ?, ?, ?, ?, 'ACTIVE', now()) " +
+                            "ON CONFLICT (store_key, id_scope, public_id) DO UPDATE SET " +
+                            "observation_id = EXCLUDED.observation_id, " +
+                            "generation_id = EXCLUDED.generation_id, " +
+                            "state = 'ACTIVE', " +
+                            "updated_at = now() " +
+                            "WHERE EXCLUDED.observation_id >= oscar_event_locator.observation_id")) {
+                for (EventLocatorCandidate loc : eventLocators) {
+                    locStmt.setString(1, storeKey);
+                    locStmt.setInt(2, idScope);
+                    locStmt.setString(3, loc.eventId());
+                    locStmt.setLong(4, loc.observationId());
+                    locStmt.setObject(5, generation.id());
+                    locStmt.addBatch();
+                }
+                locStmt.executeBatch();
+            }
         }
-
-        // Resolve the single latest observation_id per datastream before joining wide
-        // result_json and schema_json payloads so PostgreSQL sorts only scalar key columns
-        // instead of duplicating schema_json/result_json across every staged row into temp disk.
-        String upsertLatestSql = "WITH latest_ids AS MATERIALIZED (" +
-                "SELECT DISTINCT ON (datastream_id) observation_id " +
-                "FROM oscar_archive_activation_row " +
-                "ORDER BY datastream_id, " +
-                "phenomenon_time DESC NULLS LAST, " +
-                "result_time DESC NULLS LAST, " +
-                "observation_id DESC" +
-                ") " +
-                "INSERT INTO oscar_obs_latest(" +
-                "store_key, id_scope, datastream_id, generation_id, observation_id, " +
-                "foi_id, phenomenon_time, result_time, result_json, schema_json, profile, updated_at) " +
-                "SELECT " +
-                "?, ?, exported.datastream_id, ?, exported.observation_id, " +
-                "exported.foi_id, " +
-                "exported.phenomenon_time AT TIME ZONE 'UTC', " +
-                "exported.result_time AT TIME ZONE 'UTC', " +
-                "exported.result_json, " +
-                "COALESCE(s.schema_json, blob.schema_json), " +
-                "?, now() " +
-                "FROM latest_ids winner " +
-                "JOIN oscar_archive_activation_row exported ON exported.observation_id = winner.observation_id " +
-                "JOIN oscar_archive_schema s ON s.generation_id = ? AND s.datastream_id = exported.datastream_id " +
-                "LEFT JOIN oscar_archive_schema_blob blob ON blob.schema_sha256 = s.schema_sha256 " +
-                "WHERE COALESCE(s.schema_json, blob.schema_json) IS NOT NULL " +
-                "ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET " +
-                "generation_id = EXCLUDED.generation_id, " +
-                "observation_id = EXCLUDED.observation_id, " +
-                "foi_id = EXCLUDED.foi_id, " +
-                "phenomenon_time = EXCLUDED.phenomenon_time, " +
-                "result_time = EXCLUDED.result_time, " +
-                "result_json = EXCLUDED.result_json, " +
-                "schema_json = EXCLUDED.schema_json, " +
-                "profile = EXCLUDED.profile, " +
-                "updated_at = now() " +
-                "WHERE oscar_obs_latest.phenomenon_time IS NULL " +
-                "OR (EXCLUDED.phenomenon_time IS NOT NULL AND (" +
-                "EXCLUDED.phenomenon_time > oscar_obs_latest.phenomenon_time " +
-                "OR (EXCLUDED.phenomenon_time = oscar_obs_latest.phenomenon_time " +
-                "AND EXCLUDED.observation_id >= oscar_obs_latest.observation_id)))";
-        try (PreparedStatement statement = connection.prepareStatement(upsertLatestSql)) {
-            statement.setString(1, storeKey);
-            statement.setInt(2, idScope);
-            statement.setObject(3, generation.id());
-            statement.setString(4, generation.profile());
-            statement.setObject(5, generation.id());
-            statement.executeUpdate();
+        if (latestCandidates != null && !latestCandidates.isEmpty()) {
+            try (PreparedStatement latStmt = connection.prepareStatement(
+                    "INSERT INTO oscar_obs_latest(" +
+                            "store_key, id_scope, datastream_id, generation_id, observation_id, " +
+                            "foi_id, phenomenon_time, result_time, result_json, schema_json, profile, " +
+                            "latest_lat, latest_lon, latest_alt, updated_at) " +
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, ?, ?, ?, now()) " +
+                            "ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET " +
+                            "generation_id = EXCLUDED.generation_id, " +
+                            "observation_id = EXCLUDED.observation_id, " +
+                            "foi_id = EXCLUDED.foi_id, " +
+                            "phenomenon_time = EXCLUDED.phenomenon_time, " +
+                            "result_time = EXCLUDED.result_time, " +
+                            "result_json = EXCLUDED.result_json, " +
+                            "schema_json = EXCLUDED.schema_json, " +
+                            "profile = EXCLUDED.profile, " +
+                            "latest_lat = EXCLUDED.latest_lat, " +
+                            "latest_lon = EXCLUDED.latest_lon, " +
+                            "latest_alt = EXCLUDED.latest_alt, " +
+                            "updated_at = now() " +
+                            "WHERE NOT (oscar_obs_latest.observation_id = EXCLUDED.observation_id " +
+                            "AND EXISTS (SELECT 1 FROM oscar_obs_overlay ov " +
+                            "  WHERE ov.store_key = oscar_obs_latest.store_key " +
+                            "    AND ov.id_scope = oscar_obs_latest.id_scope " +
+                            "    AND ov.observation_id = oscar_obs_latest.observation_id)) " +
+                            "AND (oscar_obs_latest.phenomenon_time IS NULL " +
+                            "OR (EXCLUDED.phenomenon_time IS NOT NULL AND (" +
+                            "EXCLUDED.phenomenon_time > oscar_obs_latest.phenomenon_time " +
+                            "OR (EXCLUDED.phenomenon_time = oscar_obs_latest.phenomenon_time " +
+                            "AND EXCLUDED.observation_id >= oscar_obs_latest.observation_id))))")) {
+                for (StreamLatestCandidate lat : latestCandidates) {
+                    String schemaJson = schemaByDs.get(lat.dataStreamId());
+                    if (schemaJson == null)
+                        continue;
+                    SpatialEnvelopeExtractor.SpatialPoint point = SpatialEnvelopeExtractor.extractPoint(lat.resultJson());
+                    latStmt.setString(1, storeKey);
+                    latStmt.setInt(2, idScope);
+                    latStmt.setLong(3, lat.dataStreamId());
+                    latStmt.setObject(4, generation.id());
+                    latStmt.setLong(5, lat.observationId());
+                    if (lat.foiId() == null) latStmt.setNull(6, Types.BIGINT); else latStmt.setLong(6, lat.foiId());
+                    if (lat.phenomenonTime() == null) latStmt.setNull(7, Types.TIMESTAMP_WITH_TIMEZONE); else UtcJdbcTime.setInstant(latStmt, 7, lat.phenomenonTime());
+                    if (lat.resultTime() == null) latStmt.setNull(8, Types.TIMESTAMP_WITH_TIMEZONE); else UtcJdbcTime.setInstant(latStmt, 8, lat.resultTime());
+                    latStmt.setString(9, lat.resultJson());
+                    latStmt.setString(10, schemaJson);
+                    latStmt.setString(11, generation.profile());
+                    setNullableDouble(latStmt, 12, point != null ? point.lat() : null);
+                    setNullableDouble(latStmt, 13, point != null ? point.lon() : null);
+                    setNullableDouble(latStmt, 14, point != null ? point.alt() : null);
+                    latStmt.addBatch();
+                }
+                latStmt.executeBatch();
+            }
         }
     }
 
@@ -2817,22 +2885,22 @@ public final class ArchiveCatalog {
                     Path parquetPath = normalizedRoot.resolve(generation.objectPath()).normalize();
                     if (!parquetPath.startsWith(normalizedRoot))
                         throw new IllegalStateException("Archive object path escapes root");
-                    ResultTimeBounds bounds = stageExportedRows(connection, parquetPath, generation);
-                    if (bounds.minResultTime() != null || bounds.maxResultTime() != null) {
+                    StagedExportSummary staged = stageExportedRows(connection, parquetPath, generation, false);
+                    if (staged.minResultTime() != null || staged.maxResultTime() != null) {
                         try (PreparedStatement updateBounds = connection.prepareStatement(
                                 "UPDATE oscar_archive_generation " +
                                         "SET min_result_time = COALESCE(min_result_time, ?), " +
                                         "max_result_time = COALESCE(max_result_time, ?) " +
                                         "WHERE id=? AND store_key=? AND id_scope=?")) {
-                            UtcJdbcTime.setInstant(updateBounds, 1, bounds.minResultTime());
-                            UtcJdbcTime.setInstant(updateBounds, 2, bounds.maxResultTime());
+                            UtcJdbcTime.setInstant(updateBounds, 1, staged.minResultTime());
+                            UtcJdbcTime.setInstant(updateBounds, 2, staged.maxResultTime());
                             updateBounds.setObject(3, generation.id());
                             updateBounds.setString(4, storeKey);
                             updateBounds.setInt(5, idScope);
                             updateBounds.executeUpdate();
                         }
                     }
-                    populateGenerationSummariesAndLatest(connection, generation, bounds.ocrByStream());
+                    populateGenerationSummariesAndLatest(connection, generation, staged);
                     markGenerationsBackfillFlag(connection, List.of(generation.id()), BACKFILL_FLAG_GEN_SUMMARY);
                     connection.commit();
                     backfilled++;
@@ -3914,10 +3982,12 @@ public final class ArchiveCatalog {
         }
         try (PreparedStatement latestUpdate = connection.prepareStatement(
                 "UPDATE oscar_obs_latest SET generation_id=?, foi_id=?, phenomenon_time=?, " +
-                        "result_time=?, result_json=?::jsonb, schema_json=?::jsonb, updated_at=now() " +
+                        "result_time=?, result_json=?::jsonb, schema_json=?::jsonb, " +
+                        "latest_lat=?, latest_lon=?, latest_alt=?, updated_at=now() " +
                         "WHERE store_key=? AND id_scope=? AND datastream_id=? AND observation_id=?")) {
             for (OverlayBatchItem item : items) {
                 ArchivedObservation observation = item.observation();
+                SpatialEnvelopeExtractor.SpatialPoint point = SpatialEnvelopeExtractor.extractPoint(observation.resultJson());
                 latestUpdate.setObject(1, item.generationId());
                 if (observation.foiId() == null)
                     latestUpdate.setNull(2, java.sql.Types.BIGINT);
@@ -3933,10 +4003,13 @@ public final class ArchiveCatalog {
                     UtcJdbcTime.setInstant(latestUpdate, 4, observation.resultTime());
                 latestUpdate.setString(5, observation.resultJson());
                 latestUpdate.setString(6, item.schemaJson());
-                latestUpdate.setString(7, storeKey);
-                latestUpdate.setInt(8, idScope);
-                latestUpdate.setLong(9, observation.dataStreamId());
-                latestUpdate.setLong(10, observation.id());
+                setNullableDouble(latestUpdate, 7, point != null ? point.lat() : null);
+                setNullableDouble(latestUpdate, 8, point != null ? point.lon() : null);
+                setNullableDouble(latestUpdate, 9, point != null ? point.alt() : null);
+                latestUpdate.setString(10, storeKey);
+                latestUpdate.setInt(11, idScope);
+                latestUpdate.setLong(12, observation.dataStreamId());
+                latestUpdate.setLong(13, observation.id());
                 latestUpdate.addBatch();
             }
             latestUpdate.executeBatch();
@@ -6402,7 +6475,253 @@ public final class ArchiveCatalog {
             long rs350NeutronAlarmCount,
             long alarmCategoryGammaCount,
             long alarmCategoryNeutronCount,
-            OcrBloomFilter.Snapshot ocrSnapshot) {}
+            OcrBloomFilter.Snapshot ocrSnapshot,
+            SpatialEnvelopeExtractor.SpatialBounds spatialBounds) {
+        public StreamSummaryCounters(
+                long rowCount,
+                long gammaAlarmCount,
+                long neutronAlarmCount,
+                long gammaNeutronAlarmCount,
+                long nonAlarmOccupancyCount,
+                long gammaTrueCount,
+                long neutronTrueCount,
+                long anyAlarmCount,
+                long unadjudicatedAlarmCount,
+                long adjudicatedAlarmCount,
+                long unadjudicatedGammaAlarmCount,
+                long unadjudicatedNeutronAlarmCount,
+                long unadjudicatedGammaNeutronAlarmCount,
+                long adjudicatedGammaAlarmCount,
+                long adjudicatedNeutronAlarmCount,
+                long adjudicatedGammaNeutronAlarmCount,
+                long gammaHighFaultCount,
+                long gammaLowFaultCount,
+                long neutronFaultCount,
+                long neutronHighFaultCount,
+                long extendedOccupancyFaultCount,
+                long tamperTrueCount,
+                long rs350GammaAlarmCount,
+                long rs350NeutronAlarmCount,
+                long alarmCategoryGammaCount,
+                long alarmCategoryNeutronCount,
+                OcrBloomFilter.Snapshot ocrSnapshot) {
+            this(rowCount, gammaAlarmCount, neutronAlarmCount, gammaNeutronAlarmCount,
+                    nonAlarmOccupancyCount, gammaTrueCount, neutronTrueCount, anyAlarmCount,
+                    unadjudicatedAlarmCount, adjudicatedAlarmCount,
+                    unadjudicatedGammaAlarmCount, unadjudicatedNeutronAlarmCount, unadjudicatedGammaNeutronAlarmCount,
+                    adjudicatedGammaAlarmCount, adjudicatedNeutronAlarmCount, adjudicatedGammaNeutronAlarmCount,
+                    gammaHighFaultCount, gammaLowFaultCount, neutronFaultCount, neutronHighFaultCount,
+                    extendedOccupancyFaultCount, tamperTrueCount, rs350GammaAlarmCount, rs350NeutronAlarmCount,
+                    alarmCategoryGammaCount, alarmCategoryNeutronCount, ocrSnapshot, null);
+        }
+    }
+
+    /**
+     * Latest known WGS-84 spatial observation for a datastream from {@code oscar_obs_latest},
+     * supporting sub-millisecond situational awareness, mobile detector tracking, and
+     * external CoT/TAK tactical feed fan-out without opening cold Parquet files.
+     */
+    public record LatestSpatialPosition(
+            long dataStreamId,
+            UUID generationId,
+            long observationId,
+            Long foiId,
+            Instant phenomenonTime,
+            Instant resultTime,
+            double lat,
+            double lon,
+            Double alt,
+            String resultJson) {}
+
+    /**
+     * Lists active/sealed archive generations that have at least one datastream
+     * whose stored WGS-84 spatial envelope intersects the requested bounding box.
+     * Supports both standard ({@code minLon <= maxLon}) and antimeridian-crossing
+     * ({@code minLon > maxLon}) bounding boxes. Generations without spatial bounds
+     * are pruned in PostgreSQL without opening DuckDB or Parquet files.
+     */
+    public List<ArchiveGeneration> listGenerationsIntersectingBbox(
+            Set<Long> dataStreamIds,
+            Instant start,
+            Instant end,
+            double minLat,
+            double maxLat,
+            double minLon,
+            double maxLon) {
+        if (!Double.isFinite(minLat) || !Double.isFinite(maxLat)
+                || !Double.isFinite(minLon) || !Double.isFinite(maxLon)
+                || minLat < -90.0 || maxLat > 90.0 || minLat > maxLat
+                || minLon < -180.0 || minLon > 180.0 || maxLon < -180.0 || maxLon > 180.0) {
+            throw new IllegalArgumentException("Invalid WGS-84 bounding box");
+        }
+        if (dataStreamIds != null && dataStreamIds.isEmpty())
+            return List.of();
+        if (start != null && end != null && !start.isBefore(end))
+            return List.of();
+        boolean filterStreams = dataStreamIds != null;
+        boolean crossesAntimeridian = minLon > maxLon;
+        String lonPredicate = crossesAntimeridian
+                ? "(s.max_lon >= ? OR s.min_lon <= ?)"
+                : "(s.max_lon >= ? AND s.min_lon <= ?)";
+        StringBuilder sql = new StringBuilder(
+                "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time, g.min_result_time " +
+                "FROM oscar_archive_generation g " +
+                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') ");
+        if (end != null)
+            sql.append("AND g.window_start < ? ");
+        if (start != null)
+            sql.append("AND g.window_end > ? ");
+        sql.append("AND EXISTS (SELECT 1 FROM oscar_archive_schema s WHERE s.generation_id=g.id ")
+                .append("AND s.min_lat IS NOT NULL AND s.max_lat IS NOT NULL ")
+                .append("AND s.min_lon IS NOT NULL AND s.max_lon IS NOT NULL ")
+                .append("AND s.max_lat >= ? AND s.min_lat <= ? AND ")
+                .append(lonPredicate);
+        if (filterStreams)
+            sql.append(" AND s.datastream_id = ANY (?::bigint[])");
+        sql.append(") ORDER BY g.window_start, g.id");
+
+        List<ArchiveGeneration> out = new ArrayList<>();
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            java.sql.Array streamArray = filterStreams
+                    ? connection.createArrayOf("bigint", dataStreamIds.toArray(Long[]::new))
+                    : null;
+            try (PreparedStatement stmt = connection.prepareStatement(sql.toString())) {
+                int p = 1;
+                stmt.setString(p++, storeKey);
+                stmt.setInt(p++, idScope);
+                if (end != null)
+                    UtcJdbcTime.setInstant(stmt, p++, end);
+                if (start != null)
+                    UtcJdbcTime.setInstant(stmt, p++, start);
+                stmt.setDouble(p++, minLat);
+                stmt.setDouble(p++, maxLat);
+                stmt.setDouble(p++, minLon);
+                stmt.setDouble(p++, maxLon);
+                if (streamArray != null)
+                    stmt.setArray(p, streamArray);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        out.add(readGeneration(rs));
+                    }
+                }
+            } finally {
+                if (streamArray != null)
+                    streamArray.free();
+                connection.setReadOnly(oldReadOnly);
+            }
+            return out;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot query archive generations by spatial bounding box", e);
+        }
+    }
+
+    /**
+     * Returns the latest non-tombstoned spatial positions recorded in
+     * {@code oscar_obs_latest}, optionally filtered by datastream IDs and/or
+     * a WGS-84 bounding box.
+     */
+    public List<LatestSpatialPosition> selectLatestSpatialPositions(
+            Set<Long> dataStreamIds,
+            Double minLat,
+            Double maxLat,
+            Double minLon,
+            Double maxLon) {
+        if (dataStreamIds != null && dataStreamIds.isEmpty())
+            return List.of();
+        boolean hasAnyBbox = minLat != null || maxLat != null || minLon != null || maxLon != null;
+        if (hasAnyBbox) {
+            if (minLat == null || maxLat == null || minLon == null || maxLon == null
+                    || !Double.isFinite(minLat) || !Double.isFinite(maxLat)
+                    || !Double.isFinite(minLon) || !Double.isFinite(maxLon)
+                    || minLat < -90.0 || maxLat > 90.0 || minLat > maxLat
+                    || minLon < -180.0 || minLon > 180.0 || maxLon < -180.0 || maxLon > 180.0) {
+                throw new IllegalArgumentException("Invalid WGS-84 bounding box");
+            }
+        }
+        boolean filterStreams = dataStreamIds != null;
+        StringBuilder sql = new StringBuilder(
+                "SELECT latest.datastream_id, " +
+                "COALESCE(ov.generation_id, latest.generation_id), " +
+                "latest.observation_id, " +
+                "COALESCE(ov.foi_id, latest.foi_id), " +
+                "COALESCE(ov.phenomenon_time, latest.phenomenon_time), " +
+                "COALESCE(ov.result_time, latest.result_time), " +
+                "latest.latest_lat, latest.latest_lon, latest.latest_alt, " +
+                "COALESCE(ov.result_json, latest.result_json)::text " +
+                "FROM oscar_obs_latest latest " +
+                "JOIN oscar_archive_generation g ON g.id = latest.generation_id " +
+                "LEFT JOIN oscar_obs_overlay ov ON ov.store_key = latest.store_key " +
+                "AND ov.id_scope = latest.id_scope AND ov.observation_id = latest.observation_id " +
+                "WHERE latest.store_key=? AND latest.id_scope=? " +
+                "AND g.store_key = latest.store_key AND g.id_scope = latest.id_scope " +
+                "AND g.state IN ('ACTIVE','SEALED') " +
+                "AND latest.latest_lat IS NOT NULL AND latest.latest_lon IS NOT NULL " +
+                "AND NOT EXISTS (SELECT 1 FROM oscar_tombstone t " +
+                "JOIN oscar_archive_generation tg ON tg.id = t.generation_id " +
+                "WHERE t.store_key = latest.store_key AND t.id_scope = latest.id_scope " +
+                "AND t.subject_type = 'OBSERVATION' AND t.subject_id = latest.observation_id::text " +
+                "AND tg.store_key = t.store_key AND tg.id_scope = t.id_scope " +
+                "AND tg.state IN ('ACTIVE','SEALED')) ");
+        if (filterStreams)
+            sql.append("AND latest.datastream_id = ANY (?::bigint[]) ");
+        if (hasAnyBbox) {
+            sql.append("AND latest.latest_lat >= ? AND latest.latest_lat <= ? ");
+            if (minLon > maxLon)
+                sql.append("AND (latest.latest_lon >= ? OR latest.latest_lon <= ?) ");
+            else
+                sql.append("AND latest.latest_lon >= ? AND latest.latest_lon <= ? ");
+        }
+        sql.append("ORDER BY COALESCE(ov.phenomenon_time, latest.phenomenon_time) DESC NULLS LAST, latest.observation_id DESC");
+
+        List<LatestSpatialPosition> out = new ArrayList<>();
+        try (Connection connection = connections.open()) {
+            boolean oldReadOnly = connection.isReadOnly();
+            connection.setReadOnly(true);
+            java.sql.Array streamArray = filterStreams
+                    ? connection.createArrayOf("bigint", dataStreamIds.toArray(Long[]::new))
+                    : null;
+            try (PreparedStatement stmt = connection.prepareStatement(sql.toString())) {
+                int p = 1;
+                stmt.setString(p++, storeKey);
+                stmt.setInt(p++, idScope);
+                if (streamArray != null)
+                    stmt.setArray(p++, streamArray);
+                if (hasAnyBbox) {
+                    stmt.setDouble(p++, minLat);
+                    stmt.setDouble(p++, maxLat);
+                    stmt.setDouble(p++, minLon);
+                    stmt.setDouble(p, maxLon);
+                }
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        double altVal = rs.getDouble(9);
+                        Double alt = rs.wasNull() ? null : altVal;
+                        out.add(new LatestSpatialPosition(
+                                rs.getLong(1),
+                                rs.getObject(2, UUID.class),
+                                rs.getLong(3),
+                                rs.getObject(4, Long.class),
+                                UtcJdbcTime.getInstant(rs, 5),
+                                UtcJdbcTime.getInstant(rs, 6),
+                                rs.getDouble(7),
+                                rs.getDouble(8),
+                                alt,
+                                rs.getString(10)));
+                    }
+                }
+            } finally {
+                if (streamArray != null)
+                    streamArray.free();
+                connection.setReadOnly(oldReadOnly);
+            }
+            return out;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot read latest spatial positions", e);
+        }
+    }
 
     public record StreamLatestCandidate(
             long dataStreamId,
@@ -7442,8 +7761,9 @@ public final class ArchiveCatalog {
                         "gamma_high_fault_count, gamma_low_fault_count, neutron_fault_count, neutron_high_fault_count, extended_occupancy_fault_count, " +
                         "tamper_true_count, rs350_gamma_alarm_count, rs350_neutron_alarm_count, " +
                         "alarm_category_gamma_count, alarm_category_neutron_count, " +
-                        "ocr_bloom, ocr_min_norm, ocr_max_norm) " +
-                        "VALUES (?, ?, ?, true, " + SCHEMA_SUMMARY_VERSION_COMPACT + "::smallint, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+                        "ocr_bloom, ocr_min_norm, ocr_max_norm, min_lat, max_lat, min_lon, max_lon) " +
+                        "VALUES (?, ?, ?, true, " + SCHEMA_SUMMARY_VERSION_COMPACT + "::smallint, " +
+                        "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
             Set<String> insertedBlobs = new HashSet<>();
             for (SchemaSnapshot schema : schemas) {
                 StreamSummaryCounters stats = summaries.get(schema.dataStreamId());
@@ -7455,46 +7775,8 @@ public final class ArchiveCatalog {
                     blobStmt.setString(2, schema.json());
                     blobStmt.addBatch();
                 }
-                int p = 1;
-                schemaStmt.setObject(p++, generation.id());
-                schemaStmt.setLong(p++, schema.dataStreamId());
-                schemaStmt.setString(p++, schemaHash);
-                schemaStmt.setLong(p++, stats.rowCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.gammaAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.neutronAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.gammaNeutronAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.nonAlarmOccupancyCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.gammaTrueCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.neutronTrueCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.anyAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.unadjudicatedAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.adjudicatedAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.unadjudicatedGammaAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.unadjudicatedNeutronAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.unadjudicatedGammaNeutronAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.adjudicatedGammaAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.adjudicatedNeutronAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.adjudicatedGammaNeutronAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.gammaHighFaultCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.gammaLowFaultCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.neutronFaultCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.neutronHighFaultCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.extendedOccupancyFaultCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.tamperTrueCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.rs350GammaAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.rs350NeutronAlarmCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.alarmCategoryGammaCount());
-                setNullablePositiveLong(schemaStmt, p++, stats.alarmCategoryNeutronCount());
-                OcrBloomFilter.Snapshot ocr = stats.ocrSnapshot();
-                schemaStmt.setBytes(p++, ocr != null ? ocr.bloomBytes() : OcrBloomFilter.EMPTY_INDEXED_SENTINEL);
-                if (ocr == null || ocr.minNorm() == null)
-                    schemaStmt.setNull(p++, Types.VARCHAR);
-                else
-                    schemaStmt.setString(p++, ocr.minNorm());
-                if (ocr == null || ocr.maxNorm() == null)
-                    schemaStmt.setNull(p, Types.VARCHAR);
-                else
-                    schemaStmt.setString(p, ocr.maxNorm());
+                bindSchemaSummaryInsert(schemaStmt, generation.id(), schema.dataStreamId(), schemaHash,
+                        stats, false, true);
                 schemaStmt.addBatch();
             }
             blobStmt.executeBatch();
@@ -7543,8 +7825,9 @@ public final class ArchiveCatalog {
             try (PreparedStatement latStmt = connection.prepareStatement(
                     "INSERT INTO oscar_obs_latest(" +
                             "store_key, id_scope, datastream_id, generation_id, observation_id, " +
-                            "foi_id, phenomenon_time, result_time, result_json, schema_json, profile, updated_at) " +
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, now()) " +
+                            "foi_id, phenomenon_time, result_time, result_json, schema_json, profile, " +
+                            "latest_lat, latest_lon, latest_alt, updated_at) " +
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, ?, ?, ?, now()) " +
                             "ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET " +
                             "generation_id = EXCLUDED.generation_id, " +
                             "observation_id = EXCLUDED.observation_id, " +
@@ -7554,6 +7837,9 @@ public final class ArchiveCatalog {
                             "result_json = EXCLUDED.result_json, " +
                             "schema_json = EXCLUDED.schema_json, " +
                             "profile = EXCLUDED.profile, " +
+                            "latest_lat = EXCLUDED.latest_lat, " +
+                            "latest_lon = EXCLUDED.latest_lon, " +
+                            "latest_alt = EXCLUDED.latest_alt, " +
                             "updated_at = now() " +
                             "WHERE oscar_obs_latest.profile <> 'OVERLAY' " +
                             "AND NOT EXISTS (SELECT 1 FROM oscar_obs_overlay ov " +
@@ -7572,6 +7858,7 @@ public final class ArchiveCatalog {
                     String schemaJson = schemaByDs.get(lat.dataStreamId());
                     if (schemaJson == null)
                         continue;
+                    SpatialEnvelopeExtractor.SpatialPoint point = SpatialEnvelopeExtractor.extractPoint(lat.resultJson());
                     latStmt.setString(1, storeKey);
                     latStmt.setInt(2, idScope);
                     latStmt.setLong(3, lat.dataStreamId());
@@ -7592,6 +7879,9 @@ public final class ArchiveCatalog {
                     latStmt.setString(9, lat.resultJson());
                     latStmt.setString(10, schemaJson);
                     latStmt.setString(11, generation.profile());
+                    setNullableDouble(latStmt, 12, point != null ? point.lat() : null);
+                    setNullableDouble(latStmt, 13, point != null ? point.lon() : null);
+                    setNullableDouble(latStmt, 14, point != null ? point.alt() : null);
                     latStmt.addBatch();
                 }
                 latStmt.executeBatch();
