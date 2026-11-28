@@ -23,7 +23,7 @@ import org.bytedeco.javacpp.PointerPointer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.annotation.Nonnull;
+import org.jspecify.annotations.NonNull;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -317,7 +317,7 @@ public class MpegTsProcessor extends Thread {
      * @param videoDataBufferListener The listener to invoke when a video buffer is retrieved from
      *                                the transport stream.
      */
-    public void setVideoDataBufferListener(@Nonnull DataBufferListener videoDataBufferListener) {
+    public void setVideoDataBufferListener(@NonNull DataBufferListener videoDataBufferListener) {
         videoStreamContext.setDataBufferListener(videoDataBufferListener);
     }
 
@@ -327,7 +327,7 @@ public class MpegTsProcessor extends Thread {
      * @param audioDataBufferListener The listener to invoke when an audio buffer is retrieved from
      *                                the transport stream.
      */
-    public void setAudioDataBufferListener(@Nonnull DataBufferListener audioDataBufferListener) {
+    public void setAudioDataBufferListener(@NonNull DataBufferListener audioDataBufferListener) {
         audioStreamContext.setDataBufferListener(audioDataBufferListener);
     }
 
@@ -341,7 +341,7 @@ public class MpegTsProcessor extends Thread {
      * @param dataDataBufferListener The listener to invoke when a data buffer is retrieved from
      *                               the transport stream.
      */
-    public void setDataDataBufferListener(@Nonnull DataBufferListener dataDataBufferListener) {
+    public void setDataDataBufferListener(@NonNull DataBufferListener dataDataBufferListener) {
         dataStreamContext.setDataBufferListener(dataDataBufferListener);
     }
 

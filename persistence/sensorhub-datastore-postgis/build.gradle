@@ -4,19 +4,19 @@ ext.details = 'Storage module backed by a PostGis database'
 dependencies {
   implementation 'org.sensorhub:sensorhub-core:' + oshCoreVersion
   implementation 'org.sensorhub:sensorhub-service-consys'
-  embeddedImpl('org.postgresql:postgresql:42.7.7') {
+  embeddedImpl('org.postgresql:postgresql:42.7.15') {
     exclude group: "org.slf4j", module: "slf4j-api"
   }
-  embeddedImpl('net.postgis:postgis-jdbc:2021.1.0'){
+  embeddedImpl('net.postgis:postgis-jdbc:2025.1.1'){
     exclude group: "org.slf4j", module: "slf4j-api"
   }
-  embeddedImpl('com.zaxxer:HikariCP:7.0.2'){
+  embeddedImpl('com.zaxxer:HikariCP:7.1.0'){
     exclude group: "org.slf4j", module: "slf4j-api"
   }
-  embeddedImpl('org.apache.commons:commons-text:1.12.0'){
+  embeddedImpl('org.apache.commons:commons-text:1.15.0'){
     exclude group: "org.slf4j", module: "slf4j-api"
   }
-  embeddedImpl('com.github.ben-manes.caffeine:caffeine:3.1.7') {
+  embeddedImpl('com.github.ben-manes.caffeine:caffeine:3.3.1') {
     exclude group: 'checker-qual', module: 'org.checkerframework'
   }
   // DuckDB is embedded only for explicit, catalog-authorized Parquet files.

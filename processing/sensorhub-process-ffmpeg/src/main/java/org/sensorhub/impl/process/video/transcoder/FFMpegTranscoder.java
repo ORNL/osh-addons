@@ -38,7 +38,7 @@ import org.vast.process.ProcessException;
 import org.vast.swe.SWEHelper;
 import org.vast.swe.helper.RasterHelper;
 
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 import java.util.*;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
