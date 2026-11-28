@@ -614,4 +614,34 @@ public class TestTieredArchiveConfiguration {
         assertTrue(generationIndex.contains("(archivegenerationid, id)"));
         assertTrue(generationIndex.contains("WHERE archivegenerationid IS NOT NULL"));
     }
+
+    @Test
+    public void telemetryStoragePressureValidationEnforcesSafeBounds() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        assertTrue(config.telemetryPressureEnabled);
+        assertEquals(85, config.telemetryPressureTriggerUsagePercent);
+        assertEquals(80, config.telemetryPressureTargetUsagePercent);
+        assertEquals(365, config.telemetryPressureMinimumRetentionDays);
+        assertEquals(92, config.telemetryPressureCriticalUsagePercent);
+        assertEquals(30, config.telemetryPressureCriticalMinimumRetentionDays);
+        assertEquals(24, config.maximumTelemetryPressureRetirementsPerCycle);
+        config.validate();
+
+        config.telemetryPressureTargetUsagePercent = 85;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.telemetryPressureTargetUsagePercent = 80;
+
+        config.telemetryPressureCriticalUsagePercent = 84;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.telemetryPressureCriticalUsagePercent = 92;
+
+        config.telemetryPressureCriticalMinimumRetentionDays = 400;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.telemetryPressureCriticalMinimumRetentionDays = 30;
+
+        config.maximumTelemetryPressureRetirementsPerCycle = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.maximumTelemetryPressureRetirementsPerCycle = 24;
+        config.validate();
+    }
 }

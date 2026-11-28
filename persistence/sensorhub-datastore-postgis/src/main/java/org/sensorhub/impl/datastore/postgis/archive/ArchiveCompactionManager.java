@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryNotEmptyException;
+import java.nio.file.FileStore;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -95,6 +96,12 @@ public final class ArchiveCompactionManager {
             int monthsConsolidated,
             int monthlyGenerationsDefragmented,
             int deletingGenerationsDrained) {}
+
+    public record TelemetryPressureResult(
+            int usagePercent,
+            boolean critical,
+            int generationsRetired,
+            long queuedBytes) {}
 
     public ArchiveCompactionManager(
             ArchiveCatalog catalog,
@@ -1498,6 +1505,73 @@ public final class ArchiveCompactionManager {
             retiredGenerationHook.accept(retiredIds);
         }
         return finalized;
+    }
+
+    /**
+     * Checks archive filesystem usage against configured telemetry storage-pressure
+     * thresholds and transitions the oldest unheld {@code RAW_TELEMETRY} /
+     * {@code DAILY_TELEMETRY} generations beyond the active retention floor into
+     * {@code DELETING}. Operational event profiles and held observations are never
+     * retired.
+     */
+    public TelemetryPressureResult enforceTelemetryStoragePressure(Instant now) {
+        Objects.requireNonNull(now, "now");
+        if (!config.telemetryPressureEnabled)
+            return new TelemetryPressureResult(0, false, 0, 0L);
+        try {
+            if (!Files.isDirectory(root))
+                return new TelemetryPressureResult(0, false, 0, 0L);
+            FileStore fileStore = Files.getFileStore(root);
+            return enforceTelemetryStoragePressure(now, fileStore.getTotalSpace(), fileStore.getUsableSpace());
+        } catch (IOException | RuntimeException error) {
+            LOG.warn("Archive telemetry storage-pressure check failed for {}: {}", root, error.getMessage());
+            return new TelemetryPressureResult(0, false, 0, 0L);
+        }
+    }
+
+    public TelemetryPressureResult enforceTelemetryStoragePressure(
+            Instant now, long totalBytes, long usableBytes) {
+        Objects.requireNonNull(now, "now");
+        long safeTotal = Math.max(0L, totalBytes);
+        long safeUsable = Math.max(0L, Math.min(safeTotal, usableBytes));
+        long usedBytes = Math.max(0L, safeTotal - safeUsable);
+        int percentUsed = safeTotal == 0L ? 0 : (int) Math.ceil((usedBytes * 100.0d) / safeTotal);
+        if (!config.telemetryPressureEnabled || percentUsed < config.telemetryPressureTriggerUsagePercent)
+            return new TelemetryPressureResult(percentUsed, false, 0, 0L);
+
+        boolean critical = percentUsed >= config.telemetryPressureCriticalUsagePercent;
+        int minRetentionDays = critical
+                ? config.telemetryPressureCriticalMinimumRetentionDays
+                : config.telemetryPressureMinimumRetentionDays;
+        long targetBytes = (long) Math.floor(safeTotal * (config.telemetryPressureTargetUsagePercent / 100.0d));
+        long rawBytesToFree = Math.max(0L, usedBytes - targetBytes);
+        long pendingDeletingBytes = catalog.sumDeletingArchiveBytes();
+        long remainingBytesToFree = rawBytesToFree - pendingDeletingBytes;
+        if (remainingBytesToFree <= 0L)
+            return new TelemetryPressureResult(percentUsed, critical, 0, 0L);
+
+        Instant cutoff = now.minus(minRetentionDays, ChronoUnit.DAYS);
+        ArchiveCatalog.TelemetryPressureRetirementResult retired =
+                catalog.retireOldestUnheldTelemetryGenerationsForPressure(
+                        cutoff,
+                        remainingBytesToFree,
+                        config.maximumTelemetryPressureRetirementsPerCycle,
+                        now);
+        if (retired.generationsRetired() > 0) {
+            LOG.warn("Archive filesystem usage is {}% ({}); queued {} oldest unheld RAW_TELEMETRY generation(s) " +
+                            "({} bytes, older than {} day(s)) for deletion while preserving all event profiles and holds",
+                    percentUsed,
+                    critical ? "CRITICAL" : "PRESSURE",
+                    retired.generationsRetired(),
+                    retired.queuedBytes(),
+                    minRetentionDays);
+        } else if (critical) {
+            LOG.error("Archive filesystem usage is {}% (CRITICAL) with no unheld RAW_TELEMETRY generations older " +
+                            "than {} day(s) eligible for retirement; operational event profiles and active holds remain protected",
+                    percentUsed, minRetentionDays);
+        }
+        return new TelemetryPressureResult(
+                percentUsed, critical, retired.generationsRetired(), retired.queuedBytes());
     }
 
     /**
