@@ -178,6 +178,44 @@ public class TieredArchiveConfig {
             desc = "Safety delay after superseding source generations before unlinking files so online backups stay consistent")
     public int compactionUnlinkGraceMinutes = 15;
 
+    @DisplayInfo(label = "Enable telemetry storage pressure",
+            desc = "Retire oldest unheld RAW_TELEMETRY Parquet generations when archive filesystem usage exceeds configured thresholds; operational event profiles are never retired")
+    public boolean telemetryPressureEnabled = true;
+
+    @Min(1)
+    @Max(99)
+    @DisplayInfo(label = "Telemetry pressure trigger (%)",
+            desc = "Archive filesystem usage percentage that starts retiring oldest unheld RAW_TELEMETRY generations older than the minimum retention window")
+    public int telemetryPressureTriggerUsagePercent = 85;
+
+    @Min(0)
+    @Max(98)
+    @DisplayInfo(label = "Telemetry pressure target (%)",
+            desc = "Target archive filesystem usage percentage to reach when retiring oldest unheld RAW_TELEMETRY generations")
+    public int telemetryPressureTargetUsagePercent = 80;
+
+    @Min(0)
+    @DisplayInfo(label = "Telemetry pressure min retention (days)",
+            desc = "Minimum days of 1 Hz RAW_TELEMETRY always retained during standard storage pressure")
+    public int telemetryPressureMinimumRetentionDays = 365;
+
+    @Min(1)
+    @Max(99)
+    @DisplayInfo(label = "Telemetry critical pressure trigger (%)",
+            desc = "Critical archive filesystem usage percentage that lowers the RAW_TELEMETRY age floor to prevent disk exhaustion")
+    public int telemetryPressureCriticalUsagePercent = 92;
+
+    @Min(0)
+    @DisplayInfo(label = "Telemetry critical min retention (days)",
+            desc = "Minimum days of 1 Hz RAW_TELEMETRY preserved even under critical disk-exhaustion pressure")
+    public int telemetryPressureCriticalMinimumRetentionDays = 30;
+
+    @Min(1)
+    @Max(500)
+    @DisplayInfo(label = "Max telemetry retirements per cycle",
+            desc = "Maximum RAW_TELEMETRY generations scheduled for deletion during one storage-pressure cycle")
+    public int maximumTelemetryPressureRetirementsPerCycle = 24;
+
     public static final String PROFILE_RAW_GATED = "RAW_GATED";
     public static final String PROFILE_RAW_EVENTS = "RAW_EVENTS";
     public static final String PROFILE_RAW_TELEMETRY = "RAW_TELEMETRY";
@@ -425,6 +463,26 @@ public class TieredArchiveConfig {
                     "requireParityReceipt is a mandatory safety invariant and cannot be disabled");
         if (compactionUnlinkGraceMinutes < 0)
             throw new IllegalArgumentException("compactionUnlinkGraceMinutes must not be negative");
+        if (telemetryPressureTriggerUsagePercent < 1 || telemetryPressureTriggerUsagePercent > 99)
+            throw new IllegalArgumentException("telemetryPressureTriggerUsagePercent must be between 1 and 99");
+        if (telemetryPressureTargetUsagePercent < 0 ||
+                telemetryPressureTargetUsagePercent >= telemetryPressureTriggerUsagePercent)
+            throw new IllegalArgumentException(
+                    "telemetryPressureTargetUsagePercent must be non-negative and less than telemetryPressureTriggerUsagePercent");
+        if (telemetryPressureCriticalUsagePercent < telemetryPressureTriggerUsagePercent ||
+                telemetryPressureCriticalUsagePercent > 99)
+            throw new IllegalArgumentException(
+                    "telemetryPressureCriticalUsagePercent must be between telemetryPressureTriggerUsagePercent and 99");
+        if (telemetryPressureMinimumRetentionDays < 0)
+            throw new IllegalArgumentException("telemetryPressureMinimumRetentionDays must not be negative");
+        if (telemetryPressureCriticalMinimumRetentionDays < 0 ||
+                telemetryPressureCriticalMinimumRetentionDays > telemetryPressureMinimumRetentionDays)
+            throw new IllegalArgumentException(
+                    "telemetryPressureCriticalMinimumRetentionDays must be between 0 and telemetryPressureMinimumRetentionDays");
+        if (maximumTelemetryPressureRetirementsPerCycle < 1 ||
+                maximumTelemetryPressureRetirementsPerCycle > 500)
+            throw new IllegalArgumentException(
+                    "maximumTelemetryPressureRetirementsPerCycle must be between 1 and 500");
         if (maximumRowsPerGeneration < 1)
             throw new IllegalArgumentException("maximumRowsPerGeneration must be positive");
         if (maximumUncompressedBytesPerGeneration < 1)

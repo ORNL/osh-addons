@@ -297,6 +297,12 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         return archiveCompaction.drainDeletingGenerations(now);
     }
 
+    public ArchiveCompactionManager.TelemetryPressureResult enforceTelemetryStoragePressure(Instant now) {
+        if (archiveCompaction == null)
+            return new ArchiveCompactionManager.TelemetryPressureResult(0, false, 0, 0L);
+        return archiveCompaction.enforceTelemetryStoragePressure(now);
+    }
+
     private void invalidateRetiredGenerationCaches(Collection<UUID> retiredGenerationIds) {
         if (retiredGenerationIds == null || retiredGenerationIds.isEmpty())
             return;
@@ -366,8 +372,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         archiveLifecycle.maintain();
         if (immutableStage != null)
             immutableStage.retireVerifiedPartitions();
-        if (archiveCompaction != null)
-            archiveCompaction.drainDeletingGenerations(Instant.now());
+        if (archiveCompaction != null) {
+            Instant lifecycleNow = Instant.now();
+            archiveCompaction.enforceTelemetryStoragePressure(lifecycleNow);
+            archiveCompaction.drainDeletingGenerations(lifecycleNow);
+        }
         Path archiveRoot = Path.of(archiveConfig.rootDirectory);
         if (!schemaUpgradeSqlBackfillComplete) {
             if (archiveCatalog.backfillPendingSchemaUpgradeColumnsBatch(128) == 0)

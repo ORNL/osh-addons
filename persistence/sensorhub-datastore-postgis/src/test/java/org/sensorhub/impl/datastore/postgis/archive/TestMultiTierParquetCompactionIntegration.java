@@ -1965,6 +1965,180 @@ public class TestMultiTierParquetCompactionIntegration {
         store.getArchiveCatalog().reindexMutableTables(table, table + "_datastreams");
     }
 
+    @Test
+    public void summaryBackfillFlagsMarkCleanLegacyGenerationsAndAvoidRepeatSchemaScans() throws Exception {
+        String table = uniqueTableName("bfflags");
+        Path archiveRoot = temporary.newFolder("archive-bfflags").toPath();
+        Path duckTmp = archiveRoot.resolveSibling("ducktmp-bfflags");
+        TieredArchiveConfig cfg = parquetPrimaryConfig(archiveRoot, duckTmp,
+                List.of("occupancy", "gammaCounts"));
+        OscarTieredObsStore store = openStore(table, cfg);
+        BigId occStream = addEventOccupancyStream(store, 411L, "occupancy");
+        BigId gammaStream = addAlarmStateStream(store, 411L, "gammaCounts",
+                new String[]{"Background", "Fault - Gamma High"});
+
+        Instant winStart = Instant.parse("2026-11-12T00:00:00Z");
+        Instant winEnd = winStart.plus(30, ChronoUnit.MINUTES);
+        store.add(eventOccupancyObs(occStream, winStart.plusSeconds(10), winStart.plusSeconds(10),
+                "occ-flag-1", true, false, 150, 2, 0, 0));
+        store.add(alarmStateObs(gammaStream, winStart.plusSeconds(20), "Background"));
+        commitStore(store);
+
+        ArchiveGeneration evGen = store.archiveWindow(winStart, winEnd, TieredArchiveConfig.PROFILE_RAW_EVENTS)
+                .orElseThrow();
+        ArchiveGeneration telGen = store.archiveWindow(winStart, winEnd, TieredArchiveConfig.PROFILE_RAW_TELEMETRY)
+                .orElseThrow();
+
+        // Newly activated compact V2 generations are born with all 3 backfill flags set (7).
+        try (Connection c = openPg();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT summary_backfill_flags FROM oscar_archive_generation WHERE id IN (?, ?)")) {
+            ps.setObject(1, evGen.id());
+            ps.setObject(2, telGen.id());
+            try (ResultSet rs = ps.executeQuery()) {
+                int count = 0;
+                while (rs.next()) {
+                    assertEquals(7, rs.getShort(1));
+                    count++;
+                }
+                assertEquals(2, count);
+            }
+        }
+
+        // Simulate a legacy already-clean upgraded site where flags start at 0 on oscar_archive_generation.
+        try (Connection c = openPg();
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE oscar_archive_generation SET summary_backfill_flags = 0 WHERE store_key = ?")) {
+            ps.setString(1, table);
+            assertEquals(2, ps.executeUpdate());
+        }
+
+        // One bounded check pass confirms 0 updates are needed AND marks all 3 flags (7) so future calls never scan oscar_archive_schema.
+        assertEquals(0, store.getArchiveCatalog().backfillPendingSchemaUpgradeColumnsBatch(128));
+        assertEquals(0, store.getArchiveCatalog().backfillGenerationSummariesBatch(archiveRoot, 64));
+        assertEquals(0, store.getArchiveCatalog().backfillExtendedSummaryCountersBatch(archiveRoot, 32));
+
+        try (Connection c = openPg();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT summary_backfill_flags FROM oscar_archive_generation WHERE store_key = ?")) {
+            ps.setString(1, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                int count = 0;
+                while (rs.next()) {
+                    assertEquals(7, rs.getShort(1));
+                    count++;
+                }
+                assertEquals(2, count);
+            }
+        }
+    }
+
+    @Test
+    public void telemetryStoragePressureRetiresOldestUnheldRawTelemetryOnlyAndPreservesEventsHoldsAndLatest()
+            throws Exception {
+        String table = uniqueTableName("telpress");
+        Path archiveRoot = temporary.newFolder("archive-telpress").toPath();
+        Path duckTmp = archiveRoot.resolveSibling("ducktmp-telpress");
+        TieredArchiveConfig cfg = parquetPrimaryConfig(archiveRoot, duckTmp,
+                List.of("occupancy", "gammaCounts"));
+        cfg.telemetryPressureEnabled = true;
+        cfg.telemetryPressureTriggerUsagePercent = 85;
+        cfg.telemetryPressureTargetUsagePercent = 80;
+        cfg.telemetryPressureMinimumRetentionDays = 365;
+        cfg.telemetryPressureCriticalUsagePercent = 92;
+        cfg.telemetryPressureCriticalMinimumRetentionDays = 30;
+        cfg.compactionUnlinkGraceMinutes = 15;
+        OscarTieredObsStore store = openStore(table, cfg);
+
+        BigId occStream = addEventOccupancyStream(store, 421L, "occupancy");
+        BigId gammaStream = addAlarmStateStream(store, 421L, "gammaCounts",
+                new String[]{"Background", "Fault - Gamma High"});
+
+        Instant now = Instant.parse("2026-11-28T00:00:00Z");
+        Instant oldUnheldStart = now.minus(400, ChronoUnit.DAYS);
+        Instant oldHeldStart = now.minus(399, ChronoUnit.DAYS);
+        Instant midStart = now.minus(60, ChronoUnit.DAYS);
+        Instant recentStart = now.minus(5, ChronoUnit.DAYS);
+
+        ArchiveGeneration[] telGens = new ArchiveGeneration[4];
+        ArchiveGeneration[] evGens = new ArchiveGeneration[4];
+        Instant[] starts = {oldUnheldStart, oldHeldStart, midStart, recentStart};
+        for (int i = 0; i < starts.length; i++) {
+            Instant ws = starts[i];
+            Instant we = ws.plus(30, ChronoUnit.MINUTES);
+            store.add(eventOccupancyObs(occStream, ws.plusSeconds(10), ws.plusSeconds(10),
+                    "occ-tp-" + i, true, false, 150, 2, 0, 0));
+            store.add(alarmStateObs(gammaStream, ws.plusSeconds(20), "Background"));
+            commitStore(store);
+            evGens[i] = store.archiveWindow(ws, we, TieredArchiveConfig.PROFILE_RAW_EVENTS).orElseThrow();
+            telGens[i] = store.archiveWindow(ws, we, TieredArchiveConfig.PROFILE_RAW_TELEMETRY).orElseThrow();
+        }
+        store.maintainArchiveLifecycle();
+
+        // Place an active ARCHIVE_GENERATION retention hold on telGens[1] (399 days old).
+        try (Connection c = openPg();
+             PreparedStatement ps = c.prepareStatement(
+                     "INSERT INTO oscar_retention_hold(id, store_key, id_scope, subject_type, subject_id, reason, created_by, resolution_mode) " +
+                             "VALUES (?, ?, ?, 'ARCHIVE_GENERATION', ?, 'Legal hold test', 'tester', 'GENERATION_EXACT')")) {
+            ps.setObject(1, UUID.randomUUID());
+            ps.setString(2, table);
+            ps.setInt(3, ID_SCOPE);
+            ps.setString(4, telGens[1].id().toString());
+            ps.executeUpdate();
+        }
+
+        // Below 85% trigger -> nothing retired.
+        ArchiveCompactionManager.TelemetryPressureResult underThreshold =
+                store.getArchiveCompactionManager().enforceTelemetryStoragePressure(now, 100_000L, 20_000L);
+        assertEquals(80, underThreshold.usagePercent());
+        assertFalse(underThreshold.critical());
+        assertEquals(0, underThreshold.generationsRetired());
+
+        // At 86% (standard pressure, 365d floor) -> retires ONLY telGens[0] (400d old, unheld).
+        // telGens[1] is held, telGens[2] is 60d (<365d), telGens[3] is 5d (and latest), and ALL evGens are protected.
+        ArchiveCompactionManager.TelemetryPressureResult standardPressure =
+                store.getArchiveCompactionManager().enforceTelemetryStoragePressure(now, 100_000L, 14_000L);
+        assertEquals(86, standardPressure.usagePercent());
+        assertFalse(standardPressure.critical());
+        assertEquals(1, standardPressure.generationsRetired());
+        assertTrue(standardPressure.queuedBytes() > 0L);
+
+        // Pending DELETING bytes suppress duplicate retirements while waiting out unlink grace.
+        ArchiveCompactionManager.TelemetryPressureResult suppressedRepeat =
+                store.getArchiveCompactionManager().enforceTelemetryStoragePressure(now, 10_000L, 1_400L);
+        assertEquals(0, suppressedRepeat.generationsRetired());
+
+        // At 93% (critical pressure, 30d floor) with large deficit -> also retires telGens[2] (60d old, unheld),
+        // still skipping held telGens[1], 5d telGens[3], and all 4 RAW_EVENTS generations.
+        ArchiveCompactionManager.TelemetryPressureResult criticalPressure =
+                store.getArchiveCompactionManager().enforceTelemetryStoragePressure(now, 10_000_000L, 700_000L);
+        assertEquals(93, criticalPressure.usagePercent());
+        assertTrue(criticalPressure.critical());
+        assertEquals(1, criticalPressure.generationsRetired());
+
+        // Advance sealed_at past 15-minute unlink grace and drain DELETING generations.
+        try (Connection c = openPg();
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE oscar_archive_generation SET sealed_at = ? WHERE store_key = ? AND state = 'DELETING'")) {
+            UtcJdbcTime.setInstant(ps, 1, now.minus(20, ChronoUnit.MINUTES));
+            ps.setString(2, table);
+            assertEquals(2, ps.executeUpdate());
+        }
+        assertEquals(2, store.drainDeletingGenerations(now));
+
+        // Retired Parquet files are gone; held telemetry, recent telemetry, and ALL 4 RAW_EVENTS remain intact & queryable.
+        assertFalse(Files.exists(archiveRoot.resolve(telGens[0].objectPath())));
+        assertFalse(Files.exists(archiveRoot.resolve(telGens[2].objectPath())));
+        assertTrue(Files.exists(archiveRoot.resolve(telGens[1].objectPath())));
+        assertTrue(Files.exists(archiveRoot.resolve(telGens[3].objectPath())));
+        for (ArchiveGeneration evGen : evGens) {
+            assertTrue("Operational RAW_EVENTS must never be retired by telemetry pressure",
+                    Files.exists(archiveRoot.resolve(evGen.objectPath())));
+        }
+        assertEquals(4L, store.countMatchingEntries(new ObsFilter.Builder().withDataStreams(occStream).build()));
+        assertEquals(2L, store.countMatchingEntries(new ObsFilter.Builder().withDataStreams(gammaStream).build()));
+    }
+
     private static BigId addTamperStream(OscarTieredObsStore store, long sysNum) throws Exception {
         SWEHelper swe = new SWEHelper();
         DataRecord rec = swe.createRecord().name("tamper")
