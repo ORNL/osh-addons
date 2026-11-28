@@ -3328,7 +3328,10 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                 assertEquals("be2001bca1476f8f8480dd7db6264be12c94cb7be24332f370976c1ebc46e729",
                         result.getString(2));
                 assertEquals(74L, result.getLong(3));
-                assertEquals("0/ABC", result.getString(4));
+                // PostgreSQL 16-18 formats short LSNs as "0/ABC"; PostgreSQL 19+ zero-pads the lower 8 hex digits ("0/00000ABC").
+                String formattedLsn = result.getString(4);
+                assertTrue("Expected pg_lsn 0/ABC (or PG 19+ zero-padded 0/00000ABC), got " + formattedLsn,
+                        "0/ABC".equals(formattedLsn) || "0/00000ABC".equals(formattedLsn));
                 assertEquals("backup/epoch.json", result.getString(5));
                 assertEquals("a".repeat(64), result.getString(6));
             }
