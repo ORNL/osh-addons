@@ -1653,10 +1653,21 @@ public final class ArchiveCatalog {
             statement.executeUpdate();
         }
 
-        String upsertLatestSql = "INSERT INTO oscar_obs_latest(" +
+        // Resolve the single latest observation_id per datastream before joining wide
+        // result_json and schema_json payloads so PostgreSQL sorts only scalar key columns
+        // instead of duplicating schema_json/result_json across every staged row into temp disk.
+        String upsertLatestSql = "WITH latest_ids AS MATERIALIZED (" +
+                "SELECT DISTINCT ON (datastream_id) observation_id " +
+                "FROM oscar_archive_activation_row " +
+                "ORDER BY datastream_id, " +
+                "phenomenon_time DESC NULLS LAST, " +
+                "result_time DESC NULLS LAST, " +
+                "observation_id DESC" +
+                ") " +
+                "INSERT INTO oscar_obs_latest(" +
                 "store_key, id_scope, datastream_id, generation_id, observation_id, " +
                 "foi_id, phenomenon_time, result_time, result_json, schema_json, profile, updated_at) " +
-                "SELECT DISTINCT ON (exported.datastream_id) " +
+                "SELECT " +
                 "?, ?, exported.datastream_id, ?, exported.observation_id, " +
                 "exported.foi_id, " +
                 "exported.phenomenon_time AT TIME ZONE 'UTC', " +
@@ -1664,14 +1675,11 @@ public final class ArchiveCatalog {
                 "exported.result_json, " +
                 "COALESCE(s.schema_json, blob.schema_json), " +
                 "?, now() " +
-                "FROM oscar_archive_activation_row exported " +
+                "FROM latest_ids winner " +
+                "JOIN oscar_archive_activation_row exported ON exported.observation_id = winner.observation_id " +
                 "JOIN oscar_archive_schema s ON s.generation_id = ? AND s.datastream_id = exported.datastream_id " +
                 "LEFT JOIN oscar_archive_schema_blob blob ON blob.schema_sha256 = s.schema_sha256 " +
                 "WHERE COALESCE(s.schema_json, blob.schema_json) IS NOT NULL " +
-                "ORDER BY exported.datastream_id, " +
-                "exported.phenomenon_time DESC NULLS LAST, " +
-                "exported.result_time DESC NULLS LAST, " +
-                "exported.observation_id DESC " +
                 "ON CONFLICT (store_key, id_scope, datastream_id) DO UPDATE SET " +
                 "generation_id = EXCLUDED.generation_id, " +
                 "observation_id = EXCLUDED.observation_id, " +
